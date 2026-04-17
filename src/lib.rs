@@ -2,12 +2,13 @@
 // breaking this up only obfuscates the spec reference.
 #![allow(clippy::needless_range_loop)]
 
-//! ID3v1 and ID3v2 (2.2 / 2.3 / 2.4) tag parser.
+//! ID3v1 and ID3v2 (2.2 / 2.3 / 2.4) tag parser + writer.
 //!
-//! This crate is a *parser* — it consumes a byte buffer and exposes
-//! structured metadata. It never writes tags back.
+//! The crate parses existing tags into a structured [`Id3Tag`] and can
+//! serialise an [`Id3Tag`] back to bytes as either ID3v2.3 or ID3v2.4,
+//! or an ID3v1/1.1 128-byte trailer.
 //!
-//! The public surface is small:
+//! The public surface:
 //!
 //! * [`parse_tag`] — take a `&[u8]` that starts with the 10-byte ID3v2
 //!   header and return an [`Id3Tag`] plus the number of bytes consumed
@@ -20,6 +21,12 @@
 //!   Vorbis-comment-style `(key, value)` pairs the rest of the workspace
 //!   uses (`title`, `artist`, `album`, `date`, ...).
 //! * [`attached_pictures`] — pull the `APIC` / `PIC` frames out of a tag.
+//! * [`write_tag`] — serialise an [`Id3Tag`] to the ID3v2.3 or 2.4 wire
+//!   format. Unknown / v2.2 frames are pass-through (their raw payload
+//!   is written verbatim under a promoted 4-char id).
+//! * [`write_id3v1`] — serialise an [`Id3Tag`] as a 128-byte ID3v1/1.1
+//!   trailer, pulling the standard text/comment/track/genre fields out
+//!   of the tag's frames.
 //!
 //! Unsynchronisation (`0xFF 0x00` → `0xFF`) is reversed at the right
 //! level for each version (whole-tag in 2.2/2.3, per-frame in 2.4), and
@@ -1093,6 +1100,334 @@ fn id3v1_genre(b: u8) -> Option<&'static str> {
         "Synthpop",
     ];
     GENRES.get(b as usize).copied()
+}
+
+// ---------------------------------------------------------------------------
+// Writer
+// ---------------------------------------------------------------------------
+
+/// Serialise an [`Id3Tag`] to ID3v2 on-disk bytes.
+///
+/// `target_version` must be [`Id3Version::V2_3`] or [`Id3Version::V2_4`];
+/// v2.2 is a read-only legacy format and [`Id3Version::V1`] is handled
+/// by [`write_id3v1`] instead. Frames are written in the order they
+/// appear in the tag.
+///
+/// * `Id3Frame::Text` — written as a standard `T***` frame with
+///   encoding byte `3` (UTF-8) for v2.4 tags and encoding byte `1`
+///   (UTF-16 with BOM) for v2.3 tags so non-ASCII content survives both
+///   versions. Multi-value frames join with NUL for v2.4 and with `/`
+///   for v2.3, matching what the parser splits on.
+/// * `Id3Frame::Comment` / `Id3Frame::Lyrics` — encoded with the same
+///   rules, preserving the language tag and description.
+/// * `Id3Frame::UserText` / `UserUrl` — encoded as `TXXX` / `WXXX`.
+/// * `Id3Frame::Url` — encoded as the given 4-char `W***` id, ISO-8859-1
+///   payload.
+/// * `Id3Frame::Picture` — encoded as `APIC` with the picture type,
+///   MIME, description and raw bytes round-tripped verbatim.
+/// * `Id3Frame::Unknown` — the raw payload is written verbatim under
+///   the frame id (after promotion from v2.2 to v2.3 where applicable).
+///
+/// The resulting buffer starts with the 10-byte ID3v2 header and can be
+/// prepended directly to an MP3 or other audio file.
+pub fn write_tag(tag: &Id3Tag, target_version: Id3Version) -> Result<Vec<u8>> {
+    let major: u8 = match target_version {
+        Id3Version::V2_3 => 3,
+        Id3Version::V2_4 => 4,
+        Id3Version::V2_2 => {
+            return Err(Error::unsupported(
+                "writing ID3v2.2 is not supported; retag as v2.3 or v2.4",
+            ));
+        }
+        Id3Version::V1 => {
+            return Err(Error::unsupported(
+                "use write_id3v1 to serialise an ID3v1 trailer",
+            ));
+        }
+    };
+
+    let mut body = Vec::new();
+    for frame in &tag.frames {
+        write_frame(target_version, frame, &mut body)?;
+    }
+
+    let size = body.len();
+    if size >= 1 << 28 {
+        return Err(Error::invalid(
+            "ID3v2 tag body exceeds the 28-bit synchsafe size limit",
+        ));
+    }
+
+    let mut out = Vec::with_capacity(ID3V2_HEADER_SIZE + size);
+    out.extend_from_slice(b"ID3");
+    out.push(major);
+    out.push(0); // revision
+    out.push(0); // flags: no unsync, no extended header, no footer, no experimental
+    let s = size as u32;
+    out.push(((s >> 21) & 0x7F) as u8);
+    out.push(((s >> 14) & 0x7F) as u8);
+    out.push(((s >> 7) & 0x7F) as u8);
+    out.push((s & 0x7F) as u8);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Serialise the contents of an [`Id3Tag`] as a 128-byte ID3v1.1
+/// trailer. The standard text fields (title, artist, album, date,
+/// comment, track, genre) are pulled from the tag's frames; everything
+/// else is dropped since ID3v1 has no room for it.
+///
+/// Field lengths and padding follow the ID3v1 spec: strings are ASCII
+/// / ISO-8859-1, truncated to the field width and NUL-padded. If a
+/// `TRCK` frame is present and parses as a `1..=255` integer, the
+/// trailer is written in ID3v1.1 form (28-byte comment + NUL + track
+/// byte). Unknown genre names fall back to byte `255` ("no genre").
+pub fn write_id3v1(tag: &Id3Tag) -> Vec<u8> {
+    let kv = to_key_value_pairs(tag);
+    let get = |key: &str| -> String {
+        kv.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+
+    let mut out = vec![0u8; 128];
+    out[0..3].copy_from_slice(b"TAG");
+    write_v1_field(&mut out[3..33], &get("title"));
+    write_v1_field(&mut out[33..63], &get("artist"));
+    write_v1_field(&mut out[63..93], &get("album"));
+    // Year is 4 chars; take the first 4 digits of whatever `date` holds.
+    let year: String = get("date").chars().take(4).collect();
+    write_v1_field(&mut out[93..97], &year);
+
+    let comment = get("comment");
+    let track_byte: Option<u8> = get("track")
+        .split('/')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| (1..=255).contains(&n))
+        .map(|n| n as u8);
+
+    if let Some(t) = track_byte {
+        write_v1_field(&mut out[97..125], &comment);
+        out[125] = 0;
+        out[126] = t;
+    } else {
+        write_v1_field(&mut out[97..127], &comment);
+    }
+    out[127] = id3v1_genre_index(&get("genre")).unwrap_or(0xFF);
+    out
+}
+
+fn write_v1_field(dst: &mut [u8], s: &str) {
+    for b in dst.iter_mut() {
+        *b = 0;
+    }
+    // ISO-8859-1: code points < 256 map to the same byte value; drop
+    // anything higher so we never emit multi-byte UTF-8 into a v1 field.
+    let mut i = 0;
+    for ch in s.chars() {
+        if i >= dst.len() {
+            break;
+        }
+        let c = ch as u32;
+        if c < 256 {
+            dst[i] = c as u8;
+            i += 1;
+        }
+    }
+}
+
+fn write_frame(version: Id3Version, frame: &Id3Frame, out: &mut Vec<u8>) -> Result<()> {
+    let (id, payload) = encode_frame(version, frame)?;
+    let mut id4 = [0u8; 4];
+    let id_bytes = id.as_bytes();
+    if id_bytes.len() != 4 || !id_bytes.iter().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(Error::invalid(format!("invalid frame id for writer: {id}")));
+    }
+    id4.copy_from_slice(id_bytes);
+    out.extend_from_slice(&id4);
+    let size = payload.len();
+    match version {
+        Id3Version::V2_4 => {
+            if size >= 1 << 28 {
+                return Err(Error::invalid("v2.4 frame size exceeds synchsafe limit"));
+            }
+            let s = size as u32;
+            out.push(((s >> 21) & 0x7F) as u8);
+            out.push(((s >> 14) & 0x7F) as u8);
+            out.push(((s >> 7) & 0x7F) as u8);
+            out.push((s & 0x7F) as u8);
+        }
+        Id3Version::V2_3 => {
+            let s = size as u32;
+            out.extend_from_slice(&s.to_be_bytes());
+        }
+        _ => unreachable!("validated in write_tag"),
+    }
+    out.extend_from_slice(&[0, 0]); // status + format flags
+    out.extend_from_slice(&payload);
+    Ok(())
+}
+
+/// Produce the (id, payload) tuple for a frame. Callers wrap this with
+/// the appropriate 10-byte frame header.
+fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8>)> {
+    // In v2.4 we default to UTF-8 (encoding byte 3); in v2.3 we use
+    // UTF-16 with BOM (encoding byte 1) because the spec doesn't allow
+    // encoding 3. Pure-ASCII values could use 0, but 1 / 3 are safe for
+    // the whole Unicode range.
+    let text_enc: u8 = match version {
+        Id3Version::V2_4 => 3,
+        _ => 1,
+    };
+    match frame {
+        Id3Frame::Text { id, values } => {
+            if id.len() != 4 {
+                return Err(Error::invalid(format!(
+                    "text frame id must be 4 chars: {id}"
+                )));
+            }
+            let joined = match version {
+                Id3Version::V2_4 => values.join("\u{0}"),
+                _ => values.join("/"),
+            };
+            let mut payload = Vec::new();
+            payload.push(text_enc);
+            encode_string(&mut payload, text_enc, &joined);
+            Ok((id.clone(), payload))
+        }
+        Id3Frame::UserText { description, value } => {
+            let mut payload = Vec::new();
+            payload.push(text_enc);
+            encode_string(&mut payload, text_enc, description);
+            encode_terminator(&mut payload, text_enc);
+            encode_string(&mut payload, text_enc, value);
+            Ok(("TXXX".to_string(), payload))
+        }
+        Id3Frame::UserUrl { description, url } => {
+            let mut payload = Vec::new();
+            payload.push(text_enc);
+            encode_string(&mut payload, text_enc, description);
+            encode_terminator(&mut payload, text_enc);
+            // The URL itself is always ISO-8859-1.
+            encode_latin1(&mut payload, url);
+            Ok(("WXXX".to_string(), payload))
+        }
+        Id3Frame::Url { id, url } => {
+            if id.len() != 4 {
+                return Err(Error::invalid(format!(
+                    "url frame id must be 4 chars: {id}"
+                )));
+            }
+            let mut payload = Vec::new();
+            encode_latin1(&mut payload, url);
+            Ok((id.clone(), payload))
+        }
+        Id3Frame::Comment {
+            lang,
+            description,
+            text,
+        } => Ok((
+            "COMM".to_string(),
+            encode_comm_like(text_enc, lang, description, text),
+        )),
+        Id3Frame::Lyrics {
+            lang,
+            description,
+            text,
+        } => Ok((
+            "USLT".to_string(),
+            encode_comm_like(text_enc, lang, description, text),
+        )),
+        Id3Frame::Picture(pic) => {
+            let mut payload = Vec::new();
+            payload.push(text_enc);
+            // MIME is ISO-8859-1, NUL-terminated.
+            encode_latin1(&mut payload, &pic.mime_type);
+            payload.push(0);
+            payload.push(pic.picture_type as u8);
+            encode_string(&mut payload, text_enc, &pic.description);
+            encode_terminator(&mut payload, text_enc);
+            payload.extend_from_slice(&pic.data);
+            Ok(("APIC".to_string(), payload))
+        }
+        Id3Frame::Unknown { id, raw } => {
+            // Promote v2.2 ids (3 chars) to their v2.3 equivalents on
+            // write so the output is always a well-formed v2.3/v2.4
+            // frame. If the id is already 4 chars it passes through.
+            let promoted = if id.len() == 3 {
+                v22_promote(id).to_string()
+            } else {
+                id.clone()
+            };
+            Ok((promoted, raw.clone()))
+        }
+    }
+}
+
+fn encode_comm_like(enc: u8, lang: &[u8; 3], description: &str, text: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(enc);
+    payload.extend_from_slice(lang);
+    encode_string(&mut payload, enc, description);
+    encode_terminator(&mut payload, enc);
+    encode_string(&mut payload, enc, text);
+    payload
+}
+
+fn encode_string(out: &mut Vec<u8>, enc: u8, s: &str) {
+    match enc {
+        0 => encode_latin1(out, s),
+        1 => encode_utf16_bom(out, s),
+        2 => encode_utf16_be(out, s),
+        _ => out.extend_from_slice(s.as_bytes()),
+    }
+}
+
+fn encode_terminator(out: &mut Vec<u8>, enc: u8) {
+    if enc == 1 || enc == 2 {
+        out.push(0);
+        out.push(0);
+    } else {
+        out.push(0);
+    }
+}
+
+fn encode_latin1(out: &mut Vec<u8>, s: &str) {
+    for ch in s.chars() {
+        let c = ch as u32;
+        out.push(if c < 256 { c as u8 } else { b'?' });
+    }
+}
+
+fn encode_utf16_bom(out: &mut Vec<u8>, s: &str) {
+    // Emit a little-endian BOM, then LE code units.
+    out.push(0xFF);
+    out.push(0xFE);
+    for unit in s.encode_utf16() {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+}
+
+fn encode_utf16_be(out: &mut Vec<u8>, s: &str) {
+    for unit in s.encode_utf16() {
+        out.extend_from_slice(&unit.to_be_bytes());
+    }
+}
+
+fn id3v1_genre_index(name: &str) -> Option<u8> {
+    if name.is_empty() {
+        return None;
+    }
+    for i in 0..=191u8 {
+        if let Some(g) = id3v1_genre(i) {
+            if g.eq_ignore_ascii_case(name) {
+                return Some(i);
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
