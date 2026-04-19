@@ -14,4 +14,4 @@ keywords = ["multimedia", "audio", "id3", "mp3", "metadata"]
 categories = ["multimedia::audio", "parser-implementations"]
 
 [dependencies]
-oxideav-core = "0.0"
+oxideav-core = "0.1"
