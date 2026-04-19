@@ -6,7 +6,10 @@
 //!
 //! The crate parses existing tags into a structured [`Id3Tag`] and can
 //! serialise an [`Id3Tag`] back to bytes as either ID3v2.3 or ID3v2.4,
-//! or an ID3v1/1.1 128-byte trailer.
+//! or an ID3v1/1.1 128-byte trailer. The typical consumer is a
+//! container crate (oxideav-mp4, oxideav-flac, oxideav-mp3) that
+//! extracts or strips the tag to hand the remaining bytes off to its
+//! payload parser.
 //!
 //! The public surface:
 //!
