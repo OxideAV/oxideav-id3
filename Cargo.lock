@@ -4,16 +4,16 @@ version = 3
 
 [[package]]
 name = "oxideav-core"
-version = "0.0.3"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c911df9e299622ce782034f54a2872b6a153a62cc1c4c87d28a44e67a7c13b57"
+checksum = "6442d1e45380a051858f066515c83d8a3e7c72a32c9744300f2ec519eae31419"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "oxideav-id3"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "oxideav-core",
 ]
