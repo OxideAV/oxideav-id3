@@ -107,6 +107,12 @@ are preserved on write.
 - Common frames: `T***` text, `TXXX` user-defined text, `W***` URL,
   `WXXX` user-defined URL, `COMM` comment, `USLT` lyrics, `APIC` /
   `PIC` attached picture.
+- Structured non-text frames: `POPM` popularimeter (email + rating
+  byte + play counter, wide-counter aware), `PCNT` play counter,
+  `PRIV` private frame (owner + binary payload), `GEOB` general
+  encapsulated object (MIME / filename / description / bytes),
+  `UFID` unique file identifier (owner + binary id). All five
+  round-trip both directions for v2.3 and v2.4.
 - Everything else surfaces as `Id3Frame::Unknown { id, raw }` with the
   payload preserved so it can be written back untouched.
 

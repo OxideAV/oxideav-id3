@@ -43,6 +43,11 @@
 //! * `W***` URL frames and `WXXX` user-defined URL.
 //! * `COMM` comments and `USLT` lyrics.
 //! * `APIC` attached pictures (v2.3/2.4) and `PIC` (v2.2).
+//! * `POPM` popularimeter (email + rating + play counter).
+//! * `PCNT` play counter.
+//! * `PRIV` private frame (owner id + opaque bytes).
+//! * `GEOB` general encapsulated object.
+//! * `UFID` unique file identifier.
 //!
 //! Everything else lands in [`Id3Frame::Unknown`] with the raw payload
 //! preserved so future code can extend recognition without reparsing.
@@ -93,8 +98,39 @@ pub enum Id3Frame {
     Url { id: String, url: String },
     /// `APIC` (v2.3/2.4) or `PIC` (v2.2) attached picture.
     Picture(AttachedPicture),
+    /// `POPM` popularimeter. `email` is the (potentially empty) user
+    /// id (NUL-terminated ISO-8859-1 string), `rating` is 1..=255
+    /// (0 = unknown), `counter` is the play count. The spec allows
+    /// the counter to be omitted *or* to grow past 32 bits by
+    /// prefixing extra bytes; we widen into `u64` which covers any
+    /// realistic count.
+    Popularimeter {
+        email: String,
+        rating: u8,
+        counter: u64,
+    },
+    /// `PCNT` play counter. The counter is always at least 32 bits and
+    /// MAY grow byte-by-byte once it overflows; we widen into `u64`.
+    PlayCounter { count: u64 },
+    /// `PRIV` private frame. `owner` is a NUL-terminated ISO-8859-1
+    /// owner identifier (typically a URL with an email), `data` is the
+    /// opaque payload.
+    Private { owner: String, data: Vec<u8> },
+    /// `GEOB` general encapsulated object: arbitrary file embedded in
+    /// the tag, identified by MIME type, original filename and
+    /// content description.
+    Geob {
+        mime_type: String,
+        filename: String,
+        description: String,
+        data: Vec<u8>,
+    },
+    /// `UFID` unique file identifier. `owner` is a NUL-terminated
+    /// ISO-8859-1 owner identifier; `identifier` is up to 64 bytes of
+    /// opaque database-specific id.
+    Ufid { owner: String, identifier: Vec<u8> },
     /// Any frame whose id we don't parse structurally (SYLT, RGAD,
-    /// PRIV, ...). The payload is preserved verbatim so callers or
+    /// CHAP, ...). The payload is preserved verbatim so callers or
     /// later versions can recognise it without needing to reparse.
     Unknown { id: String, raw: Vec<u8> },
 }
@@ -316,7 +352,42 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
             }
             // Pictures are surfaced via attached_pictures(), not k/v.
             Id3Frame::Picture(_) => {}
-            Id3Frame::Unknown { .. } => {}
+            Id3Frame::Popularimeter {
+                email,
+                rating,
+                counter,
+            } => {
+                // Surface as Vorbis-style "rating" / "rating_count"
+                // keys, scoped by the (possibly empty) email so
+                // multiple POPM frames don't collide. The rating byte
+                // is the 1..=255 raw value; consumers that prefer
+                // the 0..=5 "star" scale can rescale.
+                let scope = if email.is_empty() {
+                    String::new()
+                } else {
+                    format!(":{}", email.to_lowercase())
+                };
+                if *rating != 0 {
+                    push_unique(&mut out, format!("rating{scope}"), rating.to_string());
+                }
+                if *counter != 0 {
+                    push_unique(
+                        &mut out,
+                        format!("rating_count{scope}"),
+                        counter.to_string(),
+                    );
+                }
+            }
+            Id3Frame::PlayCounter { count } => {
+                push_unique(&mut out, "play_count".to_string(), count.to_string());
+            }
+            // PRIV / GEOB / UFID carry opaque or binary payloads —
+            // not meaningful as (key, value) text pairs. Callers that
+            // need them should match on the enum.
+            Id3Frame::Private { .. }
+            | Id3Frame::Geob { .. }
+            | Id3Frame::Ufid { .. }
+            | Id3Frame::Unknown { .. } => {}
         }
     }
     out
@@ -544,6 +615,11 @@ fn dispatch_v23_v24(id: &str, payload: &[u8]) -> Id3Frame {
         "COMM" => parse_comm_like(payload, false),
         "USLT" => parse_comm_like(payload, true),
         "APIC" => parse_apic(payload),
+        "POPM" => parse_popm(payload),
+        "PCNT" => parse_pcnt(payload),
+        "PRIV" => parse_priv(payload),
+        "GEOB" => parse_geob(payload),
+        "UFID" => parse_ufid(payload),
         _ => Id3Frame::Unknown {
             id: id.to_string(),
             raw: payload.to_vec(),
@@ -799,6 +875,134 @@ fn parse_pic(payload: &[u8]) -> Id3Frame {
         description,
         data: data.to_vec(),
     })
+}
+
+/// Parse a `POPM` popularimeter payload (spec §4.17). Layout is:
+///
+/// ```text
+/// Email to user   <ISO-8859-1 string> $00
+/// Rating          $xx
+/// Counter         $xx xx xx xx (xx ...)    [optional, may grow > 4 bytes]
+/// ```
+///
+/// The counter may be omitted entirely; if present it is at least
+/// 32 bits and grows byte-by-byte once it overflows. We collect it
+/// as a big-endian unsigned integer into `u64` which is enough for
+/// counters up to 2^64 (the spec leaves the upper bound unbounded
+/// but no real-world player will exceed `u64`).
+fn parse_popm(payload: &[u8]) -> Id3Frame {
+    // Email is always ISO-8859-1 (no encoding byte).
+    let (email_bytes, after_email) = split_once_nul_bytes(payload);
+    let email = latin1_to_string(email_bytes);
+    if after_email.is_empty() {
+        // Truncated: rating is missing.
+        return Id3Frame::Popularimeter {
+            email,
+            rating: 0,
+            counter: 0,
+        };
+    }
+    let rating = after_email[0];
+    let counter_bytes = &after_email[1..];
+    let counter = be_unsigned(counter_bytes);
+    Id3Frame::Popularimeter {
+        email,
+        rating,
+        counter,
+    }
+}
+
+/// Parse a `PCNT` play-counter payload (spec §4.16). The counter is
+/// at least 32 bits and may grow byte-by-byte; we widen into `u64`.
+fn parse_pcnt(payload: &[u8]) -> Id3Frame {
+    Id3Frame::PlayCounter {
+        count: be_unsigned(payload),
+    }
+}
+
+/// Parse a `PRIV` private-frame payload (spec §4.27). Layout is:
+///
+/// ```text
+/// Owner identifier      <ISO-8859-1 string> $00
+/// The private data      <binary data>
+/// ```
+fn parse_priv(payload: &[u8]) -> Id3Frame {
+    let (owner_bytes, data) = split_once_nul_bytes(payload);
+    Id3Frame::Private {
+        owner: latin1_to_string(owner_bytes),
+        data: data.to_vec(),
+    }
+}
+
+/// Parse a `GEOB` general-encapsulated-object payload (spec §4.15).
+/// Layout is:
+///
+/// ```text
+/// Text encoding          $xx
+/// MIME type              <ISO-8859-1 string> $00
+/// Filename               <string in declared encoding> $00 (00)
+/// Content description    <string in declared encoding> $00 (00)
+/// Encapsulated object    <binary data>
+/// ```
+fn parse_geob(payload: &[u8]) -> Id3Frame {
+    if payload.is_empty() {
+        return Id3Frame::Geob {
+            mime_type: String::new(),
+            filename: String::new(),
+            description: String::new(),
+            data: Vec::new(),
+        };
+    }
+    let enc = payload[0];
+    let rest = &payload[1..];
+    // MIME type is always ISO-8859-1 regardless of the encoding byte.
+    let (mime_bytes, after_mime) = split_once_nul_bytes(rest);
+    let mime_type = latin1_to_string(mime_bytes);
+    let (filename, after_fname) = split_once_nul(enc, after_mime);
+    let (description, data) = split_once_nul(enc, after_fname);
+    Id3Frame::Geob {
+        mime_type,
+        filename,
+        description,
+        data: data.to_vec(),
+    }
+}
+
+/// Parse a `UFID` unique-file-identifier payload (spec §4.1). Layout
+/// is:
+///
+/// ```text
+/// Owner identifier        <ISO-8859-1 string> $00
+/// Identifier              <up to 64 bytes binary data>
+/// ```
+fn parse_ufid(payload: &[u8]) -> Id3Frame {
+    let (owner_bytes, identifier) = split_once_nul_bytes(payload);
+    Id3Frame::Ufid {
+        owner: latin1_to_string(owner_bytes),
+        identifier: identifier.to_vec(),
+    }
+}
+
+/// Decode a big-endian unsigned integer of arbitrary width into `u64`.
+/// Used for `POPM` / `PCNT` counters which start at 32 bits and may
+/// grow byte-by-byte beyond u32::MAX per spec §4.16. Buffers wider
+/// than 8 bytes saturate to `u64::MAX` if any of the high bytes
+/// dropped are non-zero, so an absurdly large counter still reads as
+/// "very big" instead of silently wrapping.
+fn be_unsigned(buf: &[u8]) -> u64 {
+    if buf.len() > 8 {
+        let high = &buf[..buf.len() - 8];
+        if high.iter().any(|&b| b != 0) {
+            return u64::MAX;
+        }
+    }
+    let take = buf.len().min(8);
+    let skip = buf.len() - take;
+    let mut v: u64 = 0;
+    for &b in &buf[skip..] {
+        v = (v << 8) | b as u64;
+    }
+    v
 }
 
 /// Split `buf` on the first terminator for the given encoding,
@@ -1355,6 +1559,62 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
             payload.extend_from_slice(&pic.data);
             Ok(("APIC".to_string(), payload))
         }
+        Id3Frame::Popularimeter {
+            email,
+            rating,
+            counter,
+        } => {
+            let mut payload = Vec::new();
+            // Email is always ISO-8859-1 (no encoding byte).
+            encode_latin1(&mut payload, email);
+            payload.push(0);
+            payload.push(*rating);
+            // Spec: counter is at least 32 bits, and MAY be omitted
+            // if no personal counter is wanted. We always emit at
+            // least the 4-byte form; if the value exceeds u32::MAX
+            // we widen to the smallest BE form that fits.
+            encode_counter(&mut payload, *counter);
+            Ok(("POPM".to_string(), payload))
+        }
+        Id3Frame::PlayCounter { count } => {
+            let mut payload = Vec::new();
+            encode_counter(&mut payload, *count);
+            Ok(("PCNT".to_string(), payload))
+        }
+        Id3Frame::Private { owner, data } => {
+            let mut payload = Vec::new();
+            encode_latin1(&mut payload, owner);
+            payload.push(0);
+            payload.extend_from_slice(data);
+            Ok(("PRIV".to_string(), payload))
+        }
+        Id3Frame::Geob {
+            mime_type,
+            filename,
+            description,
+            data,
+        } => {
+            let mut payload = Vec::new();
+            payload.push(text_enc);
+            encode_latin1(&mut payload, mime_type);
+            payload.push(0);
+            encode_string(&mut payload, text_enc, filename);
+            encode_terminator(&mut payload, text_enc);
+            encode_string(&mut payload, text_enc, description);
+            encode_terminator(&mut payload, text_enc);
+            payload.extend_from_slice(data);
+            Ok(("GEOB".to_string(), payload))
+        }
+        Id3Frame::Ufid { owner, identifier } => {
+            let mut payload = Vec::new();
+            encode_latin1(&mut payload, owner);
+            payload.push(0);
+            // Spec caps identifier at 64 bytes; we still write what
+            // the caller gave us — clamping is a caller policy
+            // decision and silent truncation here would lose data.
+            payload.extend_from_slice(identifier);
+            Ok(("UFID".to_string(), payload))
+        }
         Id3Frame::Unknown { id, raw } => {
             // Promote v2.2 ids (3 chars) to their v2.3 equivalents on
             // write so the output is always a well-formed v2.3/v2.4
@@ -1394,6 +1654,25 @@ fn encode_terminator(out: &mut Vec<u8>, enc: u8) {
         out.push(0);
     } else {
         out.push(0);
+    }
+}
+
+/// Encode an integer counter for `PCNT` / `POPM` as a big-endian
+/// byte string. Spec §4.16: at least 32 bits long; if the value
+/// exceeds u32::MAX we widen to the smallest BE form that fits, up
+/// to 8 bytes (u64). Callers that need a fixed width pad on read
+/// via `be_unsigned`.
+fn encode_counter(out: &mut Vec<u8>, value: u64) {
+    if value <= u32::MAX as u64 {
+        out.extend_from_slice(&(value as u32).to_be_bytes());
+    } else {
+        // Find the smallest width >= 5 that fits, then emit BE.
+        let mut width = 5usize;
+        while width < 8 && value >> (width * 8) != 0 {
+            width += 1;
+        }
+        let bytes = value.to_be_bytes();
+        out.extend_from_slice(&bytes[8 - width..]);
     }
 }
 
@@ -1699,5 +1978,65 @@ mod tests {
         let tag = build_v23_tag_title_and_apic();
         let size = tag_size_at_head(&tag[0..10]).unwrap();
         assert_eq!(size, tag.len());
+    }
+
+    /// Spec-shaped `POPM` payload parsed straight from a hand-crafted
+    /// byte sequence: email `"a@b\0"`, rating `0xC4` (=196), counter
+    /// `00 00 00 2A` (=42). Confirms the parser walks the §4.17 layout
+    /// without going through the writer first.
+    #[test]
+    fn popm_parse_handcrafted_payload() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"a@b");
+        payload.push(0);
+        payload.push(0xC4);
+        payload.extend_from_slice(&42u32.to_be_bytes());
+        match parse_popm(&payload) {
+            Id3Frame::Popularimeter {
+                email,
+                rating,
+                counter,
+            } => {
+                assert_eq!(email, "a@b");
+                assert_eq!(rating, 0xC4);
+                assert_eq!(counter, 42);
+            }
+            _ => panic!("expected Popularimeter"),
+        }
+    }
+
+    /// `be_unsigned` saturates to u64::MAX when the buffer has high
+    /// bytes that won't fit in u64. Sanity check the overflow guard.
+    #[test]
+    fn be_unsigned_saturates() {
+        // 9 bytes with a non-zero leading byte -> MAX.
+        let mut buf = vec![0u8; 9];
+        buf[0] = 1;
+        assert_eq!(be_unsigned(&buf), u64::MAX);
+        // 9 bytes with the leading byte zero -> just the lower 8.
+        let mut buf2 = vec![0u8; 9];
+        buf2[8] = 0xAB;
+        assert_eq!(be_unsigned(&buf2), 0xAB);
+        // Short buffers work too.
+        assert_eq!(be_unsigned(&[]), 0);
+        assert_eq!(be_unsigned(&[0xFF, 0xFF]), 0xFFFF);
+    }
+
+    /// `encode_counter` produces 4 bytes for a u32-range value, 5 for
+    /// the smallest 33-bit value, and 8 for a u64-range value.
+    #[test]
+    fn encode_counter_widths() {
+        let mut buf = Vec::new();
+        encode_counter(&mut buf, 0);
+        assert_eq!(buf.len(), 4);
+        let mut buf = Vec::new();
+        encode_counter(&mut buf, u32::MAX as u64);
+        assert_eq!(buf.len(), 4);
+        let mut buf = Vec::new();
+        encode_counter(&mut buf, (u32::MAX as u64) + 1);
+        assert_eq!(buf.len(), 5);
+        let mut buf = Vec::new();
+        encode_counter(&mut buf, u64::MAX);
+        assert_eq!(buf.len(), 8);
     }
 }

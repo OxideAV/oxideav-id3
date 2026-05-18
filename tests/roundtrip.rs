@@ -274,7 +274,8 @@ fn roundtrip_id3v1_trailer() {
 fn roundtrip_preserves_unknown_frames() {
     // Unknown frames must round-trip: write should emit their raw
     // payload verbatim so future code (or other tools) can still read
-    // them.
+    // them. Use a synthetic 4-char id that the parser does NOT
+    // recognise structurally (so it stays an `Unknown`).
     let tag = Id3Tag {
         version: Id3Version::V2_4,
         frames: vec![
@@ -283,18 +284,18 @@ fn roundtrip_preserves_unknown_frames() {
                 values: vec!["x".into()],
             },
             Id3Frame::Unknown {
-                id: "PRIV".into(),
+                id: "XBOG".into(),
                 raw: b"arbitrary bytes".to_vec(),
             },
         ],
     };
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
-    let priv_raw = parsed.frames.iter().find_map(|f| match f {
-        Id3Frame::Unknown { id, raw } if id == "PRIV" => Some(raw.clone()),
+    let raw = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Unknown { id, raw } if id == "XBOG" => Some(raw.clone()),
         _ => None,
     });
-    assert_eq!(priv_raw.as_deref(), Some(&b"arbitrary bytes"[..]));
+    assert_eq!(raw.as_deref(), Some(&b"arbitrary bytes"[..]));
 }
 
 #[test]
@@ -303,4 +304,244 @@ fn tag_size_matches_written_bytes() {
     let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
     let reported = oxideav_id3::tag_size_at_head(&bytes[0..10]).unwrap();
     assert_eq!(reported, bytes.len());
+}
+
+/// `POPM` round-trip: email + rating + 4-byte counter survive write
+/// → parse without loss, and the parser surfaces `rating` and
+/// `rating_count` keys in the Vorbis-style k/v projection.
+#[test]
+fn roundtrip_popm_v24() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Popularimeter {
+            email: "rater@example.com".into(),
+            rating: 196,
+            counter: 42,
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let pop = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Popularimeter {
+            email,
+            rating,
+            counter,
+        } => Some((email.clone(), *rating, *counter)),
+        _ => None,
+    });
+    assert_eq!(pop, Some(("rater@example.com".to_string(), 196u8, 42u64)));
+    let kv = to_key_value_pairs(&parsed);
+    assert!(kv.contains(&("rating:rater@example.com".into(), "196".into())));
+    assert!(kv.contains(&("rating_count:rater@example.com".into(), "42".into())));
+}
+
+/// `POPM` with the counter wider than 4 bytes survives a round trip.
+/// Per spec §4.17 the counter may grow byte-by-byte once it overflows
+/// the initial 32-bit form; the writer widens to fit and the parser
+/// folds the bytes back into the same `u64`.
+#[test]
+fn roundtrip_popm_wide_counter() {
+    let big = (u32::MAX as u64) + 7;
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Popularimeter {
+            email: String::new(),
+            rating: 255,
+            counter: big,
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let pop = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Popularimeter {
+            counter, rating, ..
+        } => Some((*rating, *counter)),
+        _ => None,
+    });
+    assert_eq!(pop, Some((255u8, big)));
+}
+
+/// `PCNT` round-trip: a moderate play count survives, and the
+/// k/v projection surfaces `play_count`.
+#[test]
+fn roundtrip_pcnt_v23() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![Id3Frame::PlayCounter { count: 1234 }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let pc = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::PlayCounter { count } => Some(*count),
+        _ => None,
+    });
+    assert_eq!(pc, Some(1234u64));
+    let kv = to_key_value_pairs(&parsed);
+    assert!(kv.contains(&("play_count".into(), "1234".into())));
+}
+
+/// `PRIV` round-trip: owner identifier + opaque binary payload.
+#[test]
+fn roundtrip_priv() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Private {
+            owner: "WM/MediaClassPrimaryID".into(),
+            data: vec![0xBC, 0x7D, 0x60, 0xD1, 0x23, 0xE3, 0xE2, 0x4B],
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let pv = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Private { owner, data } => Some((owner.clone(), data.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        pv,
+        Some((
+            "WM/MediaClassPrimaryID".to_string(),
+            vec![0xBC, 0x7D, 0x60, 0xD1, 0x23, 0xE3, 0xE2, 0x4B]
+        ))
+    );
+}
+
+/// `UFID` round-trip: owner + 16-byte synthetic database id.
+#[test]
+fn roundtrip_ufid() {
+    let id_bytes: Vec<u8> = (0..16).collect();
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Ufid {
+            owner: "http://musicbrainz.org".into(),
+            identifier: id_bytes.clone(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let ufid = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Ufid { owner, identifier } => Some((owner.clone(), identifier.clone())),
+        _ => None,
+    });
+    assert_eq!(ufid, Some(("http://musicbrainz.org".to_string(), id_bytes)));
+}
+
+/// `GEOB` round-trip: arbitrary file embedded in the tag survives
+/// write → parse with its MIME, filename, description and bytes.
+/// Round-tripped under v2.4 (UTF-8) and v2.3 (UTF-16) to exercise
+/// both string-encoding paths.
+#[test]
+fn roundtrip_geob_v24() {
+    let payload = b"binary attachment payload\x00\x01\x02".to_vec();
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Geob {
+            mime_type: "application/octet-stream".into(),
+            filename: "notes.bin".into(),
+            description: "session notes".into(),
+            data: payload.clone(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let g = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Geob {
+            mime_type,
+            filename,
+            description,
+            data,
+        } => Some((
+            mime_type.clone(),
+            filename.clone(),
+            description.clone(),
+            data.clone(),
+        )),
+        _ => None,
+    });
+    assert_eq!(
+        g,
+        Some((
+            "application/octet-stream".to_string(),
+            "notes.bin".to_string(),
+            "session notes".to_string(),
+            payload,
+        ))
+    );
+}
+
+#[test]
+fn roundtrip_geob_v23_utf16() {
+    let payload = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![Id3Frame::Geob {
+            mime_type: "image/png".into(),
+            // Non-ASCII filename forces the v2.3 UTF-16-with-BOM path
+            // through both the filename and description fields.
+            filename: "\u{65E5}\u{672C}.png".into(),
+            description: "cover art".into(),
+            data: payload.clone(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let g = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Geob {
+            mime_type,
+            filename,
+            description,
+            data,
+        } => Some((
+            mime_type.clone(),
+            filename.clone(),
+            description.clone(),
+            data.clone(),
+        )),
+        _ => None,
+    });
+    assert_eq!(
+        g,
+        Some((
+            "image/png".to_string(),
+            "\u{65E5}\u{672C}.png".to_string(),
+            "cover art".to_string(),
+            payload,
+        ))
+    );
+}
+
+/// A truncated `POPM` payload (no rating byte after the email
+/// terminator) must not panic — we surface a zero-rated frame.
+#[test]
+fn popm_truncated_no_rating() {
+    // Build the smallest possible truncated POPM frame: just an
+    // empty-email NUL terminator, no rating, no counter.
+    let mut frame = Vec::new();
+    frame.extend_from_slice(b"POPM");
+    frame.push(0);
+    frame.push(0);
+    frame.push(0);
+    frame.push(1); // synchsafe size = 1
+    frame.extend_from_slice(&[0, 0]); // flags
+    frame.push(0); // the NUL-terminator for an empty email
+    let mut tag_bytes = Vec::new();
+    tag_bytes.extend_from_slice(b"ID3");
+    tag_bytes.push(4);
+    tag_bytes.push(0);
+    tag_bytes.push(0);
+    let size = frame.len() as u32;
+    tag_bytes.push(((size >> 21) & 0x7F) as u8);
+    tag_bytes.push(((size >> 14) & 0x7F) as u8);
+    tag_bytes.push(((size >> 7) & 0x7F) as u8);
+    tag_bytes.push((size & 0x7F) as u8);
+    tag_bytes.extend_from_slice(&frame);
+    let (parsed, _) = parse_tag(&tag_bytes).unwrap();
+    let pop = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Popularimeter {
+            email,
+            rating,
+            counter,
+        } => Some((email.clone(), *rating, *counter)),
+        _ => None,
+    });
+    assert_eq!(pop, Some((String::new(), 0u8, 0u64)));
 }
