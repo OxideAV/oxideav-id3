@@ -111,8 +111,17 @@ are preserved on write.
   byte + play counter, wide-counter aware), `PCNT` play counter,
   `PRIV` private frame (owner + binary payload), `GEOB` general
   encapsulated object (MIME / filename / description / bytes),
-  `UFID` unique file identifier (owner + binary id). All five
-  round-trip both directions for v2.3 and v2.4.
+  `UFID` unique file identifier (owner + binary id), `USER` terms
+  of use (language + free text), `OWNE` ownership (currency-prefixed
+  price + 8-byte purchase date + seller), `COMR` commercial offer
+  (price + validity date + contact URL + delivery method + seller +
+  description + optional company logo), `SYTC` synchronised tempo
+  codes (time-format + `(BPM, timestamp)` pairs with the spec's
+  `$FF`-extension form for BPMs above 255), `RVA2` relative volume
+  adjustment 2 (per-channel Q9.7 dB + variable-width peak), `EQU2`
+  equalisation 2 (interpolation byte + `(frequency, adjustment)`
+  pairs in spec units). All eleven round-trip both directions for
+  v2.3 and v2.4.
 - Everything else surfaces as `Id3Frame::Unknown { id, raw }` with the
   payload preserved so it can be written back untouched.
 

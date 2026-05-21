@@ -6,7 +6,7 @@
 use oxideav_core::{AttachedPicture, PictureType};
 use oxideav_id3::{
     attached_pictures, parse_id3v1, parse_tag, to_key_value_pairs, write_id3v1, write_tag,
-    Id3Frame, Id3Tag, Id3Version,
+    Id3Frame, Id3Tag, Id3Version, Rva2Channel,
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
@@ -507,6 +507,346 @@ fn roundtrip_geob_v23_utf16() {
             payload,
         ))
     );
+}
+
+/// `USER` terms-of-use frame round-trips both directions. v2.3 uses
+/// UTF-16-with-BOM internally for the text payload; the language
+/// triplet is always plain ASCII.
+#[test]
+fn roundtrip_user_v23_and_v24() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![
+            Id3Frame::TermsOfUse {
+                lang: *b"eng",
+                text: "All rights reserved.".into(),
+            },
+            Id3Frame::TermsOfUse {
+                lang: *b"jpn",
+                text: "\u{3059}\u{3079}\u{3066}\u{306E}\u{6A29}\u{5229}".into(),
+            },
+        ],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let mut got: Vec<([u8; 3], String)> = parsed
+        .frames
+        .iter()
+        .filter_map(|f| match f {
+            Id3Frame::TermsOfUse { lang, text } => Some((*lang, text.clone())),
+            _ => None,
+        })
+        .collect();
+    got.sort_by_key(|(l, _)| *l);
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].0, *b"eng");
+    assert_eq!(got[0].1, "All rights reserved.");
+    assert_eq!(got[1].0, *b"jpn");
+    assert_eq!(got[1].1, "\u{3059}\u{3079}\u{3066}\u{306E}\u{6A29}\u{5229}");
+    let kv = to_key_value_pairs(&parsed);
+    assert!(kv.contains(&("termsofuse:eng".into(), "All rights reserved.".into())));
+}
+
+/// `OWNE` ownership frame round-trips through both v2.3 and v2.4.
+/// The 8-byte date field is fixed-width with no terminator; the
+/// writer pads short input with spaces so the on-wire layout is
+/// always parseable.
+#[test]
+fn roundtrip_owne_v24() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Ownership {
+            price: "USD9.99".into(),
+            date: "20260114".into(),
+            seller: "Example Records Inc.".into(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let own = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Ownership {
+            price,
+            date,
+            seller,
+        } => Some((price.clone(), date.clone(), seller.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        own,
+        Some((
+            "USD9.99".to_string(),
+            "20260114".to_string(),
+            "Example Records Inc.".to_string()
+        ))
+    );
+    let kv = to_key_value_pairs(&parsed);
+    assert!(kv.contains(&("ownership_price".into(), "USD9.99".into())));
+    assert!(kv.contains(&("ownership_date".into(), "20260114".into())));
+    assert!(kv.contains(&("ownership_seller".into(), "Example Records Inc.".into())));
+}
+
+/// `OWNE` short-date case: a 6-byte caller string gets space-padded
+/// to the spec's 8-byte width on write, and reads back as the same
+/// 8-character string. Spec only allows YYYYMMDD; this confirms the
+/// writer doesn't silently corrupt the on-wire layout when input is
+/// out-of-shape.
+#[test]
+fn owne_short_date_pads_to_eight() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Ownership {
+            price: "EUR1".into(),
+            date: "2026".into(),
+            seller: "S".into(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let date = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Ownership { date, .. } => Some(date.clone()),
+        _ => None,
+    });
+    assert_eq!(date, Some("2026    ".to_string()));
+}
+
+/// `COMR` commercial frame round-trip with the full optional logo
+/// block populated. Exercises the price + date + URL + received_as
+/// + encoded-string seller/description + MIME + binary logo path.
+#[test]
+fn roundtrip_comr_with_logo() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Commercial {
+            price: "USD9.99/EUR8.99".into(),
+            valid_until: "20271231".into(),
+            contact_url: "https://example.com/buy".into(),
+            received_as: 3, // File over the Internet
+            seller: "Example Records".into(),
+            description: "Deluxe Edition".into(),
+            logo_mime: "image/png".into(),
+            logo_data: vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let cm = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Commercial {
+            price,
+            valid_until,
+            contact_url,
+            received_as,
+            seller,
+            description,
+            logo_mime,
+            logo_data,
+        } => Some((
+            price.clone(),
+            valid_until.clone(),
+            contact_url.clone(),
+            *received_as,
+            seller.clone(),
+            description.clone(),
+            logo_mime.clone(),
+            logo_data.clone(),
+        )),
+        _ => None,
+    });
+    assert_eq!(
+        cm,
+        Some((
+            "USD9.99/EUR8.99".to_string(),
+            "20271231".to_string(),
+            "https://example.com/buy".to_string(),
+            3u8,
+            "Example Records".to_string(),
+            "Deluxe Edition".to_string(),
+            "image/png".to_string(),
+            vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+        ))
+    );
+}
+
+/// `COMR` without the optional logo block: spec says "These two last
+/// fields may be omitted if no picture is attached." The writer
+/// drops the MIME + logo entirely when both are empty; the parser
+/// reads back the same.
+#[test]
+fn roundtrip_comr_without_logo() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![Id3Frame::Commercial {
+            price: "JPY1000".into(),
+            valid_until: "20261231".into(),
+            contact_url: "mailto:sales@example.com".into(),
+            received_as: 0,
+            seller: "Seller".into(),
+            description: "Track".into(),
+            logo_mime: String::new(),
+            logo_data: Vec::new(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let cm = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Commercial {
+            logo_mime,
+            logo_data,
+            received_as,
+            valid_until,
+            ..
+        } => Some((
+            logo_mime.clone(),
+            logo_data.clone(),
+            *received_as,
+            valid_until.clone(),
+        )),
+        _ => None,
+    });
+    assert_eq!(
+        cm,
+        Some((String::new(), Vec::<u8>::new(), 0u8, "20261231".to_string()))
+    );
+}
+
+/// `SYTC` synchronised-tempo round-trip. Three codes exercising the
+/// 1-byte form ($02..=$FE), the reserved $00 (beat-free), and the
+/// 2-byte $FF extension form (256..=510 BPM).
+#[test]
+fn roundtrip_sytc() {
+    let codes = vec![
+        (0u16, 0u32),      // beat-free at t=0
+        (120, 1_000),      // 120 BPM at t=1000 ms
+        (300, 5_500),      // 300 BPM ($FF $2D)
+        (510, 12_000_000), // upper end of $FF extension
+    ];
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::SyncedTempo {
+            time_format: 0x02, // milliseconds
+            codes: codes.clone(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::SyncedTempo { time_format, codes } => Some((*time_format, codes.clone())),
+        _ => None,
+    });
+    assert_eq!(got, Some((0x02u8, codes)));
+}
+
+/// `RVA2` round-trip with two channels — master volume at +2 dB and
+/// front-right at -3 dB with a 16-bit peak. Confirms the Q9.7
+/// encoding survives, the variable-width peak field round-trips,
+/// and identification + channels parse back in order.
+#[test]
+fn roundtrip_rva2_multi_channel() {
+    // +2 dB = 2 * 512 = 1024 = $04 00
+    // -3 dB = -3 * 512 = -1536 = $FA 00 (two's complement)
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Rva2 {
+            identification: "track".into(),
+            channels: vec![
+                Rva2Channel {
+                    channel_type: 0x01, // Master volume
+                    volume_adjustment: 1024,
+                    bits_peak: 0,
+                    peak: Vec::new(),
+                },
+                Rva2Channel {
+                    channel_type: 0x02, // Front right
+                    volume_adjustment: -1536,
+                    bits_peak: 16,
+                    peak: vec![0x12, 0x34],
+                },
+            ],
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Rva2 {
+            identification,
+            channels,
+        } => Some((identification.clone(), channels.clone())),
+        _ => None,
+    });
+    let (id, ch) = got.expect("RVA2");
+    assert_eq!(id, "track");
+    assert_eq!(ch.len(), 2);
+    assert_eq!(ch[0].channel_type, 0x01);
+    assert_eq!(ch[0].volume_adjustment, 1024);
+    assert_eq!(ch[0].bits_peak, 0);
+    assert!(ch[0].peak.is_empty());
+    assert_eq!(ch[1].channel_type, 0x02);
+    assert_eq!(ch[1].volume_adjustment, -1536);
+    assert_eq!(ch[1].bits_peak, 16);
+    assert_eq!(ch[1].peak, vec![0x12, 0x34]);
+}
+
+/// `RVA2` peak with a non-multiple-of-8 bit width: 12 bits → 2 bytes
+/// on the wire per spec ("always padded to whole bytes, setting the
+/// most significant bits to zero"). The writer pads, the parser
+/// reads the padded form back verbatim.
+#[test]
+fn roundtrip_rva2_padded_peak() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Rva2 {
+            identification: "album".into(),
+            channels: vec![Rva2Channel {
+                channel_type: 0x01,
+                volume_adjustment: 0,
+                bits_peak: 12,
+                peak: vec![0x0F, 0xFF],
+            }],
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let ch = parsed
+        .frames
+        .iter()
+        .find_map(|f| match f {
+            Id3Frame::Rva2 { channels, .. } => Some(channels.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(ch[0].bits_peak, 12);
+    assert_eq!(ch[0].peak, vec![0x0F, 0xFF]);
+}
+
+/// `EQU2` round-trip: linear interpolation, four band/adjustment
+/// points. Frequencies are in 1/2 Hz units (so 2000 = 1000 Hz);
+/// adjustments are Q9.7 dB.
+#[test]
+fn roundtrip_equ2_linear() {
+    let pts = vec![
+        (200u16, 512i16), // 100 Hz, +1 dB
+        (2_000, -1_024),  // 1000 Hz, -2 dB
+        (8_000, 0),       // 4000 Hz, flat
+        (24_000, 1_024),  // 12000 Hz, +2 dB
+    ];
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Equ2 {
+            interpolation: 1, // Linear
+            identification: "headphones".into(),
+            points: pts.clone(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Equ2 {
+            interpolation,
+            identification,
+            points,
+        } => Some((*interpolation, identification.clone(), points.clone())),
+        _ => None,
+    });
+    assert_eq!(got, Some((1u8, "headphones".to_string(), pts)));
 }
 
 /// A truncated `POPM` payload (no rating byte after the email

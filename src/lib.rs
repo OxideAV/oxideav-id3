@@ -129,10 +129,85 @@ pub enum Id3Frame {
     /// ISO-8859-1 owner identifier; `identifier` is up to 64 bytes of
     /// opaque database-specific id.
     Ufid { owner: String, identifier: Vec<u8> },
+    /// `USER` terms-of-use frame (v2.3 §4.23 / v2.4 §4.22). A free-text
+    /// description of the legal terms tied to a 3-byte ISO-639-2
+    /// language code. Multiple `USER` frames may coexist in a tag as
+    /// long as each one has a distinct `lang`.
+    TermsOfUse { lang: [u8; 3], text: String },
+    /// `OWNE` ownership frame (v2.3 §4.24 / v2.4 §4.23). Records the
+    /// terms of a single purchase: ISO-4217 currency-prefixed price,
+    /// 8-byte `YYYYMMDD` purchase date, and free-text seller name.
+    /// Spec allows only one `OWNE` per tag.
+    Ownership {
+        price: String,
+        date: String,
+        seller: String,
+    },
+    /// `COMR` commercial frame (v2.3 §4.25 / v2.4 §4.24). Bundles a
+    /// single competing offer (price, validity date, contact URL,
+    /// delivery method, seller, description, optional company logo).
+    /// Multiple `COMR` frames may coexist in a tag.
+    Commercial {
+        price: String,
+        valid_until: String,
+        contact_url: String,
+        received_as: u8,
+        seller: String,
+        description: String,
+        logo_mime: String,
+        logo_data: Vec<u8>,
+    },
+    /// `SYTC` synchronised tempo codes (v2.4 §4.7). Carries a sequence
+    /// of `(tempo_bpm, timestamp)` pairs against a single `time_format`
+    /// byte (1 = MPEG frames, 2 = milliseconds). Tempos $00 and $01
+    /// are reserved per spec (beat-free / single-stroke); larger
+    /// values are the raw BPM, with a `$FF xx` two-byte extension
+    /// covering 256..=510 BPM.
+    SyncedTempo {
+        time_format: u8,
+        codes: Vec<(u16, u32)>,
+    },
+    /// `RVA2` relative volume adjustment 2 (v2.4 §4.11). Carries an
+    /// identification string plus one entry per channel. The volume
+    /// adjustment is a signed Q9.7 fixed-point dB value
+    /// (`raw / 512.0`); the peak field is a zero-padded big-endian
+    /// unsigned integer whose width is `ceil(bits_peak / 8)`.
+    Rva2 {
+        identification: String,
+        channels: Vec<Rva2Channel>,
+    },
+    /// `EQU2` equalisation 2 (v2.4 §4.12). Carries a 1-byte
+    /// interpolation method and an identification string, followed
+    /// by `(frequency_hz_half, adjustment_q9_7)` pairs sorted by
+    /// frequency. Frequencies are stored in units of 1/2 Hz; the
+    /// adjustment uses the same fixed-point format as `RVA2`.
+    Equ2 {
+        interpolation: u8,
+        identification: String,
+        points: Vec<(u16, i16)>,
+    },
     /// Any frame whose id we don't parse structurally (SYLT, RGAD,
     /// CHAP, ...). The payload is preserved verbatim so callers or
     /// later versions can recognise it without needing to reparse.
     Unknown { id: String, raw: Vec<u8> },
+}
+
+/// One `RVA2` channel entry (spec v2.4 §4.11). The raw 16-bit signed
+/// `volume_adjustment` is in Q9.7 dB (`raw / 512.0` = dB). The peak
+/// payload is zero-padded to whole bytes per spec; we keep the raw
+/// byte width so a writer can round-trip the exact on-wire form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rva2Channel {
+    /// Spec §4.11 channel-type enumeration ($00..=$08; values outside
+    /// the table pass through as-is for forward compatibility).
+    pub channel_type: u8,
+    /// Signed Q9.7 dB. Divide by `512.0` to recover the dB value.
+    pub volume_adjustment: i16,
+    /// Spec: "Bits representing peak can be any number between 0 and
+    /// 255. 0 means that there is no peak volume field."
+    pub bits_peak: u8,
+    /// Big-endian unsigned peak. Width = `ceil(bits_peak / 8)`.
+    pub peak: Vec<u8>,
 }
 
 /// Parse an ID3v2 tag from a buffer that starts with the 10-byte
@@ -381,10 +456,43 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
             Id3Frame::PlayCounter { count } => {
                 push_unique(&mut out, "play_count".to_string(), count.to_string());
             }
-            // PRIV / GEOB / UFID carry opaque or binary payloads —
-            // not meaningful as (key, value) text pairs. Callers that
+            Id3Frame::TermsOfUse { lang, text } => {
+                // Surface terms-of-use as a "termsofuse[:lang]" key
+                // mirroring the COMM/lang style — multiple language
+                // variants stay distinct.
+                let lang_str = latin1_to_string(lang);
+                let key = if lang_str.trim().is_empty() {
+                    "termsofuse".to_string()
+                } else {
+                    format!("termsofuse:{}", lang_str.to_lowercase())
+                };
+                push_unique(&mut out, key, text.clone());
+            }
+            Id3Frame::Ownership {
+                price,
+                date,
+                seller,
+            } => {
+                if !price.is_empty() {
+                    push_unique(&mut out, "ownership_price".to_string(), price.clone());
+                }
+                let trimmed_date = date.trim().to_string();
+                if !trimmed_date.is_empty() {
+                    push_unique(&mut out, "ownership_date".to_string(), trimmed_date);
+                }
+                if !seller.is_empty() {
+                    push_unique(&mut out, "ownership_seller".to_string(), seller.clone());
+                }
+            }
+            // COMR / SYTC / RVA2 / EQU2 / PRIV / GEOB / UFID carry
+            // structured or binary payloads that do not project
+            // cleanly onto Vorbis-style text pairs. Callers that
             // need them should match on the enum.
-            Id3Frame::Private { .. }
+            Id3Frame::Commercial { .. }
+            | Id3Frame::SyncedTempo { .. }
+            | Id3Frame::Rva2 { .. }
+            | Id3Frame::Equ2 { .. }
+            | Id3Frame::Private { .. }
             | Id3Frame::Geob { .. }
             | Id3Frame::Ufid { .. }
             | Id3Frame::Unknown { .. } => {}
@@ -620,6 +728,12 @@ fn dispatch_v23_v24(id: &str, payload: &[u8]) -> Id3Frame {
         "PRIV" => parse_priv(payload),
         "GEOB" => parse_geob(payload),
         "UFID" => parse_ufid(payload),
+        "USER" => parse_user(payload),
+        "OWNE" => parse_owne(payload),
+        "COMR" => parse_comr(payload),
+        "SYTC" => parse_sytc(payload),
+        "RVA2" => parse_rva2(payload),
+        "EQU2" => parse_equ2(payload),
         _ => Id3Frame::Unknown {
             id: id.to_string(),
             raw: payload.to_vec(),
@@ -980,6 +1094,270 @@ fn parse_ufid(payload: &[u8]) -> Id3Frame {
     Id3Frame::Ufid {
         owner: latin1_to_string(owner_bytes),
         identifier: identifier.to_vec(),
+    }
+}
+
+/// Parse a `USER` terms-of-use payload (spec v2.3 §4.23 / v2.4 §4.22).
+/// Layout is:
+///
+/// ```text
+/// Text encoding   $xx
+/// Language        $xx xx xx
+/// The actual text <text string according to encoding>
+/// ```
+///
+/// Truncated payloads (no language bytes, no text) fold to an empty
+/// frame rather than erroring — the parser is structural, not
+/// validating.
+fn parse_user(payload: &[u8]) -> Id3Frame {
+    if payload.len() < 4 {
+        return Id3Frame::TermsOfUse {
+            lang: *b"   ",
+            text: String::new(),
+        };
+    }
+    let enc = payload[0];
+    let mut lang = [0u8; 3];
+    lang.copy_from_slice(&payload[1..4]);
+    let text = decode_text(enc, &payload[4..]);
+    Id3Frame::TermsOfUse { lang, text }
+}
+
+/// Parse an `OWNE` ownership payload (spec v2.3 §4.24 / v2.4 §4.23).
+/// Layout is:
+///
+/// ```text
+/// Text encoding   $xx
+/// Price paid      <ISO-8859-1 text> $00
+/// Date of purch.  <8 chars, no terminator>
+/// Seller          <text string according to encoding>
+/// ```
+///
+/// "Price paid" is always ISO-8859-1 per the surrounding text
+/// (currency code + decimal number); "Seller" follows the declared
+/// encoding. If the buffer is shorter than the fixed-prefix length
+/// the parser folds to an empty frame.
+fn parse_owne(payload: &[u8]) -> Id3Frame {
+    if payload.is_empty() {
+        return Id3Frame::Ownership {
+            price: String::new(),
+            date: String::new(),
+            seller: String::new(),
+        };
+    }
+    let enc = payload[0];
+    let rest = &payload[1..];
+    let (price_bytes, after_price) = split_once_nul_bytes(rest);
+    let price = latin1_to_string(price_bytes);
+    let date_len = 8usize.min(after_price.len());
+    let date = latin1_to_string(&after_price[..date_len]);
+    let seller_bytes = &after_price[date_len..];
+    let seller = decode_text(enc, seller_bytes);
+    Id3Frame::Ownership {
+        price,
+        date,
+        seller,
+    }
+}
+
+/// Parse a `COMR` commercial-frame payload (spec v2.3 §4.25 / v2.4
+/// §4.24). Layout is:
+///
+/// ```text
+/// Text encoding      $xx
+/// Price string       <ISO-8859-1 text> $00
+/// Valid until        <8 chars, no terminator>
+/// Contact URL        <ISO-8859-1 text> $00
+/// Received as        $xx
+/// Name of seller     <text string according to encoding> $00 (00)
+/// Description        <text string according to encoding> $00 (00)
+/// Picture MIME type  <ISO-8859-1 text> $00          (optional)
+/// Seller logo        <binary data>                  (optional)
+/// ```
+///
+/// The MIME + logo block is optional and absent for most real-world
+/// frames; we return empty strings + empty bytes when nothing follows
+/// the description.
+fn parse_comr(payload: &[u8]) -> Id3Frame {
+    if payload.is_empty() {
+        return empty_comr();
+    }
+    let enc = payload[0];
+    let rest = &payload[1..];
+    let (price_bytes, after_price) = split_once_nul_bytes(rest);
+    let price = latin1_to_string(price_bytes);
+    if after_price.len() < 8 {
+        return empty_comr();
+    }
+    let date = latin1_to_string(&after_price[..8]);
+    let after_date = &after_price[8..];
+    let (url_bytes, after_url) = split_once_nul_bytes(after_date);
+    let contact_url = latin1_to_string(url_bytes);
+    if after_url.is_empty() {
+        return Id3Frame::Commercial {
+            price,
+            valid_until: date,
+            contact_url,
+            received_as: 0,
+            seller: String::new(),
+            description: String::new(),
+            logo_mime: String::new(),
+            logo_data: Vec::new(),
+        };
+    }
+    let received_as = after_url[0];
+    let after_recv = &after_url[1..];
+    let (seller, after_seller) = split_once_nul(enc, after_recv);
+    let (description, after_desc) = split_once_nul(enc, after_seller);
+    // The optional logo: MIME (latin1, NUL-terminated) + binary bytes.
+    // Absent when nothing follows the description.
+    let (logo_mime, logo_data) = if after_desc.is_empty() {
+        (String::new(), Vec::new())
+    } else {
+        let (mime_bytes, after_mime) = split_once_nul_bytes(after_desc);
+        (latin1_to_string(mime_bytes), after_mime.to_vec())
+    };
+    Id3Frame::Commercial {
+        price,
+        valid_until: date,
+        contact_url,
+        received_as,
+        seller,
+        description,
+        logo_mime,
+        logo_data,
+    }
+}
+
+fn empty_comr() -> Id3Frame {
+    Id3Frame::Commercial {
+        price: String::new(),
+        valid_until: String::new(),
+        contact_url: String::new(),
+        received_as: 0,
+        seller: String::new(),
+        description: String::new(),
+        logo_mime: String::new(),
+        logo_data: Vec::new(),
+    }
+}
+
+/// Parse a `SYTC` synchronised-tempo-codes payload (spec v2.4 §4.7).
+/// Layout is:
+///
+/// ```text
+/// Time stamp format   $xx
+/// Tempo data          (<tempo> <32-bit BE timestamp>)*
+/// ```
+///
+/// `<tempo>` is a single byte unless its value is `$FF`, in which case
+/// one additional byte follows and the BPM is the sum of the two
+/// (giving 2..=510 BPM, with $00 = beat-free / $01 = single stroke).
+/// Truncated trailing pairs are skipped rather than rejected.
+fn parse_sytc(payload: &[u8]) -> Id3Frame {
+    if payload.is_empty() {
+        return Id3Frame::SyncedTempo {
+            time_format: 0,
+            codes: Vec::new(),
+        };
+    }
+    let time_format = payload[0];
+    let mut codes: Vec<(u16, u32)> = Vec::new();
+    let mut i = 1usize;
+    while i < payload.len() {
+        let (tempo, used) = if payload[i] == 0xFF {
+            if i + 1 >= payload.len() {
+                break;
+            }
+            (0xFFu16 + payload[i + 1] as u16, 2usize)
+        } else {
+            (payload[i] as u16, 1usize)
+        };
+        let ts_off = i + used;
+        if ts_off + 4 > payload.len() {
+            break;
+        }
+        let ts = regular_u32(
+            payload[ts_off],
+            payload[ts_off + 1],
+            payload[ts_off + 2],
+            payload[ts_off + 3],
+        );
+        codes.push((tempo, ts));
+        i = ts_off + 4;
+    }
+    Id3Frame::SyncedTempo { time_format, codes }
+}
+
+/// Parse an `RVA2` relative-volume-adjustment-2 payload (spec v2.4
+/// §4.11). Layout is:
+///
+/// ```text
+/// Identification        <ISO-8859-1 text> $00
+/// For each channel:
+///   Type of channel       $xx
+///   Volume adjustment     $xx xx                       (signed Q9.7 dB)
+///   Bits representing peak $xx
+///   Peak volume           ceil(bits / 8) bytes BE
+/// ```
+fn parse_rva2(payload: &[u8]) -> Id3Frame {
+    let (ident_bytes, mut rest) = split_once_nul_bytes(payload);
+    let identification = latin1_to_string(ident_bytes);
+    let mut channels: Vec<Rva2Channel> = Vec::new();
+    while rest.len() >= 4 {
+        let channel_type = rest[0];
+        let volume_adjustment = i16::from_be_bytes([rest[1], rest[2]]);
+        let bits_peak = rest[3];
+        let peak_bytes = (bits_peak as usize).div_ceil(8);
+        if rest.len() < 4 + peak_bytes {
+            break;
+        }
+        let peak = rest[4..4 + peak_bytes].to_vec();
+        channels.push(Rva2Channel {
+            channel_type,
+            volume_adjustment,
+            bits_peak,
+            peak,
+        });
+        rest = &rest[4 + peak_bytes..];
+    }
+    Id3Frame::Rva2 {
+        identification,
+        channels,
+    }
+}
+
+/// Parse an `EQU2` equalisation-2 payload (spec v2.4 §4.12). Layout is:
+///
+/// ```text
+/// Interpolation method  $xx
+/// Identification        <ISO-8859-1 text> $00
+/// For each point:
+///   Frequency           $xx xx     (units of 1/2 Hz, 0..32767 Hz)
+///   Volume adjustment   $xx xx     (signed Q9.7 dB)
+/// ```
+fn parse_equ2(payload: &[u8]) -> Id3Frame {
+    if payload.is_empty() {
+        return Id3Frame::Equ2 {
+            interpolation: 0,
+            identification: String::new(),
+            points: Vec::new(),
+        };
+    }
+    let interpolation = payload[0];
+    let (ident_bytes, mut rest) = split_once_nul_bytes(&payload[1..]);
+    let identification = latin1_to_string(ident_bytes);
+    let mut points: Vec<(u16, i16)> = Vec::new();
+    while rest.len() >= 4 {
+        let freq = u16::from_be_bytes([rest[0], rest[1]]);
+        let adj = i16::from_be_bytes([rest[2], rest[3]]);
+        points.push((freq, adj));
+        rest = &rest[4..];
+    }
+    Id3Frame::Equ2 {
+        interpolation,
+        identification,
+        points,
     }
 }
 
@@ -1615,6 +1993,131 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
             payload.extend_from_slice(identifier);
             Ok(("UFID".to_string(), payload))
         }
+        Id3Frame::TermsOfUse { lang, text } => {
+            let mut payload = Vec::new();
+            payload.push(text_enc);
+            payload.extend_from_slice(lang);
+            encode_string(&mut payload, text_enc, text);
+            Ok(("USER".to_string(), payload))
+        }
+        Id3Frame::Ownership {
+            price,
+            date,
+            seller,
+        } => {
+            let mut payload = Vec::new();
+            payload.push(text_enc);
+            // Price is always ISO-8859-1 (currency-code + numeric);
+            // seller follows the declared encoding.
+            encode_latin1(&mut payload, price);
+            payload.push(0);
+            // Date is a fixed 8 chars (YYYYMMDD) — pad with spaces
+            // when shorter, truncate when longer, so the written
+            // frame matches the spec layout regardless of caller
+            // hygiene.
+            write_fixed_ascii8(&mut payload, date);
+            encode_string(&mut payload, text_enc, seller);
+            Ok(("OWNE".to_string(), payload))
+        }
+        Id3Frame::Commercial {
+            price,
+            valid_until,
+            contact_url,
+            received_as,
+            seller,
+            description,
+            logo_mime,
+            logo_data,
+        } => {
+            let mut payload = Vec::new();
+            payload.push(text_enc);
+            encode_latin1(&mut payload, price);
+            payload.push(0);
+            write_fixed_ascii8(&mut payload, valid_until);
+            encode_latin1(&mut payload, contact_url);
+            payload.push(0);
+            payload.push(*received_as);
+            encode_string(&mut payload, text_enc, seller);
+            encode_terminator(&mut payload, text_enc);
+            encode_string(&mut payload, text_enc, description);
+            encode_terminator(&mut payload, text_enc);
+            // The MIME + logo block is optional. We emit it whenever
+            // logo_data is non-empty, OR when logo_mime is non-empty
+            // (a caller may want to declare the slot even with no
+            // image — the spec says "These two last fields may be
+            // omitted if no picture is attached," implying together).
+            if !logo_data.is_empty() || !logo_mime.is_empty() {
+                encode_latin1(&mut payload, logo_mime);
+                payload.push(0);
+                payload.extend_from_slice(logo_data);
+            }
+            Ok(("COMR".to_string(), payload))
+        }
+        Id3Frame::SyncedTempo { time_format, codes } => {
+            let mut payload = Vec::new();
+            payload.push(*time_format);
+            for &(tempo, ts) in codes {
+                if tempo >= 0xFF {
+                    // Two-byte form: $FF + (tempo - 0xFF), capped at
+                    // 510 BPM per spec ($FF + $FF = 510).
+                    let extra = (tempo - 0xFF).min(0xFF) as u8;
+                    payload.push(0xFF);
+                    payload.push(extra);
+                } else {
+                    payload.push(tempo as u8);
+                }
+                payload.extend_from_slice(&ts.to_be_bytes());
+            }
+            Ok(("SYTC".to_string(), payload))
+        }
+        Id3Frame::Rva2 {
+            identification,
+            channels,
+        } => {
+            let mut payload = Vec::new();
+            encode_latin1(&mut payload, identification);
+            payload.push(0);
+            for ch in channels {
+                payload.push(ch.channel_type);
+                payload.extend_from_slice(&ch.volume_adjustment.to_be_bytes());
+                payload.push(ch.bits_peak);
+                // Spec: "The peak volume field is always padded to
+                // whole bytes." We trust the caller-supplied width;
+                // if it's wrong relative to bits_peak the writer is
+                // not allowed to silently lengthen the on-wire form.
+                let expected = (ch.bits_peak as usize).div_ceil(8);
+                if ch.peak.len() == expected {
+                    payload.extend_from_slice(&ch.peak);
+                } else if ch.peak.len() < expected {
+                    // Pad zeros at the front so the value reads as
+                    // BE with the right magnitude.
+                    let pad = expected - ch.peak.len();
+                    payload.resize(payload.len() + pad, 0);
+                    payload.extend_from_slice(&ch.peak);
+                } else {
+                    // Caller over-provided; emit only the low-order
+                    // bytes that fit in the declared width.
+                    let start = ch.peak.len() - expected;
+                    payload.extend_from_slice(&ch.peak[start..]);
+                }
+            }
+            Ok(("RVA2".to_string(), payload))
+        }
+        Id3Frame::Equ2 {
+            interpolation,
+            identification,
+            points,
+        } => {
+            let mut payload = Vec::new();
+            payload.push(*interpolation);
+            encode_latin1(&mut payload, identification);
+            payload.push(0);
+            for &(freq, adj) in points {
+                payload.extend_from_slice(&freq.to_be_bytes());
+                payload.extend_from_slice(&adj.to_be_bytes());
+            }
+            Ok(("EQU2".to_string(), payload))
+        }
         Id3Frame::Unknown { id, raw } => {
             // Promote v2.2 ids (3 chars) to their v2.3 equivalents on
             // write so the output is always a well-formed v2.3/v2.4
@@ -1680,6 +2183,31 @@ fn encode_latin1(out: &mut Vec<u8>, s: &str) {
     for ch in s.chars() {
         let c = ch as u32;
         out.push(if c < 256 { c as u8 } else { b'?' });
+    }
+}
+
+/// Write `s` as exactly 8 ISO-8859-1 bytes — truncate if longer,
+/// pad with ASCII spaces if shorter. Used for the spec-mandated
+/// fixed-width `YYYYMMDD` date fields in `OWNE` / `COMR`.
+fn write_fixed_ascii8(out: &mut Vec<u8>, s: &str) {
+    let bytes: Vec<u8> = s
+        .chars()
+        .map(|c| {
+            let v = c as u32;
+            if v < 256 {
+                v as u8
+            } else {
+                b'?'
+            }
+        })
+        .collect();
+    if bytes.len() >= 8 {
+        out.extend_from_slice(&bytes[..8]);
+    } else {
+        out.extend_from_slice(&bytes);
+        for _ in bytes.len()..8 {
+            out.push(b' ');
+        }
     }
 }
 
@@ -2020,6 +2548,81 @@ mod tests {
         // Short buffers work too.
         assert_eq!(be_unsigned(&[]), 0);
         assert_eq!(be_unsigned(&[0xFF, 0xFF]), 0xFFFF);
+    }
+
+    /// Hand-rolled `SYTC` payload exercising the two-byte $FF tempo
+    /// extension. Confirms the parser splits the 2-byte tempo +
+    /// 4-byte timestamp form correctly without going through the
+    /// writer.
+    #[test]
+    fn sytc_parse_handcrafted_ff_extension() {
+        // time_format = $02 (ms)
+        // tempo = $FF $01 -> 256 BPM
+        // ts    = 0x0000_1000
+        let mut payload = Vec::new();
+        payload.push(0x02);
+        payload.push(0xFF);
+        payload.push(0x01);
+        payload.extend_from_slice(&0x0000_1000u32.to_be_bytes());
+        match parse_sytc(&payload) {
+            Id3Frame::SyncedTempo { time_format, codes } => {
+                assert_eq!(time_format, 0x02);
+                assert_eq!(codes, vec![(256u16, 0x0000_1000u32)]);
+            }
+            _ => panic!("expected SyncedTempo"),
+        }
+    }
+
+    /// Hand-rolled `RVA2` payload with two channels confirms the
+    /// parser walks identification + repeating channel records.
+    /// Spec §4.11: bits_peak = 0 means "no peak field" — the second
+    /// channel exercises that path.
+    #[test]
+    fn rva2_parse_handcrafted_two_channels() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"alb");
+        payload.push(0);
+        // Channel 1: master, +2dB ($04 00), 8-bit peak ($80).
+        payload.push(0x01);
+        payload.extend_from_slice(&1024i16.to_be_bytes());
+        payload.push(0x08);
+        payload.push(0x80);
+        // Channel 2: front-left, -1dB ($FE 00), no peak.
+        payload.push(0x03);
+        payload.extend_from_slice(&(-512i16).to_be_bytes());
+        payload.push(0x00);
+        match parse_rva2(&payload) {
+            Id3Frame::Rva2 {
+                identification,
+                channels,
+            } => {
+                assert_eq!(identification, "alb");
+                assert_eq!(channels.len(), 2);
+                assert_eq!(channels[0].volume_adjustment, 1024);
+                assert_eq!(channels[0].bits_peak, 8);
+                assert_eq!(channels[0].peak, vec![0x80]);
+                assert_eq!(channels[1].volume_adjustment, -512);
+                assert_eq!(channels[1].bits_peak, 0);
+                assert!(channels[1].peak.is_empty());
+            }
+            _ => panic!("expected Rva2"),
+        }
+    }
+
+    /// `parse_user` on a minimal, well-formed payload.
+    #[test]
+    fn user_parse_handcrafted() {
+        let mut payload = Vec::new();
+        payload.push(0); // ISO-8859-1
+        payload.extend_from_slice(b"eng");
+        payload.extend_from_slice(b"Public domain.");
+        match parse_user(&payload) {
+            Id3Frame::TermsOfUse { lang, text } => {
+                assert_eq!(lang, *b"eng");
+                assert_eq!(text, "Public domain.");
+            }
+            _ => panic!("expected TermsOfUse"),
+        }
     }
 
     /// `encode_counter` produces 4 bytes for a u32-range value, 5 for
