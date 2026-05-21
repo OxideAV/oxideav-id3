@@ -34,6 +34,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rating_count[:email]`, `termsofuse[:lang]`, `ownership_price`,
   `ownership_date`, and `ownership_seller` keys so consumers can
   read these frames without matching on the enum.
+- Structural parser + writer for nine more ID3v2.3 / 2.4 frames:
+  `MCDI` music CD identifier (opaque CD-DA TOC bytes), `ETCO`
+  event timing codes (time-format + `(event_type, timestamp)`
+  pairs), `SYLT` synchronised lyrics/text (language + time-format
+  + content-type + descriptor + `(syllable, timestamp)` syncs,
+  honouring both single-NUL v2.4-UTF-8 and double-NUL v2.3-UTF-16
+  terminators inside the sync-record loop), `POSS` position
+  synchronisation (time-format + 32-bit position), `RBUF`
+  recommended buffer size (24-bit buffer + embedded-info flag +
+  32-bit next-tag offset; writer clamps oversized buffer-size to
+  the 24-bit field width), `SEEK` seek frame (32-bit next-tag
+  offset), `SIGN` signature frame (group-symbol byte + binary
+  signature), `AENC` audio encryption (owner + 2-byte preview
+  start / length + opaque encryption-info), `LINK` linked
+  information (auto-detects 3-byte v2.3 vs 4-byte v2.4 frame ids
+  on read, and emits the on-wire form matching the target version
+  on write). All nine new variants round-trip through
+  `write_tag` / `parse_tag` for v2.3 + v2.4 and lose no data via
+  `Id3Frame::Unknown`.
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-id3/compare/v0.0.4...v0.0.5) - 2026-04-19
 

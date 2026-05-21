@@ -120,8 +120,19 @@ are preserved on write.
   `$FF`-extension form for BPMs above 255), `RVA2` relative volume
   adjustment 2 (per-channel Q9.7 dB + variable-width peak), `EQU2`
   equalisation 2 (interpolation byte + `(frequency, adjustment)`
-  pairs in spec units). All eleven round-trip both directions for
-  v2.3 and v2.4.
+  pairs in spec units), `MCDI` music CD identifier (opaque TOC),
+  `ETCO` event timing codes (time-format + `(event_type, timestamp)`
+  pairs), `SYLT` synchronised lyrics (language + time-format +
+  content-type + `(syllable, timestamp)` pairs, both v2.3-UTF-16
+  and v2.4-UTF-8), `POSS` position synchronisation (time-format +
+  32-bit position), `RBUF` recommended buffer size (24-bit buffer
+  + embedded-info flag + 32-bit next-tag offset, auto-clamped on
+  write), `SEEK` seek frame (32-bit next-tag offset), `SIGN`
+  signature frame (group-symbol byte + binary signature), `AENC`
+  audio encryption (owner + preview start/length + opaque
+  encryption-info), `LINK` linked information (3-byte v2.3 / 4-byte
+  v2.4 frame-id + URL + spec-shaped additional data). All twenty
+  round-trip both directions for v2.3 and v2.4.
 - Everything else surfaces as `Id3Frame::Unknown { id, raw }` with the
   payload preserved so it can be written back untouched.
 

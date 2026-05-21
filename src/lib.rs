@@ -48,6 +48,16 @@
 //! * `PRIV` private frame (owner id + opaque bytes).
 //! * `GEOB` general encapsulated object.
 //! * `UFID` unique file identifier.
+//! * `USER` terms-of-use frame.
+//! * `OWNE` ownership / `COMR` commercial.
+//! * `SYTC` synchronised tempo codes.
+//! * `RVA2` / `EQU2` relative volume + equalisation (v2.4).
+//! * `MCDI` music CD identifier (TOC).
+//! * `ETCO` event timing codes / `POSS` position synchronisation.
+//! * `SYLT` synchronised lyrics/text.
+//! * `RBUF` recommended buffer size.
+//! * `SEEK` seek frame / `SIGN` signature frame.
+//! * `AENC` audio encryption / `LINK` linked information.
 //!
 //! Everything else lands in [`Id3Frame::Unknown`] with the raw payload
 //! preserved so future code can extend recognition without reparsing.
@@ -186,9 +196,79 @@ pub enum Id3Frame {
         identification: String,
         points: Vec<(u16, i16)>,
     },
-    /// Any frame whose id we don't parse structurally (SYLT, RGAD,
-    /// CHAP, ...). The payload is preserved verbatim so callers or
-    /// later versions can recognise it without needing to reparse.
+    /// `MCDI` music CD identifier (v2.3 §4.5 / v2.4 §4.4). The frame
+    /// body is the binary CD TOC table (1..=804 bytes per spec).
+    /// We pass it through verbatim — interpretation is the consumer's
+    /// job since the layout is the CD-DA TOC, not our format.
+    MusicCdId { toc: Vec<u8> },
+    /// `ETCO` event timing codes (v2.3 §4.6 / v2.4 §4.5). The
+    /// `time_format` byte is 1 for MPEG frames, 2 for milliseconds.
+    /// Each entry is `(event_type, timestamp)` per spec §4.5. The
+    /// timestamps must be sorted ascending; we keep wire order so a
+    /// caller can detect a non-conforming source.
+    EventTimingCodes {
+        time_format: u8,
+        events: Vec<(u8, u32)>,
+    },
+    /// `SYLT` synchronised lyrics/text (v2.3 §4.10 / v2.4 §4.9). The
+    /// `lang` is a 3-byte ISO-639-2 code, `time_format` matches ETCO,
+    /// `content_type` is §4.9's 8-value enum (0=other, 1=lyrics,
+    /// 2=transcription, 3=movement, 4=event, 5=chord, 6=trivia,
+    /// 7=URLs-to-webpages, 8=URLs-to-images). Each sync entry is a
+    /// terminated syllable plus a 32-bit timestamp.
+    SyncedLyrics {
+        lang: [u8; 3],
+        time_format: u8,
+        content_type: u8,
+        description: String,
+        syncs: Vec<(String, u32)>,
+    },
+    /// `POSS` position synchronisation (v2.3 §4.22 / v2.4 §4.21).
+    /// Same `time_format` semantics as ETCO/SYLT; the single `position`
+    /// is the offset from the first frame.
+    PositionSync { time_format: u8, position: u32 },
+    /// `RBUF` recommended buffer size (v2.3 §4.19 / v2.4 §4.18).
+    /// `buffer_size` is the wire-encoded 24-bit BE value (0..=0xFFFFFF);
+    /// `embedded_info` is the LSB of the flags byte; `offset_to_next`
+    /// is a 32-bit BE byte offset to the next embedded tag.
+    RecommendedBuffer {
+        buffer_size: u32,
+        embedded_info: bool,
+        offset_to_next: u32,
+    },
+    /// `SEEK` seek frame (v2.4 §4.29). The minimum byte offset from
+    /// the end of this tag to the start of the next embedded tag.
+    Seek { min_offset_to_next_tag: u32 },
+    /// `SIGN` signature frame (v2.4 §4.28). Binds a group of frames
+    /// (per `GRID`) to a binary signature payload.
+    Signature {
+        group_symbol: u8,
+        signature: Vec<u8>,
+    },
+    /// `AENC` audio encryption (v2.3 §4.26 / v2.4 §4.19). Owner is a
+    /// NUL-terminated URL/email; preview start + length are MPEG
+    /// frame counts; encryption info is opaque scheme-specific data.
+    AudioEncryption {
+        owner: String,
+        preview_start: u16,
+        preview_length: u16,
+        encryption_info: Vec<u8>,
+    },
+    /// `LINK` linked information (v2.3 §4.21 / v2.4 §4.20). The 4-byte
+    /// `frame_id` names the frame to link in (3 bytes for v2.3 LINK,
+    /// 4 bytes for v2.4); we always present it as a 4-byte array,
+    /// zero-padding short v2.3 ids on the right. `url` is the
+    /// ISO-8859-1 URL to the linked source. `additional` is any
+    /// scheme-specific extra bytes (terminator-separated text strings
+    /// per spec §4.20).
+    LinkedInfo {
+        frame_id: [u8; 4],
+        url: String,
+        additional: Vec<u8>,
+    },
+    /// Any frame whose id we don't parse structurally (RGAD, CHAP,
+    /// ...). The payload is preserved verbatim so callers or later
+    /// versions can recognise it without needing to reparse.
     Unknown { id: String, raw: Vec<u8> },
 }
 
@@ -484,10 +564,11 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
                     push_unique(&mut out, "ownership_seller".to_string(), seller.clone());
                 }
             }
-            // COMR / SYTC / RVA2 / EQU2 / PRIV / GEOB / UFID carry
-            // structured or binary payloads that do not project
-            // cleanly onto Vorbis-style text pairs. Callers that
-            // need them should match on the enum.
+            // COMR / SYTC / RVA2 / EQU2 / PRIV / GEOB / UFID / MCDI /
+            // ETCO / SYLT / POSS / RBUF / SEEK / SIGN / AENC / LINK
+            // carry structured or binary payloads that do not project
+            // cleanly onto Vorbis-style text pairs. Callers that need
+            // them should match on the enum.
             Id3Frame::Commercial { .. }
             | Id3Frame::SyncedTempo { .. }
             | Id3Frame::Rva2 { .. }
@@ -495,6 +576,15 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
             | Id3Frame::Private { .. }
             | Id3Frame::Geob { .. }
             | Id3Frame::Ufid { .. }
+            | Id3Frame::MusicCdId { .. }
+            | Id3Frame::EventTimingCodes { .. }
+            | Id3Frame::SyncedLyrics { .. }
+            | Id3Frame::PositionSync { .. }
+            | Id3Frame::RecommendedBuffer { .. }
+            | Id3Frame::Seek { .. }
+            | Id3Frame::Signature { .. }
+            | Id3Frame::AudioEncryption { .. }
+            | Id3Frame::LinkedInfo { .. }
             | Id3Frame::Unknown { .. } => {}
         }
     }
@@ -734,6 +824,15 @@ fn dispatch_v23_v24(id: &str, payload: &[u8]) -> Id3Frame {
         "SYTC" => parse_sytc(payload),
         "RVA2" => parse_rva2(payload),
         "EQU2" => parse_equ2(payload),
+        "MCDI" => parse_mcdi(payload),
+        "ETCO" => parse_etco(payload),
+        "SYLT" => parse_sylt(payload),
+        "POSS" => parse_poss(payload),
+        "RBUF" => parse_rbuf(payload),
+        "SEEK" => parse_seek(payload),
+        "SIGN" => parse_sign(payload),
+        "AENC" => parse_aenc(payload),
+        "LINK" => parse_link(payload),
         _ => Id3Frame::Unknown {
             id: id.to_string(),
             raw: payload.to_vec(),
@@ -1359,6 +1458,240 @@ fn parse_equ2(payload: &[u8]) -> Id3Frame {
         identification,
         points,
     }
+}
+
+/// Parse an `MCDI` music CD identifier payload (spec v2.3 §4.5 /
+/// v2.4 §4.4). The body is opaque binary CD-DA TOC bytes; we copy
+/// it through verbatim so callers can do their own TOC analysis.
+fn parse_mcdi(payload: &[u8]) -> Id3Frame {
+    Id3Frame::MusicCdId {
+        toc: payload.to_vec(),
+    }
+}
+
+/// Parse an `ETCO` event timing codes payload (spec v2.3 §4.6 /
+/// v2.4 §4.5). Layout is `time_format $xx` followed by pairs of
+/// `event_type $xx + timestamp $xx xx xx xx`.
+fn parse_etco(payload: &[u8]) -> Id3Frame {
+    if payload.is_empty() {
+        return Id3Frame::EventTimingCodes {
+            time_format: 0,
+            events: Vec::new(),
+        };
+    }
+    let time_format = payload[0];
+    let mut events: Vec<(u8, u32)> = Vec::new();
+    let mut i = 1usize;
+    while i + 5 <= payload.len() {
+        let ev = payload[i];
+        let ts = regular_u32(
+            payload[i + 1],
+            payload[i + 2],
+            payload[i + 3],
+            payload[i + 4],
+        );
+        events.push((ev, ts));
+        i += 5;
+    }
+    Id3Frame::EventTimingCodes {
+        time_format,
+        events,
+    }
+}
+
+/// Parse a `SYLT` synchronised lyrics payload (spec v2.3 §4.10 /
+/// v2.4 §4.9). Layout is:
+///
+/// ```text
+/// Text encoding        $xx
+/// Language             $xx xx xx
+/// Time stamp format    $xx
+/// Content type         $xx
+/// Content descriptor   <text> $00 (00)
+/// For each sync:
+///   Terminated text    <text> $00 (00)
+///   Time stamp         $xx xx xx xx
+/// ```
+fn parse_sylt(payload: &[u8]) -> Id3Frame {
+    if payload.len() < 6 {
+        return Id3Frame::SyncedLyrics {
+            lang: [0; 3],
+            time_format: 0,
+            content_type: 0,
+            description: String::new(),
+            syncs: Vec::new(),
+        };
+    }
+    let enc = payload[0];
+    let lang = [payload[1], payload[2], payload[3]];
+    let time_format = payload[4];
+    let content_type = payload[5];
+    let rest = &payload[6..];
+    let (description, mut after) = split_once_nul(enc, rest);
+    let mut syncs: Vec<(String, u32)> = Vec::new();
+    while !after.is_empty() {
+        let (text, tail) = split_once_nul(enc, after);
+        if tail.len() < 4 {
+            // Truncated entry — keep what we got, stop.
+            if !text.is_empty() {
+                syncs.push((text, 0));
+            }
+            break;
+        }
+        let ts = regular_u32(tail[0], tail[1], tail[2], tail[3]);
+        syncs.push((text, ts));
+        after = &tail[4..];
+    }
+    Id3Frame::SyncedLyrics {
+        lang,
+        time_format,
+        content_type,
+        description,
+        syncs,
+    }
+}
+
+/// Parse a `POSS` position synchronisation payload (spec v2.3 §4.22 /
+/// v2.4 §4.21). Layout: `time_format $xx` + 4-byte BE position.
+fn parse_poss(payload: &[u8]) -> Id3Frame {
+    if payload.is_empty() {
+        return Id3Frame::PositionSync {
+            time_format: 0,
+            position: 0,
+        };
+    }
+    let time_format = payload[0];
+    let position = if payload.len() >= 5 {
+        regular_u32(payload[1], payload[2], payload[3], payload[4])
+    } else {
+        // Spec says the position is 32 bits, but tolerate short forms
+        // by zero-extending the available high bytes.
+        let mut buf = [0u8; 4];
+        let avail = payload.len() - 1;
+        buf[4 - avail..].copy_from_slice(&payload[1..1 + avail]);
+        u32::from_be_bytes(buf)
+    };
+    Id3Frame::PositionSync {
+        time_format,
+        position,
+    }
+}
+
+/// Parse an `RBUF` recommended buffer size payload (spec v2.3 §4.19 /
+/// v2.4 §4.18). Layout: 3-byte BE buffer size + 1-byte flags
+/// (`%0000000x`) + optional 4-byte BE offset-to-next.
+fn parse_rbuf(payload: &[u8]) -> Id3Frame {
+    if payload.len() < 4 {
+        return Id3Frame::RecommendedBuffer {
+            buffer_size: 0,
+            embedded_info: false,
+            offset_to_next: 0,
+        };
+    }
+    let buffer_size = regular_u24(payload[0], payload[1], payload[2]);
+    let embedded_info = (payload[3] & 0x01) != 0;
+    let offset_to_next = if payload.len() >= 8 {
+        regular_u32(payload[4], payload[5], payload[6], payload[7])
+    } else {
+        0
+    };
+    Id3Frame::RecommendedBuffer {
+        buffer_size,
+        embedded_info,
+        offset_to_next,
+    }
+}
+
+/// Parse a `SEEK` seek-frame payload (spec v2.4 §4.29). Layout is a
+/// single 32-bit BE byte offset.
+fn parse_seek(payload: &[u8]) -> Id3Frame {
+    let min = if payload.len() >= 4 {
+        regular_u32(payload[0], payload[1], payload[2], payload[3])
+    } else {
+        0
+    };
+    Id3Frame::Seek {
+        min_offset_to_next_tag: min,
+    }
+}
+
+/// Parse a `SIGN` signature-frame payload (spec v2.4 §4.28). Layout:
+/// 1-byte group symbol + remainder = binary signature.
+fn parse_sign(payload: &[u8]) -> Id3Frame {
+    if payload.is_empty() {
+        return Id3Frame::Signature {
+            group_symbol: 0,
+            signature: Vec::new(),
+        };
+    }
+    Id3Frame::Signature {
+        group_symbol: payload[0],
+        signature: payload[1..].to_vec(),
+    }
+}
+
+/// Parse an `AENC` audio-encryption payload (spec v2.3 §4.26 / v2.4
+/// §4.19). Layout: NUL-terminated owner identifier + 2-byte BE
+/// preview-start + 2-byte BE preview-length + opaque encryption-info.
+fn parse_aenc(payload: &[u8]) -> Id3Frame {
+    let (owner_bytes, rest) = split_once_nul_bytes(payload);
+    let owner = latin1_to_string(owner_bytes);
+    if rest.len() < 4 {
+        return Id3Frame::AudioEncryption {
+            owner,
+            preview_start: 0,
+            preview_length: 0,
+            encryption_info: rest.to_vec(),
+        };
+    }
+    let preview_start = u16::from_be_bytes([rest[0], rest[1]]);
+    let preview_length = u16::from_be_bytes([rest[2], rest[3]]);
+    let encryption_info = rest[4..].to_vec();
+    Id3Frame::AudioEncryption {
+        owner,
+        preview_start,
+        preview_length,
+        encryption_info,
+    }
+}
+
+/// Parse a `LINK` linked-information payload (spec v2.3 §4.21 /
+/// v2.4 §4.20). v2.3 uses a 3-byte frame identifier while v2.4 uses
+/// 4 bytes. We disambiguate by scanning the *next* byte after a
+/// 3-character ASCII id triple: if it's a 4th ASCII upper/digit
+/// character we treat the id as 4 bytes (v2.4); otherwise the 3-byte
+/// v2.3 form, with the 4th array slot zero-padded for representation.
+fn parse_link(payload: &[u8]) -> Id3Frame {
+    if payload.len() < 3 {
+        return Id3Frame::LinkedInfo {
+            frame_id: [0; 4],
+            url: String::new(),
+            additional: Vec::new(),
+        };
+    }
+    let is_v24_id = payload.len() >= 4 && is_id_char(payload[3]);
+    let (frame_id, body): ([u8; 4], &[u8]) = if is_v24_id {
+        (
+            [payload[0], payload[1], payload[2], payload[3]],
+            &payload[4..],
+        )
+    } else {
+        ([payload[0], payload[1], payload[2], 0], &payload[3..])
+    };
+    let (url_bytes, additional_bytes) = split_once_nul_bytes(body);
+    let url = latin1_to_string(url_bytes);
+    Id3Frame::LinkedInfo {
+        frame_id,
+        url,
+        additional: additional_bytes.to_vec(),
+    }
+}
+
+/// True for the upper-ASCII letters / digits used in ID3v2 frame
+/// identifiers. The spec restricts frame ids to `A-Z 0-9` so the
+/// LINK 3-vs-4 disambiguator can rely on this character class.
+fn is_id_char(b: u8) -> bool {
+    b.is_ascii_uppercase() || b.is_ascii_digit()
 }
 
 /// Decode a big-endian unsigned integer of arbitrary width into `u64`.
@@ -2117,6 +2450,118 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
                 payload.extend_from_slice(&adj.to_be_bytes());
             }
             Ok(("EQU2".to_string(), payload))
+        }
+        Id3Frame::MusicCdId { toc } => Ok(("MCDI".to_string(), toc.clone())),
+        Id3Frame::EventTimingCodes {
+            time_format,
+            events,
+        } => {
+            let mut payload = Vec::new();
+            payload.push(*time_format);
+            for &(ev, ts) in events {
+                payload.push(ev);
+                payload.extend_from_slice(&ts.to_be_bytes());
+            }
+            Ok(("ETCO".to_string(), payload))
+        }
+        Id3Frame::SyncedLyrics {
+            lang,
+            time_format,
+            content_type,
+            description,
+            syncs,
+        } => {
+            let mut payload = Vec::new();
+            payload.push(text_enc);
+            payload.extend_from_slice(lang);
+            payload.push(*time_format);
+            payload.push(*content_type);
+            encode_string(&mut payload, text_enc, description);
+            encode_terminator(&mut payload, text_enc);
+            for (text, ts) in syncs {
+                encode_string(&mut payload, text_enc, text);
+                encode_terminator(&mut payload, text_enc);
+                payload.extend_from_slice(&ts.to_be_bytes());
+            }
+            Ok(("SYLT".to_string(), payload))
+        }
+        Id3Frame::PositionSync {
+            time_format,
+            position,
+        } => {
+            let mut payload = Vec::new();
+            payload.push(*time_format);
+            payload.extend_from_slice(&position.to_be_bytes());
+            Ok(("POSS".to_string(), payload))
+        }
+        Id3Frame::RecommendedBuffer {
+            buffer_size,
+            embedded_info,
+            offset_to_next,
+        } => {
+            let mut payload = Vec::new();
+            // Buffer size is a 24-bit BE field. Clamp at 0xFFFFFF to
+            // keep the wire form spec-conformant even if a caller
+            // supplied a larger value.
+            let clamped = (*buffer_size).min(0x00FF_FFFF);
+            payload.push(((clamped >> 16) & 0xFF) as u8);
+            payload.push(((clamped >> 8) & 0xFF) as u8);
+            payload.push((clamped & 0xFF) as u8);
+            // Flags byte: only the LSB is defined by spec.
+            payload.push(if *embedded_info { 0x01 } else { 0x00 });
+            payload.extend_from_slice(&offset_to_next.to_be_bytes());
+            Ok(("RBUF".to_string(), payload))
+        }
+        Id3Frame::Seek {
+            min_offset_to_next_tag,
+        } => Ok((
+            "SEEK".to_string(),
+            min_offset_to_next_tag.to_be_bytes().to_vec(),
+        )),
+        Id3Frame::Signature {
+            group_symbol,
+            signature,
+        } => {
+            let mut payload = Vec::with_capacity(1 + signature.len());
+            payload.push(*group_symbol);
+            payload.extend_from_slice(signature);
+            Ok(("SIGN".to_string(), payload))
+        }
+        Id3Frame::AudioEncryption {
+            owner,
+            preview_start,
+            preview_length,
+            encryption_info,
+        } => {
+            let mut payload = Vec::new();
+            encode_latin1(&mut payload, owner);
+            payload.push(0);
+            payload.extend_from_slice(&preview_start.to_be_bytes());
+            payload.extend_from_slice(&preview_length.to_be_bytes());
+            payload.extend_from_slice(encryption_info);
+            Ok(("AENC".to_string(), payload))
+        }
+        Id3Frame::LinkedInfo {
+            frame_id,
+            url,
+            additional,
+        } => {
+            let mut payload = Vec::new();
+            // In v2.4 the frame id is 4 bytes; in v2.3 it is 3.
+            // We emit per the *target* version so the on-wire layout
+            // matches the spec the consumer expects.
+            match version {
+                Id3Version::V2_3 | Id3Version::V2_2 | Id3Version::V1 => {
+                    payload.extend_from_slice(&frame_id[..3]);
+                }
+                Id3Version::V2_4 => {
+                    payload.extend_from_slice(frame_id);
+                }
+            }
+            encode_latin1(&mut payload, url);
+            payload.push(0);
+            payload.extend_from_slice(additional);
+            Ok(("LINK".to_string(), payload))
         }
         Id3Frame::Unknown { id, raw } => {
             // Promote v2.2 ids (3 chars) to their v2.3 equivalents on

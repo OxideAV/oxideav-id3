@@ -885,3 +885,355 @@ fn popm_truncated_no_rating() {
     });
     assert_eq!(pop, Some((String::new(), 0u8, 0u64)));
 }
+
+/// `MCDI` music CD identifier round-trip. The TOC body is opaque
+/// binary so we just confirm it survives parse + write byte-exact.
+#[test]
+fn roundtrip_mcdi() {
+    let toc: Vec<u8> = (0..200u8).collect();
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::MusicCdId { toc: toc.clone() }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::MusicCdId { toc } => Some(toc.clone()),
+        _ => None,
+    });
+    assert_eq!(got, Some(toc));
+}
+
+/// `ETCO` event timing codes round-trip. Three events: end-of-silence
+/// at t=0, intro start at t=1500 ms, outro end at t=180_000.
+#[test]
+fn roundtrip_etco() {
+    let events = vec![(0x01u8, 0u32), (0x02, 1_500), (0x05, 180_000)];
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::EventTimingCodes {
+            time_format: 0x02, // milliseconds
+            events: events.clone(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::EventTimingCodes {
+            time_format,
+            events,
+        } => Some((*time_format, events.clone())),
+        _ => None,
+    });
+    assert_eq!(got, Some((0x02u8, events)));
+}
+
+/// `SYLT` synchronised lyrics round-trip in both v2.3 (UTF-16) and
+/// v2.4 (UTF-8) so we exercise the encoding-aware terminator length
+/// inside the sync-record loop.
+#[test]
+fn roundtrip_sylt() {
+    for &v in &[Id3Version::V2_3, Id3Version::V2_4] {
+        let syncs = vec![
+            ("Strang".to_string(), 0u32),
+            ("ers ".to_string(), 1_000),
+            ("in the ".to_string(), 2_000),
+            ("night".to_string(), 3_000),
+        ];
+        let tag = Id3Tag {
+            version: v,
+            frames: vec![Id3Frame::SyncedLyrics {
+                lang: *b"eng",
+                time_format: 0x02,
+                content_type: 0x01, // lyrics
+                description: "Sinatra".into(),
+                syncs: syncs.clone(),
+            }],
+        };
+        let bytes = write_tag(&tag, v).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        let got = parsed.frames.iter().find_map(|f| match f {
+            Id3Frame::SyncedLyrics {
+                lang,
+                time_format,
+                content_type,
+                description,
+                syncs,
+            } => Some((
+                *lang,
+                *time_format,
+                *content_type,
+                description.clone(),
+                syncs.clone(),
+            )),
+            _ => None,
+        });
+        assert_eq!(
+            got,
+            Some((*b"eng", 0x02u8, 0x01u8, "Sinatra".to_string(), syncs)),
+            "version {v:?}"
+        );
+    }
+}
+
+/// `POSS` position synchronisation round-trip — a 45-second-in
+/// resume point in milliseconds.
+#[test]
+fn roundtrip_poss() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::PositionSync {
+            time_format: 0x02,
+            position: 45_000,
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::PositionSync {
+            time_format,
+            position,
+        } => Some((*time_format, *position)),
+        _ => None,
+    });
+    assert_eq!(got, Some((0x02u8, 45_000u32)));
+}
+
+/// `RBUF` recommended buffer size round-trip with the embedded-info
+/// flag set and a non-zero offset-to-next.
+#[test]
+fn roundtrip_rbuf() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::RecommendedBuffer {
+            buffer_size: 0x12_3456,
+            embedded_info: true,
+            offset_to_next: 0xCAFE_BABE,
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::RecommendedBuffer {
+            buffer_size,
+            embedded_info,
+            offset_to_next,
+        } => Some((*buffer_size, *embedded_info, *offset_to_next)),
+        _ => None,
+    });
+    assert_eq!(got, Some((0x0012_3456u32, true, 0xCAFE_BABEu32)));
+}
+
+/// `RBUF` buffer-size clamping: a value above 24-bit max gets clamped
+/// to 0xFF_FFFF on write (per spec the field is 3 bytes wide).
+#[test]
+fn rbuf_clamps_oversize_buffer_size() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::RecommendedBuffer {
+            buffer_size: 0xFFFF_FFFF,
+            embedded_info: false,
+            offset_to_next: 0,
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::RecommendedBuffer { buffer_size, .. } => Some(*buffer_size),
+        _ => None,
+    });
+    assert_eq!(got, Some(0x00FF_FFFFu32));
+}
+
+/// `SEEK` round-trip — a single 32-bit offset.
+#[test]
+fn roundtrip_seek() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Seek {
+            min_offset_to_next_tag: 0x0010_0000,
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Seek {
+            min_offset_to_next_tag,
+        } => Some(*min_offset_to_next_tag),
+        _ => None,
+    });
+    assert_eq!(got, Some(0x0010_0000u32));
+}
+
+/// `SIGN` round-trip with a small binary signature.
+#[test]
+fn roundtrip_sign() {
+    let sig = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Signature {
+            group_symbol: 0x80,
+            signature: sig.clone(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Signature {
+            group_symbol,
+            signature,
+        } => Some((*group_symbol, signature.clone())),
+        _ => None,
+    });
+    assert_eq!(got, Some((0x80u8, sig)));
+}
+
+/// `AENC` audio-encryption round-trip with a non-trivial encryption
+/// info block.
+#[test]
+fn roundtrip_aenc() {
+    let info = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::AudioEncryption {
+            owner: "https://example.com/crypto".into(),
+            preview_start: 100,
+            preview_length: 50,
+            encryption_info: info.clone(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::AudioEncryption {
+            owner,
+            preview_start,
+            preview_length,
+            encryption_info,
+        } => Some((
+            owner.clone(),
+            *preview_start,
+            *preview_length,
+            encryption_info.clone(),
+        )),
+        _ => None,
+    });
+    assert_eq!(
+        got,
+        Some((
+            "https://example.com/crypto".to_string(),
+            100u16,
+            50u16,
+            info
+        ))
+    );
+}
+
+/// `LINK` round-trip in v2.4 form (4-byte frame id) — links a TPE1
+/// frame from another file.
+#[test]
+fn roundtrip_link_v24() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::LinkedInfo {
+            frame_id: *b"TPE1",
+            url: "https://example.com/canonical.mp3".into(),
+            additional: Vec::new(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::LinkedInfo {
+            frame_id,
+            url,
+            additional,
+        } => Some((*frame_id, url.clone(), additional.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        got,
+        Some((
+            *b"TPE1",
+            "https://example.com/canonical.mp3".to_string(),
+            Vec::<u8>::new()
+        ))
+    );
+}
+
+/// `LINK` round-trip in v2.3 form (3-byte frame id). Writing under
+/// v2.3 emits a 3-byte id; the parser then promotes it back into the
+/// 4-byte `[frame_id]` slot with the trailing byte zero-padded.
+#[test]
+fn roundtrip_link_v23() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![Id3Frame::LinkedInfo {
+            frame_id: [b'T', b'P', b'1', 0],
+            url: "https://example.com/legacy.mp3".into(),
+            additional: Vec::new(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::LinkedInfo {
+            frame_id,
+            url,
+            additional,
+        } => Some((*frame_id, url.clone(), additional.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        got,
+        Some((
+            [b'T', b'P', b'1', 0],
+            "https://example.com/legacy.mp3".to_string(),
+            Vec::<u8>::new()
+        ))
+    );
+}
+
+/// `ETCO` truncated event stream — a stray trailing byte after the
+/// last 5-byte (event, ts) pair must not panic; it gets dropped.
+#[test]
+fn etco_truncated_trailing_byte_is_dropped() {
+    // Build an ETCO frame: time_format + one valid (ev, ts) pair +
+    // a single stray byte.
+    let mut frame = Vec::new();
+    frame.extend_from_slice(b"ETCO");
+    let body = vec![
+        0x02, // ms
+        0x01, 0x00, 0x00, 0x00, 0x10, // ev=$01 @ t=16
+        0x05, // stray
+    ];
+    let size = body.len() as u32;
+    frame.push(((size >> 21) & 0x7F) as u8);
+    frame.push(((size >> 14) & 0x7F) as u8);
+    frame.push(((size >> 7) & 0x7F) as u8);
+    frame.push((size & 0x7F) as u8);
+    frame.extend_from_slice(&[0, 0]); // flags
+    frame.extend_from_slice(&body);
+
+    let mut tag_bytes = Vec::new();
+    tag_bytes.extend_from_slice(b"ID3");
+    tag_bytes.push(4);
+    tag_bytes.push(0);
+    tag_bytes.push(0);
+    let total = frame.len() as u32;
+    tag_bytes.push(((total >> 21) & 0x7F) as u8);
+    tag_bytes.push(((total >> 14) & 0x7F) as u8);
+    tag_bytes.push(((total >> 7) & 0x7F) as u8);
+    tag_bytes.push((total & 0x7F) as u8);
+    tag_bytes.extend_from_slice(&frame);
+
+    let (parsed, _) = parse_tag(&tag_bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::EventTimingCodes {
+            time_format,
+            events,
+        } => Some((*time_format, events.clone())),
+        _ => None,
+    });
+    assert_eq!(got, Some((0x02u8, vec![(0x01u8, 16u32)])));
+}
