@@ -67,6 +67,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   round-trips through `write_tag` / `parse_tag` for both v2.3 and
   v2.4 (the wire layout is version-independent, identical in shape to
   `GRID`), including the symbol-only minimum frame.
+- Structural parser + writer for `ASPI` audio seek point index
+  (v2.4 §4.30): 32-bit indexed-data start + 32-bit indexed-data
+  length + 16-bit number of index points + 8/16 bits-per-point + N
+  `Fi` fraction entries. New `Id3Frame::AudioSeekPointIndex` variant
+  round-trips through `write_tag` / `parse_tag` for both the 8-bit
+  (short-file) and 16-bit (long-file) precision modes. The writer
+  refuses bit widths other than 8 or 16 (a conformant parser cannot
+  reconstruct intermediate widths) and caps `N` at `u16::MAX`. The
+  parser tolerates a fraction list shorter than the declared `N`
+  (the truncated tail is dropped) and a sub-11-byte payload
+  (degenerates to a zeroed frame rather than failing the whole tag).
+  ASPI is declared v2.4-only per spec but the wire layout is
+  byte-aligned and version-independent, so the writer accepts it
+  under any version envelope.
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-id3/compare/v0.0.4...v0.0.5) - 2026-04-19
 

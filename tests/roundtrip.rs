@@ -1305,6 +1305,71 @@ fn roundtrip_link_v23() {
     );
 }
 
+/// `ASPI` round-trip in v2.4 — a 100-point 16-bit index covering a
+/// notional VBR MP3 file. The shape is byte-aligned so the bytes
+/// written by `write_tag` parse back to the same fractions.
+#[test]
+fn roundtrip_aspi_v24_16bit() {
+    // 100 evenly-distributed fractions across the full u16 range, the
+    // shape a real ASPI emitter would produce per spec §4.30.
+    let fractions: Vec<u16> = (0..100u32)
+        .map(|i| ((i * (u16::MAX as u32)) / 99) as u16)
+        .collect();
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::AudioSeekPointIndex {
+            indexed_data_start: 4096,
+            indexed_data_length: 12_345_678,
+            bits_per_index_point: 16,
+            fractions: fractions.clone(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::AudioSeekPointIndex {
+            indexed_data_start,
+            indexed_data_length,
+            bits_per_index_point,
+            fractions,
+        } => Some((
+            *indexed_data_start,
+            *indexed_data_length,
+            *bits_per_index_point,
+            fractions.clone(),
+        )),
+        _ => None,
+    });
+    assert_eq!(got, Some((4096u32, 12_345_678u32, 16u8, fractions)));
+}
+
+/// `ASPI` round-trip in v2.4 with the 8-bit precision recommended for
+/// short files (under 5 minutes of audio per spec §4.30).
+#[test]
+fn roundtrip_aspi_v24_8bit() {
+    let fractions: Vec<u16> = (0..10u16).map(|i| i * 25).collect();
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::AudioSeekPointIndex {
+            indexed_data_start: 0,
+            indexed_data_length: 30_000,
+            bits_per_index_point: 8,
+            fractions: fractions.clone(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::AudioSeekPointIndex {
+            bits_per_index_point,
+            fractions,
+            ..
+        } => Some((*bits_per_index_point, fractions.clone())),
+        _ => None,
+    });
+    assert_eq!(got, Some((8u8, fractions)));
+}
+
 /// `ETCO` truncated event stream — a stray trailing byte after the
 /// last 5-byte (event, ts) pair must not panic; it gets dropped.
 #[test]

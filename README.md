@@ -135,8 +135,12 @@ are preserved on write.
   encryption-specific data), `AENC` audio encryption (owner +
   preview start/length + opaque encryption-info), `LINK` linked
   information (3-byte v2.3 / 4-byte v2.4 frame-id + URL + spec-shaped
-  additional data). All twenty-two round-trip both directions for
-  v2.3 and v2.4.
+  additional data), `ASPI` audio seek point index (v2.4 §4.30:
+  indexed-data start + length + 16-bit N + 8/16 bits-per-point + N
+  `Fi` fractions; writer refuses non-8/16 bit widths since a
+  conformant parser couldn't reconstruct them). All twenty-three
+  round-trip both directions for v2.3 and v2.4 (ASPI is v2.4-only per
+  spec but the wire layout is byte-aligned and version-independent).
 - Everything else surfaces as `Id3Frame::Unknown { id, raw }` with the
   payload preserved so it can be written back untouched.
 

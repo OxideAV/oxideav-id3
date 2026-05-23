@@ -60,6 +60,7 @@
 //! * `GRID` group identification registration.
 //! * `ENCR` encryption method registration.
 //! * `AENC` audio encryption / `LINK` linked information.
+//! * `ASPI` audio seek point index (v2.4).
 //!
 //! Everything else lands in [`Id3Frame::Unknown`] with the raw payload
 //! preserved so future code can extend recognition without reparsing.
@@ -296,6 +297,26 @@ pub enum Id3Frame {
         frame_id: [u8; 4],
         url: String,
         additional: Vec<u8>,
+    },
+    /// `ASPI` audio seek point index (v2.4 §4.30). Provides a list of
+    /// seek points within the audio data for variable-bit-rate streams.
+    /// `indexed_data_start` is a byte offset from the beginning of the
+    /// file; `indexed_data_length` is the byte length of the audio
+    /// being indexed; each entry in `fractions` is an `Fi` value in the
+    /// numerator of `Fi / 2^bits_per_index_point` (so an 8-bit point
+    /// fits in `u16` trivially and a 16-bit point uses the full width).
+    /// `bits_per_index_point` is 8 or 16 per spec; the writer rejects
+    /// other widths. The presence of an ASPI frame implies a TLEN frame
+    /// must also be present in the tag (this crate does not enforce
+    /// that cross-frame invariant — that is a caller-level concern).
+    /// ASPI is v2.4-only per spec but the wire layout is byte-aligned
+    /// and version-independent, so the writer emits it under any
+    /// version envelope.
+    AudioSeekPointIndex {
+        indexed_data_start: u32,
+        indexed_data_length: u32,
+        bits_per_index_point: u8,
+        fractions: Vec<u16>,
     },
     /// Any frame whose id we don't parse structurally (RGAD, CHAP,
     /// ...). The payload is preserved verbatim so callers or later
@@ -618,6 +639,7 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
             | Id3Frame::EncryptionMethod { .. }
             | Id3Frame::AudioEncryption { .. }
             | Id3Frame::LinkedInfo { .. }
+            | Id3Frame::AudioSeekPointIndex { .. }
             | Id3Frame::Unknown { .. } => {}
         }
     }
@@ -868,6 +890,7 @@ fn dispatch_v23_v24(id: &str, payload: &[u8]) -> Id3Frame {
         "ENCR" => parse_encr(payload),
         "AENC" => parse_aenc(payload),
         "LINK" => parse_link(payload),
+        "ASPI" => parse_aspi(payload),
         _ => Id3Frame::Unknown {
             id: id.to_string(),
             raw: payload.to_vec(),
@@ -1760,6 +1783,65 @@ fn parse_link(payload: &[u8]) -> Id3Frame {
         frame_id,
         url,
         additional: additional_bytes.to_vec(),
+    }
+}
+
+/// Parse an `ASPI` audio-seek-point-index payload (spec v2.4 §4.30).
+/// Layout:
+///
+/// ```text
+///   Indexed data start (S)     $xx xx xx xx        (BE u32)
+///   Indexed data length (L)    $xx xx xx xx        (BE u32)
+///   Number of index points (N) $xx xx              (BE u16)
+///   Bits per index point (b)   $xx                 (8 or 16)
+///   Fraction at index (Fi)     $xx (xx)            (N entries, 1 or 2 bytes each)
+/// ```
+///
+/// The fraction width depends on `bits_per_index_point`; values other
+/// than 8 or 16 are accepted as a passthrough (fractions stay empty)
+/// rather than rejected, so callers see the malformed-but-not-fatal
+/// header and can decide how to react. Truncated trailing bytes in the
+/// fraction list are dropped at parse time.
+fn parse_aspi(payload: &[u8]) -> Id3Frame {
+    if payload.len() < 11 {
+        return Id3Frame::AudioSeekPointIndex {
+            indexed_data_start: 0,
+            indexed_data_length: 0,
+            bits_per_index_point: 0,
+            fractions: Vec::new(),
+        };
+    }
+    let indexed_data_start = regular_u32(payload[0], payload[1], payload[2], payload[3]);
+    let indexed_data_length = regular_u32(payload[4], payload[5], payload[6], payload[7]);
+    let n = u16::from_be_bytes([payload[8], payload[9]]) as usize;
+    let bits = payload[10];
+    let body = &payload[11..];
+    let mut fractions = Vec::with_capacity(n);
+    match bits {
+        8 => {
+            let take = n.min(body.len());
+            for &b in &body[..take] {
+                fractions.push(b as u16);
+            }
+        }
+        16 => {
+            let take = n.min(body.len() / 2);
+            for i in 0..take {
+                fractions.push(u16::from_be_bytes([body[i * 2], body[i * 2 + 1]]));
+            }
+        }
+        _ => {
+            // Non-conforming width — pass through with the header
+            // captured but no fractions decoded; a downstream consumer
+            // can match on `bits_per_index_point` and inspect the raw
+            // form if needed.
+        }
+    }
+    Id3Frame::AudioSeekPointIndex {
+        indexed_data_start,
+        indexed_data_length,
+        bits_per_index_point: bits,
+        fractions,
     }
 }
 
@@ -2663,6 +2745,45 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
             payload.extend_from_slice(additional);
             Ok(("LINK".to_string(), payload))
         }
+        Id3Frame::AudioSeekPointIndex {
+            indexed_data_start,
+            indexed_data_length,
+            bits_per_index_point,
+            fractions,
+        } => {
+            // Spec §4.30 fixes the bits-per-point at 8 or 16. Anything
+            // else is a caller bug; refuse rather than silently emit an
+            // ambiguous frame the parser couldn't reconstruct.
+            if *bits_per_index_point != 8 && *bits_per_index_point != 16 {
+                return Err(Error::invalid("ASPI bits_per_index_point must be 8 or 16"));
+            }
+            // The N field is a u16 BE so the writer caps at u16::MAX
+            // (65535 points) and refuses anything larger rather than
+            // truncate silently.
+            if fractions.len() > u16::MAX as usize {
+                return Err(Error::invalid("ASPI number of index points exceeds u16"));
+            }
+            let n = fractions.len() as u16;
+            let per_point = if *bits_per_index_point == 8 { 1 } else { 2 };
+            let mut payload = Vec::with_capacity(11 + fractions.len() * per_point);
+            payload.extend_from_slice(&indexed_data_start.to_be_bytes());
+            payload.extend_from_slice(&indexed_data_length.to_be_bytes());
+            payload.extend_from_slice(&n.to_be_bytes());
+            payload.push(*bits_per_index_point);
+            if *bits_per_index_point == 8 {
+                // 8-bit form: low byte of each fraction. Clamp at 0xFF
+                // so a caller that put a wider value in the `u16` slot
+                // gets a defined truncation, not a wrap.
+                for &f in fractions {
+                    payload.push(f.min(0xFF) as u8);
+                }
+            } else {
+                for &f in fractions {
+                    payload.extend_from_slice(&f.to_be_bytes());
+                }
+            }
+            Ok(("ASPI".to_string(), payload))
+        }
         Id3Frame::Unknown { id, raw } => {
             // Promote v2.2 ids (3 chars) to their v2.3 equivalents on
             // write so the output is always a well-formed v2.3/v2.4
@@ -3242,6 +3363,164 @@ mod tests {
                 other => panic!("expected EncryptionMethod, got {other:?}"),
             }
         }
+    }
+
+    /// `parse_aspi` decodes an 8-bit-per-point index. Spec §4.30
+    /// header layout: S(4) + L(4) + N(2) + b(1) + N×b/8 fraction bytes.
+    #[test]
+    fn aspi_parse_handcrafted_8bit() {
+        let mut payload = Vec::new();
+        // S = 0x0000_0100 (256 byte file offset to start of audio)
+        payload.extend_from_slice(&0x0000_0100u32.to_be_bytes());
+        // L = 0x0001_0000 (65536 byte indexed audio length)
+        payload.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        // N = 4 points
+        payload.extend_from_slice(&4u16.to_be_bytes());
+        // b = 8 bits per point
+        payload.push(8);
+        // Fractions: 0x00, 0x40, 0x80, 0xC0 (quarters of the audio)
+        payload.extend_from_slice(&[0x00, 0x40, 0x80, 0xC0]);
+        match parse_aspi(&payload) {
+            Id3Frame::AudioSeekPointIndex {
+                indexed_data_start,
+                indexed_data_length,
+                bits_per_index_point,
+                fractions,
+            } => {
+                assert_eq!(indexed_data_start, 0x0000_0100);
+                assert_eq!(indexed_data_length, 0x0001_0000);
+                assert_eq!(bits_per_index_point, 8);
+                assert_eq!(fractions, vec![0x00, 0x40, 0x80, 0xC0]);
+            }
+            _ => panic!("expected AudioSeekPointIndex"),
+        }
+    }
+
+    /// 16-bit-per-point `ASPI` reads two bytes per fraction.
+    #[test]
+    fn aspi_parse_handcrafted_16bit() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_be_bytes()); // S
+        payload.extend_from_slice(&0x1000u32.to_be_bytes()); // L
+        payload.extend_from_slice(&3u16.to_be_bytes()); // N
+        payload.push(16); // b
+        payload.extend_from_slice(&[
+            0x00, 0x00, // F0 = 0
+            0x55, 0x55, // F1 = 0x5555
+            0xAA, 0xAA, // F2 = 0xAAAA
+        ]);
+        match parse_aspi(&payload) {
+            Id3Frame::AudioSeekPointIndex {
+                bits_per_index_point,
+                fractions,
+                ..
+            } => {
+                assert_eq!(bits_per_index_point, 16);
+                assert_eq!(fractions, vec![0x0000, 0x5555, 0xAAAA]);
+            }
+            _ => panic!("expected AudioSeekPointIndex"),
+        }
+    }
+
+    /// Truncated fraction list (N claims more points than the payload
+    /// carries) drops the missing tail rather than panicking.
+    #[test]
+    fn aspi_parse_truncated_fraction_list_drops_tail() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_be_bytes()); // S
+        payload.extend_from_slice(&100u32.to_be_bytes()); // L
+        payload.extend_from_slice(&10u16.to_be_bytes()); // N claims 10
+        payload.push(8); // b
+        payload.extend_from_slice(&[0x10, 0x20, 0x30]); // only 3 fractions present
+        match parse_aspi(&payload) {
+            Id3Frame::AudioSeekPointIndex { fractions, .. } => {
+                assert_eq!(fractions, vec![0x10, 0x20, 0x30]);
+            }
+            _ => panic!("expected AudioSeekPointIndex"),
+        }
+    }
+
+    /// A payload shorter than the 11-byte fixed header degenerates to
+    /// a zeroed `AudioSeekPointIndex` rather than failing the parse.
+    #[test]
+    fn aspi_parse_short_header_degenerate() {
+        let payload = [0x00, 0x01, 0x02];
+        match parse_aspi(&payload) {
+            Id3Frame::AudioSeekPointIndex {
+                indexed_data_start,
+                indexed_data_length,
+                bits_per_index_point,
+                fractions,
+            } => {
+                assert_eq!(indexed_data_start, 0);
+                assert_eq!(indexed_data_length, 0);
+                assert_eq!(bits_per_index_point, 0);
+                assert!(fractions.is_empty());
+            }
+            _ => panic!("expected AudioSeekPointIndex"),
+        }
+    }
+
+    /// `ASPI` round-trips through `write_tag` / `parse_tag` for v2.4
+    /// (the wire layout is byte-aligned and version-independent, but
+    /// spec §4.30 declares the frame in v2.4 only).
+    #[test]
+    fn aspi_roundtrips_v24() {
+        for bits in [8u8, 16u8] {
+            let fractions: Vec<u16> = (0..5).map(|i| (i as u16) * 0x1000).collect();
+            let original = Id3Tag {
+                version: Id3Version::V2_4,
+                frames: vec![Id3Frame::AudioSeekPointIndex {
+                    indexed_data_start: 0x0000_2A00,
+                    indexed_data_length: 0x000F_4240,
+                    bits_per_index_point: bits,
+                    fractions: if bits == 8 {
+                        fractions.iter().map(|&f| f >> 8).collect()
+                    } else {
+                        fractions.clone()
+                    },
+                }],
+            };
+            let bytes = write_tag(&original, Id3Version::V2_4).unwrap();
+            let (parsed, _) = parse_tag(&bytes).unwrap();
+            assert_eq!(parsed.frames.len(), 1);
+            match &parsed.frames[0] {
+                Id3Frame::AudioSeekPointIndex {
+                    indexed_data_start,
+                    indexed_data_length,
+                    bits_per_index_point,
+                    fractions: got,
+                } => {
+                    assert_eq!(*indexed_data_start, 0x0000_2A00);
+                    assert_eq!(*indexed_data_length, 0x000F_4240);
+                    assert_eq!(*bits_per_index_point, bits);
+                    let expected: Vec<u16> = if bits == 8 {
+                        fractions.iter().map(|&f| f >> 8).collect()
+                    } else {
+                        fractions.clone()
+                    };
+                    assert_eq!(got, &expected);
+                }
+                other => panic!("expected AudioSeekPointIndex, got {other:?}"),
+            }
+        }
+    }
+
+    /// Writing an `ASPI` with a non-conforming bit width is a hard
+    /// error — the resulting bytes would be unreadable by a conformant
+    /// parser, so we refuse rather than emit them.
+    #[test]
+    fn aspi_write_rejects_unsupported_bits() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::AudioSeekPointIndex {
+                indexed_data_start: 0,
+                indexed_data_length: 0,
+                bits_per_index_point: 12, // not 8 or 16
+                fractions: vec![0, 1, 2],
+            }],
+        };
+        assert!(write_tag(&tag, Id3Version::V2_4).is_err());
     }
 
     /// `encode_counter` produces 4 bytes for a u32-range value, 5 for
