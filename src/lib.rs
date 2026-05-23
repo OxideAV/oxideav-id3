@@ -57,6 +57,7 @@
 //! * `SYLT` synchronised lyrics/text.
 //! * `RBUF` recommended buffer size.
 //! * `SEEK` seek frame / `SIGN` signature frame.
+//! * `GRID` group identification registration.
 //! * `AENC` audio encryption / `LINK` linked information.
 //!
 //! Everything else lands in [`Id3Frame::Unknown`] with the raw payload
@@ -244,6 +245,20 @@ pub enum Id3Frame {
     Signature {
         group_symbol: u8,
         signature: Vec<u8>,
+    },
+    /// `GRID` group identification registration (v2.3 §4.27 / v2.4
+    /// §4.26). Registers a group symbol so that the per-frame grouping
+    /// flag (and `SIGN`) can refer to a set of frames as one unit.
+    /// `owner` is a NUL-terminated ISO-8859-1 owner identifier (a URL
+    /// with an email per spec), `group_symbol` is the $80-F0 value that
+    /// associates frames with this group throughout the tag, and `data`
+    /// is the optional group-dependent payload (e.g. a digital
+    /// signature). Multiple `GRID` frames may coexist but each must
+    /// carry a distinct symbol and a distinct owner.
+    GroupId {
+        owner: String,
+        group_symbol: u8,
+        data: Vec<u8>,
     },
     /// `AENC` audio encryption (v2.3 §4.26 / v2.4 §4.19). Owner is a
     /// NUL-terminated URL/email; preview start + length are MPEG
@@ -565,10 +580,10 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
                 }
             }
             // COMR / SYTC / RVA2 / EQU2 / PRIV / GEOB / UFID / MCDI /
-            // ETCO / SYLT / POSS / RBUF / SEEK / SIGN / AENC / LINK
-            // carry structured or binary payloads that do not project
-            // cleanly onto Vorbis-style text pairs. Callers that need
-            // them should match on the enum.
+            // ETCO / SYLT / POSS / RBUF / SEEK / SIGN / GRID / AENC /
+            // LINK carry structured or binary payloads that do not
+            // project cleanly onto Vorbis-style text pairs. Callers that
+            // need them should match on the enum.
             Id3Frame::Commercial { .. }
             | Id3Frame::SyncedTempo { .. }
             | Id3Frame::Rva2 { .. }
@@ -583,6 +598,7 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
             | Id3Frame::RecommendedBuffer { .. }
             | Id3Frame::Seek { .. }
             | Id3Frame::Signature { .. }
+            | Id3Frame::GroupId { .. }
             | Id3Frame::AudioEncryption { .. }
             | Id3Frame::LinkedInfo { .. }
             | Id3Frame::Unknown { .. } => {}
@@ -831,6 +847,7 @@ fn dispatch_v23_v24(id: &str, payload: &[u8]) -> Id3Frame {
         "RBUF" => parse_rbuf(payload),
         "SEEK" => parse_seek(payload),
         "SIGN" => parse_sign(payload),
+        "GRID" => parse_grid(payload),
         "AENC" => parse_aenc(payload),
         "LINK" => parse_link(payload),
         _ => Id3Frame::Unknown {
@@ -1627,6 +1644,26 @@ fn parse_sign(payload: &[u8]) -> Id3Frame {
     Id3Frame::Signature {
         group_symbol: payload[0],
         signature: payload[1..].to_vec(),
+    }
+}
+
+/// Parse a `GRID` group-identification-registration payload (spec v2.3
+/// §4.27 / v2.4 §4.26). Layout: NUL-terminated owner identifier +
+/// 1-byte group symbol + remainder = optional group-dependent data.
+fn parse_grid(payload: &[u8]) -> Id3Frame {
+    let (owner_bytes, rest) = split_once_nul_bytes(payload);
+    let owner = latin1_to_string(owner_bytes);
+    if rest.is_empty() {
+        return Id3Frame::GroupId {
+            owner,
+            group_symbol: 0,
+            data: Vec::new(),
+        };
+    }
+    Id3Frame::GroupId {
+        owner,
+        group_symbol: rest[0],
+        data: rest[1..].to_vec(),
     }
 }
 
@@ -2526,6 +2563,18 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
             payload.push(*group_symbol);
             payload.extend_from_slice(signature);
             Ok(("SIGN".to_string(), payload))
+        }
+        Id3Frame::GroupId {
+            owner,
+            group_symbol,
+            data,
+        } => {
+            let mut payload = Vec::new();
+            encode_latin1(&mut payload, owner);
+            payload.push(0);
+            payload.push(*group_symbol);
+            payload.extend_from_slice(data);
+            Ok(("GRID".to_string(), payload))
         }
         Id3Frame::AudioEncryption {
             owner,

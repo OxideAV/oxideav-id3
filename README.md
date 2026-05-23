@@ -128,11 +128,13 @@ are preserved on write.
   32-bit position), `RBUF` recommended buffer size (24-bit buffer
   + embedded-info flag + 32-bit next-tag offset, auto-clamped on
   write), `SEEK` seek frame (32-bit next-tag offset), `SIGN`
-  signature frame (group-symbol byte + binary signature), `AENC`
-  audio encryption (owner + preview start/length + opaque
-  encryption-info), `LINK` linked information (3-byte v2.3 / 4-byte
-  v2.4 frame-id + URL + spec-shaped additional data). All twenty
-  round-trip both directions for v2.3 and v2.4.
+  signature frame (group-symbol byte + binary signature), `GRID`
+  group identification registration (owner + group-symbol byte +
+  optional group-dependent data), `AENC` audio encryption (owner +
+  preview start/length + opaque encryption-info), `LINK` linked
+  information (3-byte v2.3 / 4-byte v2.4 frame-id + URL + spec-shaped
+  additional data). All twenty-one round-trip both directions for
+  v2.3 and v2.4.
 - Everything else surfaces as `Id3Frame::Unknown { id, raw }` with the
   payload preserved so it can be written back untouched.
 

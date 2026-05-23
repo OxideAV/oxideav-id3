@@ -53,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on write). All nine new variants round-trip through
   `write_tag` / `parse_tag` for v2.3 + v2.4 and lose no data via
   `Id3Frame::Unknown`.
+- Structural parser + writer for `GRID` group identification
+  registration (v2.3 §4.27 / v2.4 §4.26): NUL-terminated owner
+  identifier + 1-byte group symbol ($80-F0 per spec) + optional
+  group-dependent data. New `Id3Frame::GroupId` variant round-trips
+  through `write_tag` / `parse_tag` for both v2.3 and v2.4 (the wire
+  layout is version-independent), including the empty-data minimum
+  frame.
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-id3/compare/v0.0.4...v0.0.5) - 2026-04-19
 

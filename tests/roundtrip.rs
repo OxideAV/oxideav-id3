@@ -1129,6 +1129,117 @@ fn roundtrip_aenc() {
     );
 }
 
+/// `GRID` group-identification-registration round-trip with
+/// group-dependent data. Exercises both v2.3 and v2.4 (the wire layout
+/// is identical across versions).
+#[test]
+fn roundtrip_grid() {
+    let extra = vec![0xAB, 0xCD, 0xEF, 0x12, 0x34];
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        let tag = Id3Tag {
+            version,
+            frames: vec![Id3Frame::GroupId {
+                owner: "https://example.com/group".into(),
+                group_symbol: 0x90,
+                data: extra.clone(),
+            }],
+        };
+        let bytes = write_tag(&tag, version).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        let got = parsed.frames.iter().find_map(|f| match f {
+            Id3Frame::GroupId {
+                owner,
+                group_symbol,
+                data,
+            } => Some((owner.clone(), *group_symbol, data.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            got,
+            Some((
+                "https://example.com/group".to_string(),
+                0x90u8,
+                extra.clone()
+            ))
+        );
+    }
+}
+
+/// `GRID` with no group-dependent data — owner + symbol only, the
+/// minimum legal frame. The empty-data branch must round-trip cleanly.
+#[test]
+fn roundtrip_grid_empty_data() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::GroupId {
+            owner: "tag@example.org".into(),
+            group_symbol: 0x80,
+            data: Vec::new(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::GroupId {
+            owner,
+            group_symbol,
+            data,
+        } => Some((owner.clone(), *group_symbol, data.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        got,
+        Some(("tag@example.org".to_string(), 0x80u8, Vec::<u8>::new()))
+    );
+}
+
+/// `GRID` parsed straight from hand-built wire bytes — confirms the
+/// exact spec layout (owner $00, group symbol $xx, group-dependent
+/// data) is decoded, independent of our own writer.
+#[test]
+fn grid_parse_raw_bytes() {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(b"GRID");
+    let mut body = Vec::new();
+    body.extend_from_slice(b"owner@x.test"); // owner identifier
+    body.push(0x00); // NUL terminator
+    body.push(0xF0); // group symbol (top of $80-F0 range)
+    body.extend_from_slice(&[0x00, 0xFF, 0x7E]); // group-dependent data
+    let size = body.len() as u32;
+    frame.push(((size >> 21) & 0x7F) as u8);
+    frame.push(((size >> 14) & 0x7F) as u8);
+    frame.push(((size >> 7) & 0x7F) as u8);
+    frame.push((size & 0x7F) as u8);
+    frame.extend_from_slice(&[0, 0]); // flags
+    frame.extend_from_slice(&body);
+
+    let mut tag_bytes = Vec::new();
+    tag_bytes.extend_from_slice(b"ID3");
+    tag_bytes.push(4);
+    tag_bytes.push(0);
+    tag_bytes.push(0);
+    let total = frame.len() as u32;
+    tag_bytes.push(((total >> 21) & 0x7F) as u8);
+    tag_bytes.push(((total >> 14) & 0x7F) as u8);
+    tag_bytes.push(((total >> 7) & 0x7F) as u8);
+    tag_bytes.push((total & 0x7F) as u8);
+    tag_bytes.extend_from_slice(&frame);
+
+    let (parsed, _) = parse_tag(&tag_bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::GroupId {
+            owner,
+            group_symbol,
+            data,
+        } => Some((owner.clone(), *group_symbol, data.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        got,
+        Some(("owner@x.test".to_string(), 0xF0u8, vec![0x00u8, 0xFF, 0x7E]))
+    );
+}
+
 /// `LINK` round-trip in v2.4 form (4-byte frame id) — links a TPE1
 /// frame from another file.
 #[test]
