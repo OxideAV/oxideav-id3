@@ -58,6 +58,7 @@
 //! * `RBUF` recommended buffer size.
 //! * `SEEK` seek frame / `SIGN` signature frame.
 //! * `GRID` group identification registration.
+//! * `ENCR` encryption method registration.
 //! * `AENC` audio encryption / `LINK` linked information.
 //!
 //! Everything else lands in [`Id3Frame::Unknown`] with the raw payload
@@ -258,6 +259,21 @@ pub enum Id3Frame {
     GroupId {
         owner: String,
         group_symbol: u8,
+        data: Vec<u8>,
+    },
+    /// `ENCR` encryption method registration (v2.3 §4.25 / v2.4 §4.25).
+    /// Registers an encryption method symbol so that the per-frame
+    /// encryption flag can refer to it. `owner` is a NUL-terminated
+    /// ISO-8859-1 owner identifier (a URL with an email per spec),
+    /// `method_symbol` is the $80-F0 value associated with this method
+    /// throughout the tag, and `data` is the optional encryption-specific
+    /// payload. Multiple `ENCR` frames may coexist but each must carry a
+    /// distinct symbol and a distinct owner. The wire layout is identical
+    /// to `GRID` (owner + symbol byte + optional data) and is
+    /// version-independent.
+    EncryptionMethod {
+        owner: String,
+        method_symbol: u8,
         data: Vec<u8>,
     },
     /// `AENC` audio encryption (v2.3 §4.26 / v2.4 §4.19). Owner is a
@@ -580,8 +596,8 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
                 }
             }
             // COMR / SYTC / RVA2 / EQU2 / PRIV / GEOB / UFID / MCDI /
-            // ETCO / SYLT / POSS / RBUF / SEEK / SIGN / GRID / AENC /
-            // LINK carry structured or binary payloads that do not
+            // ETCO / SYLT / POSS / RBUF / SEEK / SIGN / GRID / ENCR /
+            // AENC / LINK carry structured or binary payloads that do not
             // project cleanly onto Vorbis-style text pairs. Callers that
             // need them should match on the enum.
             Id3Frame::Commercial { .. }
@@ -599,6 +615,7 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
             | Id3Frame::Seek { .. }
             | Id3Frame::Signature { .. }
             | Id3Frame::GroupId { .. }
+            | Id3Frame::EncryptionMethod { .. }
             | Id3Frame::AudioEncryption { .. }
             | Id3Frame::LinkedInfo { .. }
             | Id3Frame::Unknown { .. } => {}
@@ -848,6 +865,7 @@ fn dispatch_v23_v24(id: &str, payload: &[u8]) -> Id3Frame {
         "SEEK" => parse_seek(payload),
         "SIGN" => parse_sign(payload),
         "GRID" => parse_grid(payload),
+        "ENCR" => parse_encr(payload),
         "AENC" => parse_aenc(payload),
         "LINK" => parse_link(payload),
         _ => Id3Frame::Unknown {
@@ -1663,6 +1681,27 @@ fn parse_grid(payload: &[u8]) -> Id3Frame {
     Id3Frame::GroupId {
         owner,
         group_symbol: rest[0],
+        data: rest[1..].to_vec(),
+    }
+}
+
+/// Parse an `ENCR` encryption-method-registration payload (spec v2.3
+/// §4.25 / v2.4 §4.25). Layout: NUL-terminated owner identifier +
+/// 1-byte method symbol + remainder = optional encryption-specific
+/// data. The on-wire shape matches `GRID`.
+fn parse_encr(payload: &[u8]) -> Id3Frame {
+    let (owner_bytes, rest) = split_once_nul_bytes(payload);
+    let owner = latin1_to_string(owner_bytes);
+    if rest.is_empty() {
+        return Id3Frame::EncryptionMethod {
+            owner,
+            method_symbol: 0,
+            data: Vec::new(),
+        };
+    }
+    Id3Frame::EncryptionMethod {
+        owner,
+        method_symbol: rest[0],
         data: rest[1..].to_vec(),
     }
 }
@@ -2576,6 +2615,18 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
             payload.extend_from_slice(data);
             Ok(("GRID".to_string(), payload))
         }
+        Id3Frame::EncryptionMethod {
+            owner,
+            method_symbol,
+            data,
+        } => {
+            let mut payload = Vec::new();
+            encode_latin1(&mut payload, owner);
+            payload.push(0);
+            payload.push(*method_symbol);
+            payload.extend_from_slice(data);
+            Ok(("ENCR".to_string(), payload))
+        }
         Id3Frame::AudioEncryption {
             owner,
             preview_start,
@@ -3116,6 +3167,80 @@ mod tests {
                 assert_eq!(text, "Public domain.");
             }
             _ => panic!("expected TermsOfUse"),
+        }
+    }
+
+    /// `parse_encr` on a minimal, well-formed payload: owner +
+    /// method symbol + optional encryption-specific data.
+    #[test]
+    fn encr_parse_handcrafted_payload() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"http://example.org/enc");
+        payload.push(0);
+        payload.push(0x80); // method symbol
+        payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // method data
+        match parse_encr(&payload) {
+            Id3Frame::EncryptionMethod {
+                owner,
+                method_symbol,
+                data,
+            } => {
+                assert_eq!(owner, "http://example.org/enc");
+                assert_eq!(method_symbol, 0x80);
+                assert_eq!(data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            }
+            _ => panic!("expected EncryptionMethod"),
+        }
+    }
+
+    /// An `ENCR` frame with an empty owner and no method data still
+    /// parses to a well-formed `EncryptionMethod` (symbol only).
+    #[test]
+    fn encr_parse_minimal_symbol_only() {
+        // Empty owner ($00) followed by the method symbol byte.
+        let payload = [0x00, 0xF0];
+        match parse_encr(&payload) {
+            Id3Frame::EncryptionMethod {
+                owner,
+                method_symbol,
+                data,
+            } => {
+                assert!(owner.is_empty());
+                assert_eq!(method_symbol, 0xF0);
+                assert!(data.is_empty());
+            }
+            _ => panic!("expected EncryptionMethod"),
+        }
+    }
+
+    /// `ENCR` round-trips through `write_tag` / `parse_tag` for both
+    /// v2.3 and v2.4 (the wire layout is version-independent).
+    #[test]
+    fn encr_roundtrips_v23_and_v24() {
+        for version in [Id3Version::V2_3, Id3Version::V2_4] {
+            let original = Id3Tag {
+                version,
+                frames: vec![Id3Frame::EncryptionMethod {
+                    owner: "mailto:enc@example.org".into(),
+                    method_symbol: 0x81,
+                    data: vec![0x01, 0x02, 0x03],
+                }],
+            };
+            let bytes = write_tag(&original, version).unwrap();
+            let (parsed, _) = parse_tag(&bytes).unwrap();
+            assert_eq!(parsed.frames.len(), 1);
+            match &parsed.frames[0] {
+                Id3Frame::EncryptionMethod {
+                    owner,
+                    method_symbol,
+                    data,
+                } => {
+                    assert_eq!(owner, "mailto:enc@example.org");
+                    assert_eq!(*method_symbol, 0x81);
+                    assert_eq!(data, &vec![0x01, 0x02, 0x03]);
+                }
+                other => panic!("expected EncryptionMethod, got {other:?}"),
+            }
         }
     }
 

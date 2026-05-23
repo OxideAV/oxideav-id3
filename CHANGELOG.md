@@ -60,6 +60,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through `write_tag` / `parse_tag` for both v2.3 and v2.4 (the wire
   layout is version-independent), including the empty-data minimum
   frame.
+- Structural parser + writer for `ENCR` encryption method
+  registration (v2.3 §4.25 / v2.4 §4.25): NUL-terminated owner
+  identifier + 1-byte method symbol ($80-F0 per spec) + optional
+  encryption-specific data. New `Id3Frame::EncryptionMethod` variant
+  round-trips through `write_tag` / `parse_tag` for both v2.3 and
+  v2.4 (the wire layout is version-independent, identical in shape to
+  `GRID`), including the symbol-only minimum frame.
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-id3/compare/v0.0.4...v0.0.5) - 2026-04-19
 
