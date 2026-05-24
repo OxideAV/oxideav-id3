@@ -151,6 +151,22 @@ are preserved on write.
   round-trips losslessly when a tag is re-serialised under the other
   version.
 
+## Fuzzing
+
+A [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) harness lives
+in `fuzz/`. The `parse` target drives attacker-controlled bytes through
+`tag_size_at_head`, `parse_tag`, `parse_id3v1`, `to_key_value_pairs`,
+`attached_pictures`, `write_id3v1`, and both `write_tag` targets
+(v2.3 + v2.4) — every public surface that turns bytes into an `Id3Tag`
+or back out. The contract is panic-freedom on any input: a malformed
+stream yields `Err(_)` / `None`, never an OOB index, debug-overflow
+panic, or 256-MiB allocation from a synchsafe-size announce. Sustained
+runs (≥ 15 M iterations) under libFuzzer find nothing.
+
+```sh
+cd fuzz && cargo +nightly fuzz run parse
+```
+
 ## License
 
 MIT - see [LICENSE](LICENSE).

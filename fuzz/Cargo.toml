@@ -1,0 +1,67 @@
+[package]
+name = "oxideav-id3-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The ID3 surface worth fuzzing is the structural parser: a 10-byte
+# ID3v2 header followed by an optional extended header followed by a
+# stream of frames whose 4-byte (v2.3/2.4) or 3-byte (v2.2) size fields
+# the parser walks. Every reachable parse path is byte-slice arithmetic
+# with no external state, so the contract under test is purely
+# panic-freedom — `parse_tag`, `tag_size_at_head`, and `parse_id3v1`
+# must return a `Result` / `Option` for any input rather than indexing
+# out of bounds, integer-overflowing the synchsafe-size unpack, or
+# allocating attacker-controlled buffers without an upper-bounds check.
+#
+# The harness also runs `to_key_value_pairs`, `attached_pictures`, and
+# `write_tag` over whatever survives a parse so the downstream-API
+# surface gets fuzz coverage too (an Id3Tag the parser produced should
+# be writeable back through write_tag without panicking, even though
+# the resulting bytes may not round-trip exactly to the input — many
+# frames are structurally pass-through and the writer drops fields the
+# encoder doesn't know how to express).
+#
+# No external library worth dlopen-ing as a cross-decode oracle: the
+# clean-room wall bars id3/taglib/mutagen/eyed3, and even if it didn't,
+# real-world ID3 readers diverge wildly on malformed input — there is
+# no canonical "what should this byte sequence mean" answer to compare
+# against. Decode-only panic-freedom is the contract.
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-id3]
+path = ".."
+
+[dependencies.oxideav-core]
+version = "0.1"
+
+[lib]
+name = "oxideav_id3_fuzz"
+path = "src/lib.rs"
+
+# Prevent this fuzz package from being pulled into the umbrella
+# workspace at `crates/*` glob-resolve time.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# ------------------------------------------------------------------
+# Fuzz targets.
+# ------------------------------------------------------------------
+
+# Panic-freedom over the ID3v2 parser entry points + the ID3v1 trailer
+# decoder + the v2.3/v2.4 writer. Drives attacker-controlled bytes
+# through every public surface that turns bytes into an `Id3Tag` (or
+# back out).
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false

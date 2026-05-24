@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `cargo-fuzz` target `fuzz/fuzz_targets/parse.rs` drives arbitrary
+  bytes through `tag_size_at_head`, `parse_tag`, `parse_id3v1`,
+  `to_key_value_pairs`, `attached_pictures`, `write_id3v1`, and
+  `write_tag` (v2.3 + v2.4) and asserts panic-freedom on every input.
+  Classic spots covered: synchsafe-size overflow, frame-size > tag-size,
+  v2.3/v2.4 extended-header bounds, encryption / compression /
+  data-length-indicator flag combos, GEOB length fields, SYLT
+  terminators. Sustained 15M+ iteration runs under libFuzzer find no
+  crashes. Run with `cd fuzz && cargo +nightly fuzz run parse`.
+
 - New public `TimestampUnit` enum (`MpegFrames` / `Milliseconds`) and
   `Id3Frame::timestamp_unit()` typed accessor surface the
   `time_stamp_format` byte carried by `ETCO`, `SYTC`, `SYLT`, and
