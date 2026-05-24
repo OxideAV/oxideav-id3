@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New public `TimestampUnit` enum (`MpegFrames` / `Milliseconds`) and
+  `Id3Frame::timestamp_unit()` typed accessor surface the
+  `time_stamp_format` byte carried by `ETCO`, `SYTC`, `SYLT`, and
+  `POSS` frames per spec v2.3 §4.6 / §4.8 / §4.10 / §4.22 (identical
+  in v2.4 §4.5 / §4.7 / §4.9 / §4.21). The accessor returns `None`
+  for the reserved wire values so callers don't have to invent a
+  default. Two new round-trip tests prove the logical unit is
+  preserved when a SYLT frame is written under one major-version
+  envelope and re-parsed under the other.
+
 - Structural parser + writer for five additional ID3v2.3 / 2.4 frames:
   `POPM` (popularimeter — email, rating, wide-counter), `PCNT` (play
   counter, widens past 32 bits per spec §4.16), `PRIV` (private frame

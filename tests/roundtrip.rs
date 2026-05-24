@@ -6,7 +6,7 @@
 use oxideav_core::{AttachedPicture, PictureType};
 use oxideav_id3::{
     attached_pictures, parse_id3v1, parse_tag, to_key_value_pairs, write_id3v1, write_tag,
-    Id3Frame, Id3Tag, Id3Version, Rva2Channel,
+    Id3Frame, Id3Tag, Id3Version, Rva2Channel, TimestampUnit,
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
@@ -974,6 +974,90 @@ fn roundtrip_sylt() {
             "version {v:?}"
         );
     }
+}
+
+/// `SYLT` time-stamp-format byte preserves its logical unit when a
+/// tag authored under one major version is re-serialised under the
+/// other (v2.3 §4.10 vs v2.4 §4.9 define the byte identically — `$01`
+/// = MPEG frames, `$02` = milliseconds). Writing v2.3 and re-parsing
+/// as v2.4 (and the reverse) must surface the same
+/// [`TimestampUnit`] from the typed accessor, and the raw wire byte
+/// must be unchanged.
+#[test]
+fn sylt_timestamp_unit_roundtrips_across_v23_and_v24() {
+    for &wire_format in &[1u8, 2u8] {
+        for (src, dst) in [
+            (Id3Version::V2_3, Id3Version::V2_4),
+            (Id3Version::V2_4, Id3Version::V2_3),
+        ] {
+            let tag = Id3Tag {
+                version: src,
+                frames: vec![Id3Frame::SyncedLyrics {
+                    lang: *b"eng",
+                    time_format: wire_format,
+                    content_type: 0x01,
+                    description: "x".into(),
+                    syncs: vec![("hi".into(), 12_345)],
+                }],
+            };
+            // Write under the source version then re-parse under the
+            // destination version envelope (parse_tag reads the version
+            // from the wire header, not a caller-supplied hint).
+            let bytes = write_tag(&tag, dst).unwrap();
+            let (parsed, _) = parse_tag(&bytes).unwrap();
+            let frame = parsed
+                .frames
+                .iter()
+                .find(|f| matches!(f, Id3Frame::SyncedLyrics { .. }))
+                .expect("SYLT survived re-serialise");
+            let raw = match frame {
+                Id3Frame::SyncedLyrics { time_format, .. } => *time_format,
+                _ => unreachable!(),
+            };
+            assert_eq!(raw, wire_format, "raw byte preserved {src:?} -> {dst:?}");
+            let unit = frame.timestamp_unit().expect("known unit");
+            let expected_unit = match wire_format {
+                1 => TimestampUnit::MpegFrames,
+                2 => TimestampUnit::Milliseconds,
+                _ => unreachable!(),
+            };
+            assert_eq!(unit, expected_unit, "typed unit {src:?} -> {dst:?}");
+            assert_eq!(unit.to_wire(), wire_format, "to_wire round-trips");
+        }
+    }
+}
+
+/// Reserved `time_stamp_format` wire values (anything other than `$01`
+/// / `$02` per spec) surface as `None` from the typed accessor — the
+/// raw byte is still preserved on the variant so a writer can round-
+/// trip an exotic source, but the typed accessor does not invent a
+/// unit.
+#[test]
+fn sylt_timestamp_unit_none_for_reserved_byte() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::SyncedLyrics {
+            lang: *b"eng",
+            time_format: 0x05, // reserved
+            content_type: 0x01,
+            description: String::new(),
+            syncs: vec![],
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let frame = parsed
+        .frames
+        .iter()
+        .find(|f| matches!(f, Id3Frame::SyncedLyrics { .. }))
+        .unwrap();
+    assert!(frame.timestamp_unit().is_none());
+    // And the typed accessor returns None on unrelated frame variants.
+    let text = Id3Frame::Text {
+        id: "TIT2".into(),
+        values: vec!["x".into()],
+    };
+    assert!(text.timestamp_unit().is_none());
 }
 
 /// `POSS` position synchronisation round-trip — a 45-second-in

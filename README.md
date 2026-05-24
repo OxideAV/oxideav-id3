@@ -143,6 +143,13 @@ are preserved on write.
   spec but the wire layout is byte-aligned and version-independent).
 - Everything else surfaces as `Id3Frame::Unknown { id, raw }` with the
   payload preserved so it can be written back untouched.
+- `Id3Frame::timestamp_unit()` returns a typed `TimestampUnit`
+  (`MpegFrames` / `Milliseconds`) for the time-stamp-format byte
+  carried by `ETCO`, `SYTC`, `SYLT`, and `POSS`. The wire byte is
+  identical between v2.3 and v2.4 (spec §4.10 vs §4.9 for SYLT, and
+  the matching sections for the other three), so the logical unit
+  round-trips losslessly when a tag is re-serialised under the other
+  version.
 
 ## License
 

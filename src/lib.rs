@@ -342,6 +342,71 @@ pub struct Rva2Channel {
     pub peak: Vec<u8>,
 }
 
+/// Decoded form of the `time_stamp_format` byte that appears in
+/// `ETCO`, `SYTC`, `SYLT`, and `POSS` frames. The spec (v2.3 §4.6,
+/// §4.8, §4.10, §4.22 and v2.4 §4.5, §4.7, §4.9, §4.21) defines two
+/// values; anything else is reserved and surfaces as `None` from the
+/// typed accessor.
+///
+/// Wire values:
+///
+/// * `$01` — MPEG frames as unit. Decoded as
+///   [`TimestampUnit::MpegFrames`].
+/// * `$02` — milliseconds as unit. Decoded as
+///   [`TimestampUnit::Milliseconds`].
+///
+/// The numeric byte itself is unchanged across v2.3 → v2.4 (see spec
+/// §4.10 vs §4.9), so the logical unit round-trips losslessly when a
+/// tag is re-serialised under a different version envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimestampUnit {
+    /// `$01` per spec — timestamps count MPEG audio frames from the
+    /// start of the file.
+    MpegFrames,
+    /// `$02` per spec — timestamps are milliseconds from the start of
+    /// the file.
+    Milliseconds,
+}
+
+impl TimestampUnit {
+    /// Decode a raw `time_stamp_format` byte. Returns `None` for
+    /// reserved values (anything other than `$01` or `$02` per spec).
+    pub fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(TimestampUnit::MpegFrames),
+            2 => Some(TimestampUnit::Milliseconds),
+            _ => None,
+        }
+    }
+
+    /// Encode this unit back to the raw wire byte (`$01` or `$02`).
+    pub fn to_wire(self) -> u8 {
+        match self {
+            TimestampUnit::MpegFrames => 1,
+            TimestampUnit::Milliseconds => 2,
+        }
+    }
+}
+
+impl Id3Frame {
+    /// Typed accessor for the `time_stamp_format` byte carried by the
+    /// frames whose spec layout opens with one (`ETCO`, `SYTC`, `SYLT`,
+    /// `POSS`). Returns `Some(unit)` when the wire byte is `$01` or
+    /// `$02` per spec, and `None` for any other variant or any
+    /// reserved wire byte. Lets callers handle the cross-version
+    /// timestamp unit without matching on the raw `u8`.
+    pub fn timestamp_unit(&self) -> Option<TimestampUnit> {
+        let wire = match self {
+            Id3Frame::EventTimingCodes { time_format, .. }
+            | Id3Frame::SyncedTempo { time_format, .. }
+            | Id3Frame::SyncedLyrics { time_format, .. }
+            | Id3Frame::PositionSync { time_format, .. } => *time_format,
+            _ => return None,
+        };
+        TimestampUnit::from_wire(wire)
+    }
+}
+
 /// Parse an ID3v2 tag from a buffer that starts with the 10-byte
 /// header. On success, returns the [`Id3Tag`] and the total number of
 /// bytes consumed from `buf` (header + body + optional footer) —
