@@ -196,6 +196,14 @@ stream yields `Err(_)` / `None`, never an OOB index, debug-overflow
 panic, or 256-MiB allocation from a synchsafe-size announce. Sustained
 runs (≥ 15 M iterations) under libFuzzer find nothing.
 
+A curated seed corpus under `fuzz/corpus/parse/` (minimal v2.2 / v2.3 /
+v2.4 text tags, a mixed COMM/UFID/TXXX/APIC v2.4 tag, a v2.3
+extended-header tag, a whole-tag-unsync v2.4 tag, and an ID3v1 trailer)
+drives the fuzzer straight into the real parse paths rather than
+spending budget rediscovering the `ID3` magic. A daily scheduled `Fuzz`
+CI workflow (`.github/workflows/fuzz.yml`) runs the target for a
+30-minute budget.
+
 ```sh
 cd fuzz && cargo +nightly fuzz run parse
 ```

@@ -1,0 +1,23 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harness under fuzz/. ID3v2 / ID3v1
+# tag parsing is byte-slice arithmetic over attacker-controlled length
+# fields (10-byte header + synchsafe sizes, per-frame 4-byte sizes,
+# extended-header sub-records, unsync 0xFF 0x00 collapse, GEOB/SYLT
+# walk-until-empty loops). No external library oracle is in scope —
+# the clean-room wall bars id3/taglib/mutagen/eyed3 and real ID3
+# readers diverge wildly on malformed input, so decode-only
+# panic-freedom is the contract: one target gets the whole 30-minute
+# budget.
+
+on:
+  schedule:
+    - cron: "53 6 * * *"   # daily 06:53 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

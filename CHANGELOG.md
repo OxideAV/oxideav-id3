@@ -36,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   data-length-indicator flag combos, GEOB length fields, SYLT
   terminators. Sustained 15M+ iteration runs under libFuzzer find no
   crashes. Run with `cd fuzz && cargo +nightly fuzz run parse`.
+- Daily scheduled `Fuzz` CI workflow
+  (`.github/workflows/fuzz.yml`) runs the `parse` target for a
+  30-minute budget via the shared `crate-fuzz` reusable workflow, plus
+  a curated seven-input seed corpus under `fuzz/corpus/parse/` (minimal
+  v2.2 / v2.3 / v2.4 text tags, a mixed COMM/UFID/TXXX/APIC v2.4 tag, a
+  v2.3 extended-header tag, a whole-tag-unsync v2.4 tag, and an ID3v1
+  trailer). The seeds drive structural coverage ~30x deeper than the
+  prior noise corpus; a fresh 60-second two-worker baseline at ~4.4M
+  iterations is crash-free.
 
 - New public `TimestampUnit` enum (`MpegFrames` / `Milliseconds`) and
   `Id3Frame::timestamp_unit()` typed accessor surface the
