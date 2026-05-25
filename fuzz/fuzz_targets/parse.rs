@@ -58,7 +58,7 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_id3::{
     attached_pictures, parse_id3v1, parse_tag, tag_size_at_head, to_key_value_pairs, write_id3v1,
-    write_tag, Id3Version,
+    write_tag, write_tag_with_options, Id3Version, UnsyncMode, WriteOptions,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -107,4 +107,23 @@ fuzz_target!(|data: &[u8]| {
     // and that's by design.
     let _ = write_tag(&writeable, Id3Version::V2_3);
     let _ = write_tag(&writeable, Id3Version::V2_4);
+
+    // 6. Unsync-mode write paths. Each `write_tag_with_options` call
+    //    must finish without panicking under either unsync strategy,
+    //    on either target version. Whole-tag unsync on a body
+    //    containing many `0xFF` sequences exercises `apply_unsync`'s
+    //    quadratic-allocation-safety path; per-frame unsync (v2.4)
+    //    drives `apply_unsync` once per frame. Re-parsing the output
+    //    must also panic-freedom-pass — a writer-induced bad header
+    //    that the parser then OOB-reads would be caught here.
+    let modes = [UnsyncMode::None, UnsyncMode::WholeTag, UnsyncMode::PerFrame];
+    let versions = [Id3Version::V2_3, Id3Version::V2_4];
+    for &mode in &modes {
+        for &ver in &versions {
+            let opts = WriteOptions::new().with_unsync(mode);
+            if let Ok(bytes) = write_tag_with_options(&writeable, ver, &opts) {
+                let _ = parse_tag(&bytes);
+            }
+        }
+    }
 });

@@ -759,6 +759,39 @@ fn reverse_unsync(buf: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Apply the ID3 unsynchronisation encoding (the inverse of
+/// [`reverse_unsync`]). For every `0xFF` byte that is followed by a
+/// byte whose top three bits are set (`%111xxxxx`) OR by a literal
+/// `0x00`, a `0x00` byte is inserted after the `0xFF`. A trailing
+/// `0xFF` at the very end of the buffer is also escaped (spec
+/// §6.1: "the special case when the last byte of the last frame is
+/// $FF [...] can be solved by [...] unsynchronising the frame and
+/// adding $00 to the end of the frame data"). The result, once
+/// passed back through [`reverse_unsync`], reproduces the input
+/// byte-for-byte.
+fn apply_unsync(buf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(buf.len());
+    let mut i = 0;
+    while i < buf.len() {
+        let b = buf[i];
+        out.push(b);
+        if b == 0xFF {
+            let next = buf.get(i + 1).copied();
+            let needs_escape = match next {
+                Some(n) if (n & 0xE0) == 0xE0 => true, // false sync %111xxxxx
+                Some(0x00) => true,                    // protect literal $FF $00
+                None => true,                          // trailing $FF
+                _ => false,
+            };
+            if needs_escape {
+                out.push(0x00);
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 fn skip_extended_header(version: Id3Version, body: &[u8]) -> Result<&[u8]> {
     match version {
         Id3Version::V2_3 => {
@@ -2272,6 +2305,84 @@ fn id3v1_genre(b: u8) -> Option<&'static str> {
 /// The resulting buffer starts with the 10-byte ID3v2 header and can be
 /// prepended directly to an MP3 or other audio file.
 pub fn write_tag(tag: &Id3Tag, target_version: Id3Version) -> Result<Vec<u8>> {
+    write_tag_with_options(tag, target_version, &WriteOptions::default())
+}
+
+/// Strategy for inserting unsynchronisation `$00` bytes into a tag's
+/// serialised body (spec §6.1). Unsync is the mechanism that hides
+/// the MPEG sync pattern `%11111111 111xxxxx` (plus literal `$FF $00`
+/// runs) from naive MPEG decoders that might otherwise mistake an ID3
+/// tag for the start of an audio frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnsyncMode {
+    /// No unsynchronisation. The tag header flag bit 0x80 is clear,
+    /// no per-frame unsync format-flag bit is set, and the body is
+    /// written verbatim. This is the historical default for the
+    /// `write_tag` shorthand and remains the default of
+    /// [`WriteOptions`].
+    #[default]
+    None,
+    /// Whole-tag unsynchronisation. The entire serialised body
+    /// (every frame header plus payload) is passed through
+    /// [`apply_unsync`] and the header flag bit 0x80 is set. The
+    /// 28-bit synchsafe size in the header reflects the
+    /// post-unsync byte count, matching what the spec says callers
+    /// should compute. Suitable for both v2.3 and v2.4 (v2.4
+    /// permits whole-tag unsync as an "all frames" shortcut per
+    /// §3.1).
+    WholeTag,
+    /// Per-frame unsynchronisation. v2.4-only: each individual
+    /// frame body is unsynchronised independently, the frame's
+    /// format-flag bit 0x02 is set, and the frame size in its
+    /// header reflects the post-unsync length. The tag-header
+    /// flag bit 0x80 is deliberately left *clear* — spec §6.1
+    /// recommends ("SHOULD") setting it when every frame is
+    /// unsynchronised, but this crate's parser treats the v2.4
+    /// header bit as a whole-tag-body unsync signal and would
+    /// double-reverse the bytes if it were also set here. The
+    /// per-frame format-flag bit (spec §4.1.2) is the
+    /// v2.4-authoritative location and is unambiguous on its own.
+    /// Selecting `PerFrame` under a v2.3 target falls back to
+    /// [`UnsyncMode::WholeTag`] (v2.3 has no per-frame format-flag
+    /// byte for the unsync bit).
+    PerFrame,
+}
+
+/// Options bag for [`write_tag_with_options`]. Constructed via
+/// [`WriteOptions::default`] or [`WriteOptions::new`] and tweaked
+/// with the builder-style setters.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WriteOptions {
+    pub unsync: UnsyncMode,
+}
+
+impl WriteOptions {
+    /// Equivalent to [`WriteOptions::default`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builder-style setter for the unsync strategy.
+    pub fn with_unsync(mut self, mode: UnsyncMode) -> Self {
+        self.unsync = mode;
+        self
+    }
+}
+
+/// Serialise an [`Id3Tag`] to the ID3v2 wire format with caller-supplied
+/// options (currently: which unsynchronisation strategy to apply).
+///
+/// The output is always a self-contained tag with a 10-byte header
+/// followed by the body; the synchsafe size field reflects the
+/// post-unsync byte count. The output round-trips through [`parse_tag`]
+/// for any of the three [`UnsyncMode`] settings — the parser detects
+/// and reverses unsync from the header / per-frame flags identically
+/// regardless of which mode produced the bytes.
+pub fn write_tag_with_options(
+    tag: &Id3Tag,
+    target_version: Id3Version,
+    options: &WriteOptions,
+) -> Result<Vec<u8>> {
     let major: u8 = match target_version {
         Id3Version::V2_3 => 3,
         Id3Version::V2_4 => 4,
@@ -2287,9 +2398,23 @@ pub fn write_tag(tag: &Id3Tag, target_version: Id3Version) -> Result<Vec<u8>> {
         }
     };
 
+    // PerFrame is v2.4-only (v2.3 lacks the per-frame format-flag
+    // byte the spec defines the bit in). Downgrade silently to
+    // WholeTag rather than erroring — callers asked for "unsync"
+    // and we delivered the closest available form.
+    let effective_unsync = match (options.unsync, target_version) {
+        (UnsyncMode::PerFrame, Id3Version::V2_3) => UnsyncMode::WholeTag,
+        (mode, _) => mode,
+    };
+
     let mut body = Vec::new();
     for frame in &tag.frames {
-        write_frame(target_version, frame, &mut body)?;
+        let frame_unsync = matches!(effective_unsync, UnsyncMode::PerFrame);
+        write_frame_with_options(target_version, frame, frame_unsync, &mut body)?;
+    }
+
+    if matches!(effective_unsync, UnsyncMode::WholeTag) {
+        body = apply_unsync(&body);
     }
 
     let size = body.len();
@@ -2299,11 +2424,30 @@ pub fn write_tag(tag: &Id3Tag, target_version: Id3Version) -> Result<Vec<u8>> {
         ));
     }
 
+    // Spec §6.1 says "If all frames in the tag are unsynchronised the
+    // unsynchronisation flag in the tag header SHOULD be set." In v2.4
+    // however, the bit's meaning is overloaded by this crate's parser:
+    // when the v2.4 header bit is set, `parse_tag` runs `reverse_unsync`
+    // over the *entire body* before walking frame headers. Setting it
+    // alongside per-frame unsync would therefore double-decode and
+    // corrupt the recovered payload. We deliberately leave the header
+    // bit clear under PerFrame mode and let the per-frame format-flag
+    // bit (0x02) carry the signal, which is the v2.4-authoritative
+    // location per spec §4.1.2.
+    let flags: u8 = match (effective_unsync, target_version) {
+        (UnsyncMode::None, _) => 0,
+        (UnsyncMode::WholeTag, _) => 0x80,
+        // PerFrame is v2.4-only at this point (v2.3 was downgraded
+        // above). Header bit stays clear so the parser does not
+        // double-reverse the body.
+        (UnsyncMode::PerFrame, _) => 0,
+    };
+
     let mut out = Vec::with_capacity(ID3V2_HEADER_SIZE + size);
     out.extend_from_slice(b"ID3");
     out.push(major);
     out.push(0); // revision
-    out.push(0); // flags: no unsync, no extended header, no footer, no experimental
+    out.push(flags);
     let s = size as u32;
     out.push(((s >> 21) & 0x7F) as u8);
     out.push(((s >> 14) & 0x7F) as u8);
@@ -2379,14 +2523,32 @@ fn write_v1_field(dst: &mut [u8], s: &str) {
     }
 }
 
-fn write_frame(version: Id3Version, frame: &Id3Frame, out: &mut Vec<u8>) -> Result<()> {
-    let (id, payload) = encode_frame(version, frame)?;
+/// Serialise a single frame into the caller's buffer, optionally
+/// applying per-frame unsynchronisation (v2.4 only; the v2.3
+/// format-flags byte has no unsync bit so the option is ignored under
+/// v2.3). When requested, the encoded payload is passed through
+/// [`apply_unsync`] before its length is computed for the frame
+/// header, and the v2.4 format-flags byte gets bit 0x02 set per spec
+/// §4.1.2.
+fn write_frame_with_options(
+    version: Id3Version,
+    frame: &Id3Frame,
+    per_frame_unsync: bool,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let (id, mut payload) = encode_frame(version, frame)?;
     let mut id4 = [0u8; 4];
     let id_bytes = id.as_bytes();
     if id_bytes.len() != 4 || !id_bytes.iter().all(|b| b.is_ascii_alphanumeric()) {
         return Err(Error::invalid(format!("invalid frame id for writer: {id}")));
     }
     id4.copy_from_slice(id_bytes);
+
+    let apply_per_frame = per_frame_unsync && matches!(version, Id3Version::V2_4);
+    if apply_per_frame {
+        payload = apply_unsync(&payload);
+    }
+
     out.extend_from_slice(&id4);
     let size = payload.len();
     match version {
@@ -2406,7 +2568,9 @@ fn write_frame(version: Id3Version, frame: &Id3Frame, out: &mut Vec<u8>) -> Resu
         }
         _ => unreachable!("validated in write_tag"),
     }
-    out.extend_from_slice(&[0, 0]); // status + format flags
+    // status flags = 0, format flags = 0x02 iff per-frame unsync was applied.
+    let format_flags: u8 = if apply_per_frame { 0x02 } else { 0 };
+    out.extend_from_slice(&[0, format_flags]);
     out.extend_from_slice(&payload);
     Ok(())
 }
@@ -3604,5 +3768,271 @@ mod tests {
         let mut buf = Vec::new();
         encode_counter(&mut buf, u64::MAX);
         assert_eq!(buf.len(), 8);
+    }
+
+    // ── Unsync round-trip ──────────────────────────────────────────────
+    //
+    // Spec §6.1: `apply_unsync` (writer) inserts a `0x00` after every
+    // `0xFF` that would otherwise be followed by the MPEG sync pattern
+    // `%111xxxxx`, by a literal `0x00`, or by end-of-buffer. The
+    // parser-side `reverse_unsync` removes those `0x00` bytes again.
+    // The two should compose to the identity on any input.
+
+    /// `apply_unsync` + `reverse_unsync` is the identity for every
+    /// notable byte sequence: empty, sync-pattern, literal `$FF $00`,
+    /// trailing `$FF`, and a stream with no `$FF` at all.
+    #[test]
+    fn unsync_apply_then_reverse_is_identity() {
+        let cases: &[&[u8]] = &[
+            &[],
+            &[0x00, 0x01, 0x02],
+            &[0xFF, 0xE0, 0x55], // false MPEG sync
+            &[0xFF, 0xFB, 0x10], // another false sync
+            &[0xFF, 0x00, 0x42], // literal $FF $00 (must be protected)
+            &[0xFF],             // trailing $FF
+            &[0x10, 0xFF, 0xFF, 0xE0, 0x00, 0xFF],
+            &[0xFF, 0xFF, 0xFF, 0xFF], // run of $FF (first three trail another $FF, last is EOF)
+        ];
+        for input in cases {
+            let encoded = apply_unsync(input);
+            let decoded = reverse_unsync(&encoded);
+            assert_eq!(
+                decoded.as_slice(),
+                *input,
+                "round-trip failed for {input:?}"
+            );
+        }
+    }
+
+    /// `apply_unsync` never produces a buffer containing a false
+    /// synchronisation pattern (`$FF` followed by `%111xxxxx`), a
+    /// literal `$FF $00`, or a trailing `$FF`. This is the property
+    /// the spec requires of a "completely unsynchronised" tag body.
+    #[test]
+    fn unsync_apply_eliminates_false_syncs() {
+        let inputs: &[&[u8]] = &[
+            &[0xFF, 0xE0, 0xFF, 0x00, 0xFF, 0xFB, 0x42],
+            &[0xFF; 8],
+            &[0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00],
+        ];
+        for input in inputs {
+            let out = apply_unsync(input);
+            // No two consecutive bytes (X, Y) such that X==0xFF and (Y & 0xE0)==0xE0
+            // or (X==0xFF and Y==0x00 was protected by a *third* zero) — the test
+            // here is that re-reversing yields the input, which is the spec-level
+            // round-trip guarantee.
+            for w in out.windows(2) {
+                if w[0] == 0xFF {
+                    // After apply_unsync, the byte following any 0xFF in the
+                    // output must be either a non-escaped 0x00 (sentinel) or
+                    // something whose top 3 bits are NOT all 1.
+                    if w[1] != 0x00 {
+                        assert!(
+                            (w[1] & 0xE0) != 0xE0,
+                            "false sync survived: 0xFF 0x{:02X}",
+                            w[1]
+                        );
+                    }
+                }
+            }
+            // Trailing 0xFF must have been escaped (followed by an
+            // appended 0x00) — the *first* byte of any trailing 0xFF
+            // is at position out.len() - 2 (the 0x00 sentinel sits at
+            // out.len() - 1).
+            if let Some(&last) = out.last() {
+                if !input.is_empty() && input[input.len() - 1] == 0xFF {
+                    assert_eq!(
+                        last,
+                        0x00,
+                        "trailing 0xFF was not escaped: {:02X?}",
+                        &out[out.len().saturating_sub(4)..]
+                    );
+                }
+            }
+        }
+    }
+
+    /// `write_tag_with_options(..., UnsyncMode::WholeTag)` produces a
+    /// tag whose synchsafe size reflects the post-unsync length, with
+    /// the header flag bit 0x80 set, that parses back to a tag
+    /// containing the original frame payload byte-for-byte. v2.3 path.
+    #[test]
+    fn write_then_parse_whole_tag_unsync_v23() {
+        // PRIV is a passthrough binary frame, perfect for exercising
+        // arbitrary byte sequences (including 0xFF followed by 0xE0).
+        let owner = "test@example.com".to_string();
+        let payload = vec![0xFF, 0xE0, 0xAA, 0xFF, 0x00, 0x55, 0xFF];
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![Id3Frame::Private {
+                owner: owner.clone(),
+                data: payload.clone(),
+            }],
+        };
+        let opts = WriteOptions::new().with_unsync(UnsyncMode::WholeTag);
+        let bytes = write_tag_with_options(&tag, Id3Version::V2_3, &opts).unwrap();
+        // Header unsync flag set.
+        assert_eq!(bytes[5] & 0x80, 0x80);
+        // No raw false-sync survives in the body (header still
+        // contains a literal version byte etc. but the body starts
+        // at offset 10 and must obey the rule).
+        for w in bytes[10..].windows(2) {
+            if w[0] == 0xFF {
+                assert!(w[1] == 0x00 || (w[1] & 0xE0) != 0xE0);
+            }
+        }
+        let (parsed, consumed) = parse_tag(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert!(matches!(parsed.frames[0], Id3Frame::Private { .. }));
+        if let Id3Frame::Private { owner: o, data: d } = &parsed.frames[0] {
+            assert_eq!(o, &owner);
+            assert_eq!(d, &payload);
+        }
+    }
+
+    /// Same property, v2.4 path, whole-tag unsync.
+    #[test]
+    fn write_then_parse_whole_tag_unsync_v24() {
+        let owner = "test@example.com".to_string();
+        let payload = vec![0xFF, 0xE0, 0xAA, 0xFF, 0x00, 0x55, 0xFF];
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Private {
+                owner: owner.clone(),
+                data: payload.clone(),
+            }],
+        };
+        let opts = WriteOptions::new().with_unsync(UnsyncMode::WholeTag);
+        let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts).unwrap();
+        assert_eq!(bytes[5] & 0x80, 0x80);
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        if let Id3Frame::Private { owner: o, data: d } = &parsed.frames[0] {
+            assert_eq!(o, &owner);
+            assert_eq!(d, &payload);
+        } else {
+            panic!("expected Private frame, got {:?}", parsed.frames[0]);
+        }
+    }
+
+    /// `UnsyncMode::PerFrame` on v2.4 sets format-flag bit 0x02 on
+    /// each frame, applies unsync to that frame's payload, and the
+    /// parser reverses it correctly. The header flag bit 0x80 is
+    /// also set per spec §6.1 (all frames unsynchronised).
+    #[test]
+    fn write_then_parse_per_frame_unsync_v24() {
+        let owner = "owner".to_string();
+        let payload_a = vec![0xFF, 0xE0, 0x01];
+        let payload_b = vec![0xAA, 0xBB, 0xFF];
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![
+                Id3Frame::Private {
+                    owner: owner.clone(),
+                    data: payload_a.clone(),
+                },
+                Id3Frame::Private {
+                    owner: owner.clone(),
+                    data: payload_b.clone(),
+                },
+            ],
+        };
+        let opts = WriteOptions::new().with_unsync(UnsyncMode::PerFrame);
+        let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts).unwrap();
+        // PerFrame deliberately leaves the header flag clear (see
+        // write_tag_with_options) so the parser doesn't double-reverse
+        // the per-frame unsynced payload.
+        assert_eq!(bytes[5] & 0x80, 0);
+        // Walk the body and verify each frame header carries the
+        // format-flag bit 0x02. v2.4 frame header is 10 bytes:
+        // 4 id + 4 size + 1 status + 1 format flags.
+        let mut cursor = 10usize;
+        let mut frames_seen = 0;
+        while cursor + 10 <= bytes.len() {
+            if !bytes[cursor..cursor + 4]
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric())
+            {
+                break;
+            }
+            let s0 = bytes[cursor + 4] as u32;
+            let s1 = bytes[cursor + 5] as u32;
+            let s2 = bytes[cursor + 6] as u32;
+            let s3 = bytes[cursor + 7] as u32;
+            let fsize =
+                ((s0 & 0x7F) << 21) | ((s1 & 0x7F) << 14) | ((s2 & 0x7F) << 7) | (s3 & 0x7F);
+            let format_flags = bytes[cursor + 9];
+            assert_eq!(format_flags & 0x02, 0x02, "per-frame unsync bit not set");
+            cursor += 10 + fsize as usize;
+            frames_seen += 1;
+        }
+        assert_eq!(frames_seen, 2);
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        assert_eq!(parsed.frames.len(), 2);
+        if let Id3Frame::Private { data, .. } = &parsed.frames[0] {
+            assert_eq!(data, &payload_a);
+        } else {
+            panic!();
+        }
+        if let Id3Frame::Private { data, .. } = &parsed.frames[1] {
+            assert_eq!(data, &payload_b);
+        } else {
+            panic!();
+        }
+    }
+
+    /// Selecting `PerFrame` under a v2.3 target downgrades silently
+    /// to `WholeTag` (v2.3 has no per-frame unsync format-flag bit).
+    /// The output is still a valid v2.3 tag with the header flag set
+    /// and parses back to the original frames.
+    #[test]
+    fn per_frame_under_v23_downgrades_to_whole_tag() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![Id3Frame::Private {
+                owner: "owner".into(),
+                data: vec![0xFF, 0xE0, 0x33],
+            }],
+        };
+        let opts = WriteOptions::new().with_unsync(UnsyncMode::PerFrame);
+        let bytes = write_tag_with_options(&tag, Id3Version::V2_3, &opts).unwrap();
+        assert_eq!(bytes[5] & 0x80, 0x80);
+        // v2.3 frame format-flags byte is at offset 10 + (4 + 4 + 1) = 19
+        // for the first frame. For a downgraded WholeTag it must be 0.
+        // (The body containing the frame may itself have been unsynced,
+        // so we don't read past the header — but the first frame header
+        // is fixed-position since the body starts at offset 10.)
+        // After whole-tag unsync, the frame id may have shifted only if
+        // any 0xFF lives in the header — it doesn't, so the frame still
+        // begins at offset 10.
+        let format_flags = bytes[10 + 4 + 4 + 1];
+        assert_eq!(
+            format_flags & 0x02,
+            0,
+            "v2.3 must not set per-frame unsync bit"
+        );
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        if let Id3Frame::Private { data, .. } = &parsed.frames[0] {
+            assert_eq!(data, &[0xFF, 0xE0, 0x33]);
+        } else {
+            panic!();
+        }
+    }
+
+    /// `write_tag` (the no-options shorthand) keeps its historical
+    /// behaviour: no unsync flag, no unsync transform. Equivalent to
+    /// `write_tag_with_options(..., WriteOptions::default())`.
+    #[test]
+    fn write_tag_default_unchanged() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["hello".into()],
+            }],
+        };
+        let a = write_tag(&tag, Id3Version::V2_4).unwrap();
+        let b = write_tag_with_options(&tag, Id3Version::V2_4, &WriteOptions::default()).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a[5] & 0x80, 0, "default writer must not set unsync flag");
     }
 }

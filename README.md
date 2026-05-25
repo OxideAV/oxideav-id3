@@ -95,6 +95,39 @@ and `/` in v2.3, matching what the parser splits on. `Id3Frame::Unknown`
 payloads round-trip verbatim so frames the parser did not understand
 are preserved on write.
 
+### Unsynchronisation on write
+
+`write_tag` defaults to no unsynchronisation — the body is written
+verbatim. To produce a tag that hides the MPEG sync pattern from
+naive decoders (spec §6.1), build a `WriteOptions` and call
+`write_tag_with_options`:
+
+```rust
+use oxideav_id3::{write_tag_with_options, Id3Tag, Id3Version, UnsyncMode, WriteOptions};
+
+# let tag = Id3Tag { version: Id3Version::V2_4, frames: vec![] };
+// Whole-tag unsync: header flag 0x80 set, the entire serialised body
+// is passed through the unsync transform (`0xFF` → `0xFF 0x00`
+// whenever the next byte would otherwise form a false sync, be a
+// literal `0x00`, or run off the end).
+let opts = WriteOptions::new().with_unsync(UnsyncMode::WholeTag);
+let bytes_v24 = write_tag_with_options(&tag, Id3Version::V2_4, &opts)?;
+
+// Per-frame unsync (v2.4-only): each frame's payload is
+// unsynchronised independently and the per-frame format-flag bit
+// 0x02 is set. Selecting `PerFrame` under a v2.3 target falls back
+// to `WholeTag` silently (v2.3 has no per-frame format-flag bit
+// for unsync).
+let per_frame = WriteOptions::new().with_unsync(UnsyncMode::PerFrame);
+let bytes_per_frame = write_tag_with_options(&tag, Id3Version::V2_4, &per_frame)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`parse_tag` reverses unsync transparently regardless of which mode
+produced the bytes, so the round-trip `write_tag_with_options →
+parse_tag` is the identity on the tag's frame contents for all
+three `UnsyncMode` values.
+
 ## What is supported
 
 - **ID3v1 / ID3v1.1** — parse + write 128-byte trailers, Winamp's

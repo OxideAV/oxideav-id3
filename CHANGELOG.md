@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Writer-side unsynchronisation: new public `UnsyncMode` enum
+  (`None` / `WholeTag` / `PerFrame`), `WriteOptions` bag, and
+  `write_tag_with_options` entry point. `WholeTag` applies spec §6.1
+  unsync over the entire serialised body and sets the header flag
+  bit 0x80 (works for both v2.3 and v2.4); `PerFrame` is v2.4-only
+  and unsynchronises each frame's payload independently with the
+  format-flag bit 0x02 set per frame. A new internal `apply_unsync`
+  is the byte-for-byte inverse of the existing `reverse_unsync`
+  (escapes `$FF` whenever followed by an MPEG sync byte `%111xxxxx`,
+  by literal `$00`, or by end-of-buffer per spec §6.1 last
+  paragraph). The pre-existing `write_tag` shorthand is unchanged
+  (it forwards to `write_tag_with_options` with `UnsyncMode::None`).
+  Six new round-trip tests cover identity composition,
+  false-sync elimination, v2.3 / v2.4 whole-tag round-trip via
+  `parse_tag`, v2.4 per-frame round-trip, and the v2.3 silent
+  downgrade of `PerFrame` to `WholeTag`. The cargo-fuzz `parse`
+  target now also drives `write_tag_with_options` under both unsync
+  modes on both target versions and re-parses the output.
 - `cargo-fuzz` target `fuzz/fuzz_targets/parse.rs` drives arbitrary
   bytes through `tag_size_at_head`, `parse_tag`, `parse_id3v1`,
   `to_key_value_pairs`, `attached_pictures`, `write_id3v1`, and
