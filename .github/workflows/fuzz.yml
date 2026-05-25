@@ -4,9 +4,9 @@ name: Fuzz
 # tag parsing is byte-slice arithmetic over attacker-controlled length
 # fields (10-byte header + synchsafe sizes, per-frame 4-byte sizes,
 # extended-header sub-records, unsync 0xFF 0x00 collapse, GEOB/SYLT
-# walk-until-empty loops). No external library oracle is in scope —
-# the clean-room wall bars id3/taglib/mutagen/eyed3 and real ID3
-# readers diverge wildly on malformed input, so decode-only
+# walk-until-empty loops). No external library oracle is in scope (the
+# clean-room wall bars third-party ID3 readers, and real-world readers
+# diverge wildly on malformed input anyway), so decode-only
 # panic-freedom is the contract: one target gets the whole 30-minute
 # budget.
 
