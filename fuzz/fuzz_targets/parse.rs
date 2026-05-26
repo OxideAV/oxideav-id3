@@ -120,9 +120,18 @@ fuzz_target!(|data: &[u8]| {
     let versions = [Id3Version::V2_3, Id3Version::V2_4];
     for &mode in &modes {
         for &ver in &versions {
-            let opts = WriteOptions::new().with_unsync(mode);
-            if let Ok(bytes) = write_tag_with_options(&writeable, ver, &opts) {
-                let _ = parse_tag(&bytes);
+            for &crc in &[false, true] {
+                // 7. Extended-header CRC × unsync combinations. With
+                //    `crc=true` the writer prepends a CRC-bearing
+                //    extended header and sets the tag-header's
+                //    extended-header bit; the parser walks the
+                //    extended header, runs CRC-32 over the spec-defined
+                //    region, and verifies. Both halves must remain
+                //    panic-free for every (mode, ver, crc) combination.
+                let opts = WriteOptions::new().with_unsync(mode).with_crc(crc);
+                if let Ok(bytes) = write_tag_with_options(&writeable, ver, &opts) {
+                    let _ = parse_tag(&bytes);
+                }
             }
         }
     }
