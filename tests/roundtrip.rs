@@ -6,7 +6,8 @@
 use oxideav_core::{AttachedPicture, PictureType};
 use oxideav_id3::{
     attached_pictures, parse_id3v1, parse_tag, to_key_value_pairs, write_id3v1, write_tag,
-    Id3Frame, Id3Tag, Id3Version, Rva2Channel, TimestampUnit,
+    write_tag_with_options, Id3Frame, Id3Tag, Id3Version, Rva2Channel, TimestampUnit, UnsyncMode,
+    WriteOptions,
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
@@ -1496,4 +1497,220 @@ fn etco_truncated_trailing_byte_is_dropped() {
         _ => None,
     });
     assert_eq!(got, Some((0x02u8, vec![(0x01u8, 16u32)])));
+}
+
+// ---------------------------------------------------------------------------
+// Extended-header CRC round-trip (spec §3.2, v2.3 + v2.4)
+// ---------------------------------------------------------------------------
+
+fn small_text_tag(version: Id3Version) -> Id3Tag {
+    Id3Tag {
+        version,
+        frames: vec![
+            Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["CRC Test".into()],
+            },
+            Id3Frame::Text {
+                id: "TPE1".into(),
+                values: vec!["The CRC".into()],
+            },
+        ],
+    }
+}
+
+/// v2.3 extended-header CRC: emitting `WriteOptions::with_crc(true)`
+/// must set the header's bit 6, lay down a 10-byte ext header with
+/// flags `0x80 00`, padding size = 0, and a regular-u32 CRC; the
+/// parser must verify the CRC against the frame area and round-trip
+/// the frame contents losslessly.
+#[test]
+fn roundtrip_extended_header_crc_v23() {
+    let tag = small_text_tag(Id3Version::V2_3);
+    let opts = WriteOptions::new().with_crc(true);
+    let bytes = write_tag_with_options(&tag, Id3Version::V2_3, &opts).unwrap();
+
+    // Header bit 6 (extended header) must be set, bit 7 (unsync) must
+    // not (we did not request unsync).
+    assert_eq!(bytes[5] & 0x40, 0x40);
+    assert_eq!(bytes[5] & 0x80, 0x00);
+
+    // Extended header layout: size (4 bytes, regular, excludes itself) = 10
+    let ext_size = u32::from_be_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
+    assert_eq!(ext_size, 10);
+    // Flags: bit 15 of the 2-byte field = CRC present.
+    assert_eq!(bytes[14] & 0x80, 0x80);
+    assert_eq!(bytes[15], 0x00);
+    // Size of padding = 0 (writer emits no padding).
+    let padding_size = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    assert_eq!(padding_size, 0);
+
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    assert_eq!(parsed.version, Id3Version::V2_3);
+    assert_eq!(parsed.frames.len(), 2);
+    let titles: Vec<String> = parsed
+        .frames
+        .iter()
+        .filter_map(|f| match f {
+            Id3Frame::Text { id, values } if id == "TIT2" => values.first().cloned(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(titles, vec!["CRC Test".to_string()]);
+}
+
+/// v2.4 extended-header CRC: must set bit 6, lay down a 12-byte ext
+/// header with synchsafe size = 12, flag-count = 1, flags = 0x20,
+/// data-length = 5, then the 5-byte synchsafe CRC.
+#[test]
+fn roundtrip_extended_header_crc_v24() {
+    let tag = small_text_tag(Id3Version::V2_4);
+    let opts = WriteOptions::new().with_crc(true);
+    let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts).unwrap();
+
+    assert_eq!(bytes[5] & 0x40, 0x40);
+    assert_eq!(bytes[5] & 0x80, 0x00);
+
+    // ext_size synchsafe: 4 bytes, includes itself.
+    let ext_size = ((bytes[10] as u32 & 0x7F) << 21)
+        | ((bytes[11] as u32 & 0x7F) << 14)
+        | ((bytes[12] as u32 & 0x7F) << 7)
+        | (bytes[13] as u32 & 0x7F);
+    assert_eq!(ext_size, 12);
+    assert_eq!(bytes[14], 0x01); // number of flag bytes
+    assert_eq!(bytes[15], 0x20); // flags: c = CRC present
+    assert_eq!(bytes[16], 0x05); // CRC attached-data length
+
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    assert_eq!(parsed.version, Id3Version::V2_4);
+    assert_eq!(parsed.frames.len(), 2);
+}
+
+/// Composing CRC + whole-tag unsync must still round-trip: the writer
+/// inserts the extended header BEFORE running unsync over the
+/// `(ext_header || frames)` concatenation, and the parser reverses
+/// unsync first so the CRC verifies against the pre-unsync bytes
+/// (matching v2.3 §3.2's "calculated before unsynchronisation").
+#[test]
+fn roundtrip_extended_header_crc_with_unsync_v23() {
+    // Use a frame value that contains an $FF byte so unsync actually
+    // mutates the body.
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![Id3Frame::Private {
+            owner: "test@oxideav.io".into(),
+            data: vec![0xFF, 0xE0, 0xFF, 0x00, 0xFF],
+        }],
+    };
+    let opts = WriteOptions::new()
+        .with_crc(true)
+        .with_unsync(UnsyncMode::WholeTag);
+    let bytes = write_tag_with_options(&tag, Id3Version::V2_3, &opts).unwrap();
+    // Both flags set.
+    assert_eq!(bytes[5] & 0xC0, 0xC0);
+
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Private { owner, data } => Some((owner.clone(), data.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        got,
+        Some(("test@oxideav.io".into(), vec![0xFF, 0xE0, 0xFF, 0x00, 0xFF]))
+    );
+}
+
+#[test]
+fn roundtrip_extended_header_crc_with_unsync_v24() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Private {
+            owner: "v24@oxideav.io".into(),
+            data: vec![0xFF, 0xFA, 0xFF, 0x00, 0x10],
+        }],
+    };
+    let opts = WriteOptions::new()
+        .with_crc(true)
+        .with_unsync(UnsyncMode::WholeTag);
+    let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Private { owner, data } => Some((owner.clone(), data.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        got,
+        Some(("v24@oxideav.io".into(), vec![0xFF, 0xFA, 0xFF, 0x00, 0x10]))
+    );
+}
+
+/// A corrupted CRC must fail the parse — silent acceptance would defeat
+/// the purpose of having a CRC.
+#[test]
+fn parse_rejects_bad_crc_v23() {
+    let tag = small_text_tag(Id3Version::V2_3);
+    let opts = WriteOptions::new().with_crc(true);
+    let mut bytes = write_tag_with_options(&tag, Id3Version::V2_3, &opts).unwrap();
+    // Flip one bit of the stored CRC (last 4 bytes of the 14-byte ext
+    // header area: bytes[20..24]).
+    bytes[20] ^= 0xFF;
+    assert!(parse_tag(&bytes).is_err());
+}
+
+#[test]
+fn parse_rejects_bad_crc_v24() {
+    let tag = small_text_tag(Id3Version::V2_4);
+    let opts = WriteOptions::new().with_crc(true);
+    let mut bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts).unwrap();
+    // Flip a byte of the 5-byte synchsafe CRC at bytes[17..22]. Keep
+    // the synchsafe high bit (0x80) clear or the resulting decoded
+    // value just changes — either way the CRC won't match.
+    bytes[17] ^= 0x01;
+    assert!(parse_tag(&bytes).is_err());
+}
+
+/// Round-tripping a tag whose body contains a frame whose payload
+/// itself contains the false-sync pattern: with both CRC and per-frame
+/// unsync, the frame payload is unsynchronised but the CRC covers the
+/// pre-unsync frame headers + bodies, so the parser must reverse
+/// per-frame unsync as it walks frames AND verify the (un-touched, in
+/// this mode) extended header CRC against the original frame-area
+/// bytes. The writer puts the extended header in front of the original
+/// frame stream and applies only per-frame unsync on the individual
+/// frame payloads, not the ext header itself.
+#[test]
+fn roundtrip_extended_header_crc_with_perframe_unsync_v24() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Private {
+            owner: "perframe".into(),
+            data: vec![0xFF, 0xE0, 0x00, 0xFF, 0xF8],
+        }],
+    };
+    let opts = WriteOptions::new()
+        .with_crc(true)
+        .with_unsync(UnsyncMode::PerFrame);
+    let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::Private { owner, data } => Some((owner.clone(), data.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        got,
+        Some(("perframe".into(), vec![0xFF, 0xE0, 0x00, 0xFF, 0xF8]))
+    );
+}
+
+/// Default `WriteOptions` (no CRC) must not emit an extended header
+/// and the header's bit 6 must stay clear — the historical
+/// `write_tag` shorthand must be byte-identical to
+/// `write_tag_with_options(..., WriteOptions::default())`.
+#[test]
+fn default_options_emit_no_extended_header() {
+    let tag = small_text_tag(Id3Version::V2_4);
+    let a = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let b = write_tag_with_options(&tag, Id3Version::V2_4, &WriteOptions::default()).unwrap();
+    assert_eq!(a, b);
+    assert_eq!(a[5] & 0x40, 0); // no extended-header bit
 }

@@ -128,6 +128,35 @@ produced the bytes, so the round-trip `write_tag_with_options →
 parse_tag` is the identity on the tag's frame contents for all
 three `UnsyncMode` values.
 
+### Extended-header CRC
+
+`WriteOptions::with_crc(true)` adds an ID3v2 extended header carrying
+a CRC-32 [ISO-3309] over the frame area (spec §3.2 in both v2.3 and
+v2.4):
+
+```rust
+use oxideav_id3::{write_tag_with_options, Id3Tag, Id3Version, WriteOptions};
+
+# let tag = Id3Tag { version: Id3Version::V2_4, frames: vec![] };
+let opts = WriteOptions::new().with_crc(true);
+let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The writer emits 14 bytes of extended header for v2.3 (size=10
+exclusive of itself, flags `0x80 0x00`, size-of-padding = 0, regular
+4-byte CRC) and 12 bytes for v2.4 (synchsafe size = 12 inclusive,
+flag-count = 1, flags = 0x20, data-length = 5, 5-byte synchsafe CRC).
+`parse_tag` recognises both forms, verifies the stored CRC against the
+spec-defined region — frames-only for v2.3, frames + padding for v2.4 —
+and returns an error on mismatch rather than silently accepting a
+corrupted tag. `WriteOptions::with_crc(true)` and
+`WriteOptions::with_unsync(...)` compose: the writer computes the CRC
+on the pre-unsync frame bytes (matching v2.3's "calculated before
+unsynchronisation"), then runs unsync over the concatenated extended
+header + frames; the parser reverses unsync first and so verifies the
+CRC against the same byte sequence.
+
 ## What is supported
 
 - **ID3v1 / ID3v1.1** — parse + write 128-byte trailers, Winamp's
@@ -136,7 +165,11 @@ three `UnsyncMode` values.
   to their v2.3 equivalents (`TT2 -> TIT2`, `PIC -> APIC`, ...).
 - **ID3v2.3 / ID3v2.4** — parse + write. Whole-tag unsync, per-frame
   unsync, data-length indicator, and extended headers are handled on
-  read. Footer-bearing tags are sized correctly.
+  read; the extended-header CRC-32 is verified against the spec-defined
+  region (frames-only in v2.3, frames + padding in v2.4) and parse
+  fails on mismatch. The writer can emit a CRC-bearing extended header
+  via `WriteOptions::with_crc(true)`. Footer-bearing tags are sized
+  correctly.
 - Common frames: `T***` text, `TXXX` user-defined text, `W***` URL,
   `WXXX` user-defined URL, `COMM` comment, `USLT` lyrics, `APIC` /
   `PIC` attached picture.

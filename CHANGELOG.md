@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Extended-header CRC verification on read + emission on write
+  (spec §3.2 in both v2.3 and v2.4). The parser used to skip the
+  extended header outright; it now decodes it, walks the v2.4 per-flag
+  attached-data area (update / CRC / restrictions, with strict
+  data-length validation), and verifies the stored CRC-32 [ISO-3309]
+  against the spec-defined region — frames-only in v2.3, frames +
+  padding in v2.4. A mismatched CRC is a hard parse error. The writer
+  grows a new `WriteOptions::crc` flag (set via the `with_crc` builder
+  method); when enabled the writer prepends a CRC-bearing extended
+  header (14 bytes for v2.3: size = 10 excl-self, flags `0x80 0x00`,
+  padding-size = 0, regular u32 CRC; 12 bytes for v2.4: synchsafe
+  size = 12 incl-self, flag-count = 1, flags = 0x20, data-length = 5,
+  5-byte synchsafe CRC) and sets the tag-header's extended-header bit.
+  `WriteOptions::with_crc` composes cleanly with the existing
+  `with_unsync` setter: the CRC is computed on pre-unsync frame
+  bytes (matching v2.3's "calculated before unsynchronisation"), then
+  unsync is applied over `(ext_header || frames)`; the parser reverses
+  unsync first, so the same byte sequence is fed to the CRC check on
+  the read side. Seven new round-trip tests cover the per-version
+  on-wire shape, default-options-emit-no-extended-header invariant,
+  CRC + WholeTag unsync round-trip on both versions, CRC + PerFrame
+  unsync on v2.4, and corrupted-CRC parse rejection on both versions.
+  Internal CRC-32 implementation is a 9-line bit-by-bit loop
+  (polynomial 0xEDB88320, init / xor-out 0xFFFFFFFF) — no new
+  dependencies.
 - Writer-side unsynchronisation: new public `UnsyncMode` enum
   (`None` / `WholeTag` / `PerFrame`), `WriteOptions` bag, and
   `write_tag_with_options` entry point. `WholeTag` applies spec §6.1

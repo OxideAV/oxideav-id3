@@ -36,6 +36,13 @@
 //! the v2.4 data-length indicator is honoured so tools that set it see
 //! their real payload length.
 //!
+//! The extended header (spec §3.2 in both v2.3 and v2.4) is decoded
+//! rather than skipped: a stored CRC-32 [ISO-3309] is verified against
+//! the spec-defined region (frames-only for v2.3; frames + padding for
+//! v2.4) and a mismatch is a hard parse error. `WriteOptions::with_crc`
+//! emits a CRC-bearing extended header on the writer side; it composes
+//! with the existing unsync modes via a round-trip-stable layering.
+//!
 //! Frames this parser knows about structurally:
 //!
 //! * `T***` text frames (v2.3/2.4) and their v2.2 equivalents (3-char ids).
@@ -459,12 +466,15 @@ pub fn parse_tag(buf: &[u8]) -> Result<(Id3Tag, usize)> {
         body
     };
 
-    // Extended header: 6 bytes in v2.3 (size is non-synchsafe), 6+
-    // bytes in v2.4 (first 4 bytes are synchsafe size INCLUDING those
-    // 4 bytes). We just skip it — none of the fields affect frame
-    // parsing for our purposes.
+    // Extended header: 6 bytes in v2.3 (size is non-synchsafe, EXCLUDES
+    // itself), 6+ bytes in v2.4 (first 4 bytes are synchsafe size
+    // INCLUDING those 4 bytes). When the CRC flag is set we verify the
+    // stored CRC-32 against the data the spec defines (v2.3: frames
+    // only, excluding padding; v2.4: frames + padding). A mismatched
+    // CRC is a hard parse error: a parser that accepted broken CRCs
+    // would defeat the point of the field.
     if flags & 0x40 != 0 {
-        body = skip_extended_header(version, body)?;
+        body = parse_extended_header(version, body)?;
     }
 
     let frames = parse_frames(version, body);
@@ -792,33 +802,204 @@ fn apply_unsync(buf: &[u8]) -> Vec<u8> {
     out
 }
 
-fn skip_extended_header(version: Id3Version, body: &[u8]) -> Result<&[u8]> {
+/// Walk the extended header at the start of `body` and return the
+/// remaining body (frames + padding). When the CRC flag is set, the
+/// stored CRC-32 is verified against the spec-defined region:
+///
+/// * v2.3 (`%x0000000 00000000` extended-flags bit 15) — CRC covers the
+///   frames only, excluding the padding whose size is announced in the
+///   extended header itself.
+/// * v2.4 (extended-flags bit `c` = 0x20) — CRC covers everything after
+///   the extended header (frames + padding), per §3.2 "all the data
+///   between the header and footer ... minus the extended header. Note
+///   that this includes the padding".
+///
+/// The v2.4 restrictions flag (`d` = 0x10) is consumed but does not
+/// influence parsing — it describes how the tag was *encoded*, not how
+/// to decode it.
+fn parse_extended_header(version: Id3Version, body: &[u8]) -> Result<&[u8]> {
     match version {
         Id3Version::V2_3 => {
             if body.len() < 4 {
                 return Err(Error::invalid("ID3v2.3 extended header truncated"));
             }
             let ext_size = regular_u32(body[0], body[1], body[2], body[3]) as usize;
-            // v2.3: ext_size does NOT include itself, so skip 4 + ext_size.
+            // v2.3 §3.2: "Extended header size [...] excludes itself".
+            // Currently 6 or 10 bytes (10 when CRC is present).
             let total = 4 + ext_size;
-            if total > body.len() {
+            if total > body.len() || ext_size < 6 {
                 return Err(Error::invalid("ID3v2.3 extended header overflows tag"));
             }
-            Ok(&body[total..])
+            let ext = &body[4..total];
+            // ext layout: %x0000000 00000000  (flags, 2 bytes)
+            //             size of padding     (4 bytes regular)
+            //             total frame CRC     (4 bytes regular, iff flag x set)
+            let flag_hi = ext[0];
+            let crc_present = flag_hi & 0x80 != 0;
+            let padding_size = regular_u32(ext[2], ext[3], ext[4], ext[5]) as usize;
+            let after = &body[total..];
+            if padding_size > after.len() {
+                return Err(Error::invalid(
+                    "ID3v2.3 extended header padding size exceeds body",
+                ));
+            }
+            if crc_present {
+                if ext_size != 10 {
+                    return Err(Error::invalid(
+                        "ID3v2.3 extended header CRC flag set but size is not 10",
+                    ));
+                }
+                let stored = regular_u32(ext[6], ext[7], ext[8], ext[9]);
+                // v2.3 spec §3.2: CRC covers "the frames and only the
+                // frames" — excludes the padding announced above.
+                let frames_only = &after[..after.len() - padding_size];
+                let computed = crc32_iso3309(frames_only);
+                if computed != stored {
+                    return Err(Error::invalid(format!(
+                        "ID3v2.3 extended header CRC mismatch: stored={stored:#010x} computed={computed:#010x}"
+                    )));
+                }
+            }
+            Ok(after)
         }
         Id3Version::V2_4 => {
             if body.len() < 4 {
                 return Err(Error::invalid("ID3v2.4 extended header truncated"));
             }
             let ext_size = synchsafe_u32(body[0], body[1], body[2], body[3]) as usize;
-            // v2.4: ext_size INCLUDES itself, so skip ext_size bytes total.
-            if ext_size < 4 || ext_size > body.len() {
+            // v2.4 §3.2: ext_size INCLUDES itself. "An extended header
+            // can thus never have a size of fewer than six bytes."
+            if ext_size < 6 || ext_size > body.len() {
                 return Err(Error::invalid("ID3v2.4 extended header size invalid"));
             }
-            Ok(&body[ext_size..])
+            let ext = &body[..ext_size];
+            // ext layout (after the 4 size bytes):
+            //   number-of-flag-bytes  $01
+            //   extended flags        %0bcd0000
+            //   per-flag attached data, in flag order b, c, d
+            let num_flag_bytes = ext[4] as usize;
+            if num_flag_bytes != 1 {
+                return Err(Error::invalid(
+                    "ID3v2.4 extended header: only single flag byte supported",
+                ));
+            }
+            if ext.len() < 6 {
+                return Err(Error::invalid("ID3v2.4 extended header truncated"));
+            }
+            let ext_flags = ext[5];
+            let update = ext_flags & 0x40 != 0;
+            let crc = ext_flags & 0x20 != 0;
+            let restrictions = ext_flags & 0x10 != 0;
+            // Reject unknown extended-flag bits per spec §3.2: "All
+            // unknown flags MUST be unset and their corresponding data
+            // removed when a tag is modified". A set unknown bit means
+            // we cannot safely advance past the attached-data area.
+            if ext_flags & !0x70 != 0 {
+                return Err(Error::invalid(
+                    "ID3v2.4 extended header: unknown extended-flag bits set",
+                ));
+            }
+            let mut cursor = 6usize;
+            let after = &body[ext_size..];
+            let mut stored_crc: Option<u32> = None;
+            for (flag_present, expected_len, name) in [
+                (update, 0u8, "update"),
+                (crc, 5u8, "crc"),
+                (restrictions, 1u8, "restrictions"),
+            ] {
+                if !flag_present {
+                    continue;
+                }
+                if cursor >= ext.len() {
+                    return Err(Error::invalid(format!(
+                        "ID3v2.4 extended header: missing data-length for {name} flag"
+                    )));
+                }
+                let data_len = ext[cursor] as usize;
+                if data_len != expected_len as usize {
+                    return Err(Error::invalid(format!(
+                        "ID3v2.4 extended header: {name} data-length is {data_len}, expected {expected_len}"
+                    )));
+                }
+                cursor += 1;
+                if cursor + data_len > ext.len() {
+                    return Err(Error::invalid(format!(
+                        "ID3v2.4 extended header: truncated data for {name} flag"
+                    )));
+                }
+                if name == "crc" && data_len == 5 {
+                    // Spec §3.2 "Total frame CRC    5 * %0xxxxxxx" — the
+                    // 32-bit CRC is stored as 5 synchsafe bytes (35
+                    // bits, upper 4 always zero).
+                    stored_crc = Some(crc32_from_synchsafe5(
+                        ext[cursor],
+                        ext[cursor + 1],
+                        ext[cursor + 2],
+                        ext[cursor + 3],
+                        ext[cursor + 4],
+                    ));
+                }
+                cursor += data_len;
+            }
+            if let Some(stored) = stored_crc {
+                // v2.4 §3.2: CRC is "calculated on all the data between
+                // the header and footer as indicated by the header's
+                // tag length field, minus the extended header. Note
+                // that this includes the padding".
+                let computed = crc32_iso3309(after);
+                if computed != stored {
+                    return Err(Error::invalid(format!(
+                        "ID3v2.4 extended header CRC mismatch: stored={stored:#010x} computed={computed:#010x}"
+                    )));
+                }
+            }
+            Ok(after)
         }
         _ => Ok(body),
     }
+}
+
+/// CRC-32 [ISO-3309] — the IEEE 802.3 / PNG / zlib variant: polynomial
+/// `0x04C11DB7` (reflected `0xEDB88320`), init `0xFFFF_FFFF`, xor-out
+/// `0xFFFF_FFFF`. Used by the ID3v2.3 and v2.4 extended-header CRC
+/// fields (spec §3.2 in both versions). The implementation is the
+/// classic bit-by-bit table-free loop — the data spans we run it over
+/// are tag-body-sized (KB at most), so the table is unnecessary.
+fn crc32_iso3309(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+/// Decode the v2.4 extended-header CRC's 5-byte synchsafe encoding back
+/// into a 32-bit value. Spec §3.2: "stored as a 35 bit synchsafe
+/// integer, leaving the upper four bits always zeroed".
+fn crc32_from_synchsafe5(a: u8, b: u8, c: u8, d: u8, e: u8) -> u32 {
+    (((a as u64 & 0x7F) << 28)
+        | ((b as u64 & 0x7F) << 21)
+        | ((c as u64 & 0x7F) << 14)
+        | ((d as u64 & 0x7F) << 7)
+        | (e as u64 & 0x7F)) as u32
+}
+
+/// Encode a 32-bit CRC into 5 synchsafe bytes for v2.4 extended-header
+/// emission. The upper 4 bits of the 35-bit value are always zero (the
+/// CRC fits in 32 bits).
+fn crc32_to_synchsafe5(crc: u32) -> [u8; 5] {
+    let v = crc as u64;
+    [
+        ((v >> 28) & 0x07) as u8, // top 4 bits ride here; remaining 3 unused
+        ((v >> 21) & 0x7F) as u8,
+        ((v >> 14) & 0x7F) as u8,
+        ((v >> 7) & 0x7F) as u8,
+        (v & 0x7F) as u8,
+    ]
 }
 
 fn parse_frames(version: Id3Version, body: &[u8]) -> Vec<Id3Frame> {
@@ -2354,6 +2535,30 @@ pub enum UnsyncMode {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WriteOptions {
     pub unsync: UnsyncMode,
+    /// Emit an extended header carrying a CRC-32 over the tag's frame
+    /// data (spec §3.2 in both v2.3 and v2.4). Default `false`: no
+    /// extended header is written.
+    ///
+    /// * v2.3 — the 10-byte extended header (4-byte size = 10, 2-byte
+    ///   flags = `%10000000 00000000`, 4-byte size-of-padding = 0,
+    ///   4-byte CRC-32) is inserted between the tag header and the
+    ///   frames. The CRC covers the frame area only (no padding is
+    ///   emitted alongside) per spec §3.2.
+    /// * v2.4 — a 12-byte extended header (4-byte synchsafe size = 12,
+    ///   1-byte flag-count = 1, 1-byte flags = 0x20, 1-byte CRC
+    ///   data-length = 5, 5-byte synchsafe CRC-32) is inserted. The
+    ///   CRC covers everything after the extended header (i.e. the
+    ///   frames; this writer emits no padding, so frames-only equals
+    ///   frames-plus-padding here) per spec §3.2.
+    ///
+    /// Note that the v2.3 spec says the CRC "should be calculated
+    /// before unsynchronisation"; we always compute the CRC on the
+    /// pre-unsync frame bytes, then run [`UnsyncMode::WholeTag`] over
+    /// the concatenation of (extended header + frames). The parser
+    /// reverses unsync first and then verifies the CRC against the
+    /// reversed bytes, so the round-trip is exact for any combination
+    /// of `crc` and `with_unsync`.
+    pub crc: bool,
 }
 
 impl WriteOptions {
@@ -2365,6 +2570,14 @@ impl WriteOptions {
     /// Builder-style setter for the unsync strategy.
     pub fn with_unsync(mut self, mode: UnsyncMode) -> Self {
         self.unsync = mode;
+        self
+    }
+
+    /// Builder-style setter for the extended-header CRC emission flag.
+    /// See [`WriteOptions::crc`] for the per-version on-wire layout
+    /// the writer produces.
+    pub fn with_crc(mut self, enabled: bool) -> Self {
+        self.crc = enabled;
         self
     }
 }
@@ -2407,11 +2620,30 @@ pub fn write_tag_with_options(
         (mode, _) => mode,
     };
 
-    let mut body = Vec::new();
+    let mut frame_bytes = Vec::new();
     for frame in &tag.frames {
         let frame_unsync = matches!(effective_unsync, UnsyncMode::PerFrame);
-        write_frame_with_options(target_version, frame, frame_unsync, &mut body)?;
+        write_frame_with_options(target_version, frame, frame_unsync, &mut frame_bytes)?;
     }
+
+    // Optional extended header. We always emit the minimal CRC form
+    // (no update / restrictions data), with size-of-padding = 0 in
+    // v2.3 since this writer emits no padding. The CRC is computed on
+    // the pre-unsync frame bytes — the v2.3 spec mandates this
+    // ("calculated before unsynchronisation"), and for v2.4 it is the
+    // natural interpretation since the parser always reverses unsync
+    // before walking the extended header.
+    let ext_header = if options.crc {
+        Some(build_extended_header_crc(target_version, &frame_bytes)?)
+    } else {
+        None
+    };
+
+    let mut body = Vec::new();
+    if let Some(ref ext) = ext_header {
+        body.extend_from_slice(ext);
+    }
+    body.extend_from_slice(&frame_bytes);
 
     if matches!(effective_unsync, UnsyncMode::WholeTag) {
         body = apply_unsync(&body);
@@ -2434,7 +2666,7 @@ pub fn write_tag_with_options(
     // bit clear under PerFrame mode and let the per-frame format-flag
     // bit (0x02) carry the signal, which is the v2.4-authoritative
     // location per spec §4.1.2.
-    let flags: u8 = match (effective_unsync, target_version) {
+    let mut flags: u8 = match (effective_unsync, target_version) {
         (UnsyncMode::None, _) => 0,
         (UnsyncMode::WholeTag, _) => 0x80,
         // PerFrame is v2.4-only at this point (v2.3 was downgraded
@@ -2442,6 +2674,11 @@ pub fn write_tag_with_options(
         // double-reverse the body.
         (UnsyncMode::PerFrame, _) => 0,
     };
+    // Extended-header bit (bit 6) signals to the parser that the body
+    // opens with an extended header.
+    if ext_header.is_some() {
+        flags |= 0x40;
+    }
 
     let mut out = Vec::with_capacity(ID3V2_HEADER_SIZE + size);
     out.extend_from_slice(b"ID3");
@@ -2520,6 +2757,69 @@ fn write_v1_field(dst: &mut [u8], s: &str) {
             dst[i] = c as u8;
             i += 1;
         }
+    }
+}
+
+/// Build the bytes of a CRC-bearing extended header for `target_version`,
+/// computed against the given pre-unsync frame data. The output is
+/// inserted between the 10-byte tag header and the frame bytes.
+///
+/// v2.3 layout (14 bytes total on the wire):
+///
+/// ```text
+/// 00 00 00 0A      — extended-header size (excludes itself; with CRC
+///                    present we emit 10 since the spec announces
+///                    "currently 6 or 10 bytes, excludes itself")
+/// 80 00            — extended flags, bit 15 (CRC present)
+/// 00 00 00 00      — size of padding (this writer emits none)
+/// xx xx xx xx      — total frame CRC-32 (regular u32)
+/// ```
+///
+/// v2.4 layout (12 bytes total):
+///
+/// ```text
+/// 00 00 00 0C      — synchsafe ext-header size, INCLUDES itself (=12)
+/// 01               — number of flag bytes
+/// 20               — flags %00100000 (bit c = CRC present)
+/// 05               — CRC attached-data length
+/// xx xx xx xx xx   — CRC-32 as 5 * %0xxxxxxx (35-bit synchsafe)
+/// ```
+fn build_extended_header_crc(target_version: Id3Version, frame_bytes: &[u8]) -> Result<Vec<u8>> {
+    let crc = crc32_iso3309(frame_bytes);
+    match target_version {
+        Id3Version::V2_3 => {
+            let mut out = Vec::with_capacity(14);
+            // size = 10 (excludes itself), so total ext-area = 4 + 10 = 14
+            out.extend_from_slice(&10u32.to_be_bytes());
+            // flags: bit 15 (CRC present), all others clear
+            out.push(0x80);
+            out.push(0x00);
+            // size of padding = 0 (no padding emitted)
+            out.extend_from_slice(&0u32.to_be_bytes());
+            // total frame CRC
+            out.extend_from_slice(&crc.to_be_bytes());
+            Ok(out)
+        }
+        Id3Version::V2_4 => {
+            let mut out = Vec::with_capacity(12);
+            // size = 12 (INCLUDES itself), synchsafe
+            let s: u32 = 12;
+            out.push(((s >> 21) & 0x7F) as u8);
+            out.push(((s >> 14) & 0x7F) as u8);
+            out.push(((s >> 7) & 0x7F) as u8);
+            out.push((s & 0x7F) as u8);
+            // number of flag bytes
+            out.push(0x01);
+            // extended flags: %00100000 (c = CRC present)
+            out.push(0x20);
+            // CRC attached data: length byte $05, then 5 synchsafe bytes
+            out.push(0x05);
+            out.extend_from_slice(&crc32_to_synchsafe5(crc));
+            Ok(out)
+        }
+        _ => Err(Error::invalid(
+            "extended-header CRC emission requires v2.3 or v2.4",
+        )),
     }
 }
 
