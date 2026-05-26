@@ -157,6 +157,38 @@ unsynchronisation"), then runs unsync over the concatenated extended
 header + frames; the parser reverses unsync first and so verifies the
 CRC against the same byte sequence.
 
+### ID3v2.4 footer
+
+`WriteOptions::with_footer(true)` emits the 10-byte trailer described
+in spec §3.4 — a copy of the 10-byte header but with identifier `3DI`
+instead of `ID3`, used to locate a tag that was appended after the
+audio data on a reverse scan from end-of-file:
+
+```rust
+use oxideav_id3::{write_tag_with_options, Id3Tag, Id3Version, WriteOptions};
+
+# let tag = Id3Tag { version: Id3Version::V2_4, frames: vec![] };
+let opts = WriteOptions::new().with_footer(true);
+let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts)?;
+// bytes[5] & 0x10 == 0x10 (footer-present flag set)
+// &bytes[bytes.len() - 10..bytes.len() - 7] == b"3DI"
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Footer is a v2.4-only construct. Requesting it on a v2.3 target
+returns `Error::unsupported` rather than silently dropping the flag.
+On the parse side, `parse_tag` requires the trailer's `3DI` identifier
+and validates that the footer's version, flags, and synchsafe size
+match the header byte-for-byte — a corrupted, version-mismatched, or
+size-mismatched trailer is rejected with a specific error. A buffer
+that announces a footer but is short of the 10 trailer bytes returns
+`Error::NeedMore` so callers can read more. `with_footer` composes
+freely with `with_crc` and `with_unsync(WholeTag | PerFrame)`: the
+footer lives outside the announced synchsafe body size, so unsync
+never touches it and the CRC region is unchanged. `tag_size_at_head`
+already reports footer-inclusive totals so a one-shot 10-byte file
+peek still sizes the right number of bytes to read.
+
 ## What is supported
 
 - **ID3v1 / ID3v1.1** — parse + write 128-byte trailers, Winamp's

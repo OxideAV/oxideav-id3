@@ -1714,3 +1714,86 @@ fn default_options_emit_no_extended_header() {
     assert_eq!(a, b);
     assert_eq!(a[5] & 0x40, 0); // no extended-header bit
 }
+
+/// ID3v2.4 footer end-to-end: write_tag_with_options(footer=true)
+/// produces a tag whose final 10 bytes are "3DI..." mirroring the
+/// header's flags+size, and parse_tag round-trips the frames AND
+/// reports a `consumed` byte count that includes the footer (so a
+/// caller seeking to the next audio byte advances correctly).
+#[test]
+fn roundtrip_footer_v24_text() {
+    let tag = small_text_tag(Id3Version::V2_4);
+    let opts = WriteOptions::new().with_footer(true);
+    let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts).unwrap();
+    assert_eq!(bytes[5] & 0x10, 0x10, "header footer-flag must be set");
+    let (parsed, consumed) = parse_tag(&bytes).unwrap();
+    assert_eq!(consumed, bytes.len());
+    // The synchsafe size in the header excludes the footer; consumed
+    // therefore equals (header_size 10) + (announced body size) + 10
+    // (footer). Pin that down to make the convention regression-proof.
+    let size = ((bytes[6] as u32 & 0x7F) << 21)
+        | ((bytes[7] as u32 & 0x7F) << 14)
+        | ((bytes[8] as u32 & 0x7F) << 7)
+        | (bytes[9] as u32 & 0x7F);
+    assert_eq!(consumed, 10 + size as usize + 10);
+    // Frame survived intact.
+    assert_eq!(parsed.frames.len(), tag.frames.len());
+}
+
+/// Footer composes with whole-tag unsync: header bits 0x80 and 0x10
+/// are both set, the footer lives *after* the unsynced body, and the
+/// round-trip recovers the original frame payload byte-for-byte even
+/// when the payload contains a false-sync trigger (`0xFF 0xE0`).
+#[test]
+fn roundtrip_footer_v24_with_unsync() {
+    let payload = vec![0xFF, 0xE0, 0xAB, 0xFF, 0x00, 0xCD];
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Private {
+            owner: "owner@example.com".into(),
+            data: payload.clone(),
+        }],
+    };
+    let opts = WriteOptions::new()
+        .with_unsync(UnsyncMode::WholeTag)
+        .with_footer(true);
+    let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts).unwrap();
+    assert_eq!(bytes[5] & 0x80, 0x80);
+    assert_eq!(bytes[5] & 0x10, 0x10);
+    assert_eq!(&bytes[bytes.len() - 10..bytes.len() - 7], b"3DI");
+    let (parsed, consumed) = parse_tag(&bytes).unwrap();
+    assert_eq!(consumed, bytes.len());
+    match &parsed.frames[0] {
+        Id3Frame::Private { data, .. } => assert_eq!(data, &payload),
+        other => panic!("expected Private frame, got {other:?}"),
+    }
+}
+
+/// Footer + extended-header CRC compose cleanly: both flag bits set,
+/// the writer emits header → ext-header → frames → footer in order,
+/// the parser verifies the CRC over the frames region and validates
+/// the footer separately, and the original frames round-trip.
+#[test]
+fn roundtrip_footer_v24_with_crc() {
+    let tag = small_text_tag(Id3Version::V2_4);
+    let opts = WriteOptions::new().with_crc(true).with_footer(true);
+    let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts).unwrap();
+    assert_eq!(bytes[5] & 0x40, 0x40);
+    assert_eq!(bytes[5] & 0x10, 0x10);
+    let (parsed, consumed) = parse_tag(&bytes).unwrap();
+    assert_eq!(consumed, bytes.len());
+    assert_eq!(parsed.frames.len(), tag.frames.len());
+}
+
+/// Requesting a footer on a v2.3 target is rejected at write time —
+/// the spec defines the footer only for v2.4. The error message
+/// mentions "v2.4" so consumers can disambiguate from the v2.2
+/// "not supported" message.
+#[test]
+fn write_footer_on_v23_errors() {
+    let tag = small_text_tag(Id3Version::V2_3);
+    let opts = WriteOptions::new().with_footer(true);
+    let err = write_tag_with_options(&tag, Id3Version::V2_3, &opts).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("v2.4"), "unexpected error: {msg}");
+}

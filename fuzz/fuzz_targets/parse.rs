@@ -121,16 +121,26 @@ fuzz_target!(|data: &[u8]| {
     for &mode in &modes {
         for &ver in &versions {
             for &crc in &[false, true] {
-                // 7. Extended-header CRC × unsync combinations. With
-                //    `crc=true` the writer prepends a CRC-bearing
-                //    extended header and sets the tag-header's
-                //    extended-header bit; the parser walks the
-                //    extended header, runs CRC-32 over the spec-defined
-                //    region, and verifies. Both halves must remain
-                //    panic-free for every (mode, ver, crc) combination.
-                let opts = WriteOptions::new().with_unsync(mode).with_crc(crc);
-                if let Ok(bytes) = write_tag_with_options(&writeable, ver, &opts) {
-                    let _ = parse_tag(&bytes);
+                for &footer in &[false, true] {
+                    // 7. Extended-header CRC × unsync × footer
+                    //    combinations. With `crc=true` the writer
+                    //    prepends a CRC-bearing extended header; with
+                    //    `footer=true` (v2.4 only — v2.3 will error
+                    //    out, which is fine) the writer appends a
+                    //    10-byte trailer and sets the tag-header's
+                    //    footer-present bit. The parser walks the
+                    //    optional extended header, verifies the CRC,
+                    //    and additionally verifies the footer's
+                    //    identifier/version/flags/size mirror the
+                    //    header. Every (mode, ver, crc, footer)
+                    //    combination must remain panic-free.
+                    let opts = WriteOptions::new()
+                        .with_unsync(mode)
+                        .with_crc(crc)
+                        .with_footer(footer);
+                    if let Ok(bytes) = write_tag_with_options(&writeable, ver, &opts) {
+                        let _ = parse_tag(&bytes);
+                    }
                 }
             }
         }

@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ID3v2.4 footer support (spec §3.4). The parser used to advance past
+  the 10-byte trailer when the header's footer-present bit (0x10) was
+  set without verifying any of it; it now requires the trailer's
+  `b"3DI"` identifier and validates that the footer's version /
+  flags / synchsafe size mirror the header byte-for-byte, returning a
+  specific error per failure mode (magic, version, flags, size,
+  truncation → `Error::NeedMore`). A footer flag on a v2.2 / v2.3
+  header is rejected outright since the spec only defines the footer
+  for v2.4. On the writer side, `WriteOptions` grows a `footer` field
+  (set via the `with_footer` builder method); when enabled on a v2.4
+  target the writer sets header bit 0x10 and appends the 10-byte
+  trailer with identifier `b"3DI"` followed by a verbatim copy of the
+  header's version / flags / size bytes. Requesting a footer against a
+  v2.3 target returns `Error::unsupported` rather than silently
+  dropping the flag — appended tags must be v2.4 to be discoverable by
+  a reverse scan. `with_footer` composes cleanly with both `with_crc`
+  and `with_unsync(WholeTag | PerFrame)`: the footer lives outside the
+  announced synchsafe size (matching spec §3.1 "If a footer is present
+  this equals to ('total size' - 20) bytes"), so the unsync transform
+  never touches it and the CRC region is unchanged. Ten new lib tests
+  (footer default / +unsync / +crc round-trips, v2.3-rejection both
+  directions, four parser-validation tests for magic / size / flags /
+  truncation, plus `tag_size_at_head` consistency) and four new
+  integration round-trip tests cover the matrix. The fuzz target's
+  write × parse loop now iterates `footer ∈ {false, true}` alongside
+  the existing unsync × CRC dimensions.
+
 - Extended-header CRC verification on read + emission on write
   (spec §3.2 in both v2.3 and v2.4). The parser used to skip the
   extended header outright; it now decodes it, walks the v2.4 per-flag

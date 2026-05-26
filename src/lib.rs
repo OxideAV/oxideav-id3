@@ -427,10 +427,11 @@ pub fn parse_tag(buf: &[u8]) -> Result<(Id3Tag, usize)> {
         return Err(Error::invalid("not an ID3v2 tag"));
     }
     let major = buf[3];
-    let _revision = buf[4];
+    let revision = buf[4];
     let flags = buf[5];
     let size = synchsafe_u32(buf[6], buf[7], buf[8], buf[9]) as usize;
-    let total = ID3V2_HEADER_SIZE + size + if flags & 0x10 != 0 { 10 } else { 0 };
+    let footer_present = flags & 0x10 != 0;
+    let total = ID3V2_HEADER_SIZE + size + if footer_present { 10 } else { 0 };
     if buf.len() < ID3V2_HEADER_SIZE + size {
         return Err(Error::NeedMore);
     }
@@ -445,6 +446,45 @@ pub fn parse_tag(buf: &[u8]) -> Result<(Id3Tag, usize)> {
             )));
         }
     };
+
+    // Footer (spec §3.4) is a v2.4-only construct. The footer flag bit
+    // being set on a v2.3 (or v2.2) tag indicates a malformed or
+    // version-confused producer; reject rather than silently advancing
+    // past the spurious 10 bytes — which would corrupt the caller's
+    // file-cursor accounting if those bytes were actually audio.
+    if footer_present && !matches!(version, Id3Version::V2_4) {
+        return Err(Error::invalid(
+            "ID3v2 footer flag (0x10) is v2.4-only; rejected on v2.2/v2.3",
+        ));
+    }
+    // Footer requires 10 more bytes after the body. Validate up front
+    // so that a partial buffer is reported via NeedMore rather than
+    // succeeding with an inconsistent `total`.
+    if footer_present && buf.len() < total {
+        return Err(Error::NeedMore);
+    }
+    if footer_present {
+        let footer = &buf[ID3V2_HEADER_SIZE + size..total];
+        if &footer[0..3] != b"3DI" {
+            return Err(Error::invalid(
+                "ID3v2 footer magic missing: expected b\"3DI\"",
+            ));
+        }
+        // Spec §3.4: "The footer is a copy of the header, but with a
+        // different identifier." Version, flags, and size MUST match.
+        if footer[3] != major || footer[4] != revision {
+            return Err(Error::invalid(
+                "ID3v2 footer version/revision does not match header",
+            ));
+        }
+        if footer[5] != flags {
+            return Err(Error::invalid("ID3v2 footer flags do not match header"));
+        }
+        let footer_size = synchsafe_u32(footer[6], footer[7], footer[8], footer[9]) as usize;
+        if footer_size != size {
+            return Err(Error::invalid("ID3v2 footer size does not match header"));
+        }
+    }
 
     // Whole-tag unsync is a v2.2/v2.3 mechanism. v2.4 moves it to a
     // per-frame flag, but some taggers still set the header bit; we
@@ -2559,6 +2599,22 @@ pub struct WriteOptions {
     /// reversed bytes, so the round-trip is exact for any combination
     /// of `crc` and `with_unsync`.
     pub crc: bool,
+    /// Emit an ID3v2.4 footer (spec §3.4). Default `false`.
+    ///
+    /// When set, the tag-header bit 0x10 is set and a 10-byte trailer
+    /// is appended after the body. The trailer's layout is a copy of
+    /// the header bytes (same flags, same synchsafe size) but with
+    /// identifier `b"3DI"` instead of `b"ID3"`. Per spec §3.4 this
+    /// is REQUIRED for tags appended after the audio data so a reader
+    /// can locate them by scanning backwards.
+    ///
+    /// Footer is a v2.4-only construct — the spec only defines it for
+    /// v2.4. Requesting `footer = true` against an
+    /// [`Id3Version::V2_3`] target returns
+    /// [`Error::unsupported`]; we deliberately do NOT silently drop
+    /// the flag because the caller asking for "append a footer" almost
+    /// certainly wants a v2.4 file.
+    pub footer: bool,
 }
 
 impl WriteOptions {
@@ -2578,6 +2634,13 @@ impl WriteOptions {
     /// the writer produces.
     pub fn with_crc(mut self, enabled: bool) -> Self {
         self.crc = enabled;
+        self
+    }
+
+    /// Builder-style setter for footer emission (spec §3.4, v2.4 only).
+    /// See [`WriteOptions::footer`] for the on-wire layout.
+    pub fn with_footer(mut self, enabled: bool) -> Self {
+        self.footer = enabled;
         self
     }
 }
@@ -2610,6 +2673,16 @@ pub fn write_tag_with_options(
             ));
         }
     };
+
+    // Footer is defined only in ID3v2.4 (spec §3.4). Reject loudly
+    // rather than silently dropping the flag — a caller asking for an
+    // appended tag almost certainly wants v2.4 and would otherwise get
+    // a tag the reader can't locate on a backwards scan.
+    if options.footer && !matches!(target_version, Id3Version::V2_4) {
+        return Err(Error::unsupported(
+            "ID3v2 footer is v2.4-only; set target_version = V2_4 or clear footer",
+        ));
+    }
 
     // PerFrame is v2.4-only (v2.3 lacks the per-frame format-flag
     // byte the spec defines the bit in). Downgrade silently to
@@ -2679,18 +2752,45 @@ pub fn write_tag_with_options(
     if ext_header.is_some() {
         flags |= 0x40;
     }
+    // Footer-present bit (bit 4) signals a 10-byte "3DI..." trailer
+    // after the body. The footer's own flags byte mirrors the header's
+    // flags byte (spec §3.4 "the footer is a copy of the header"),
+    // so we set this *before* serialising either copy of the flags
+    // byte to keep header and footer byte-identical except for the
+    // identifier.
+    if options.footer {
+        flags |= 0x10;
+    }
 
-    let mut out = Vec::with_capacity(ID3V2_HEADER_SIZE + size);
+    let footer_len = if options.footer { 10 } else { 0 };
+    let mut out = Vec::with_capacity(ID3V2_HEADER_SIZE + size + footer_len);
     out.extend_from_slice(b"ID3");
     out.push(major);
     out.push(0); // revision
     out.push(flags);
     let s = size as u32;
-    out.push(((s >> 21) & 0x7F) as u8);
-    out.push(((s >> 14) & 0x7F) as u8);
-    out.push(((s >> 7) & 0x7F) as u8);
-    out.push((s & 0x7F) as u8);
+    let s0 = ((s >> 21) & 0x7F) as u8;
+    let s1 = ((s >> 14) & 0x7F) as u8;
+    let s2 = ((s >> 7) & 0x7F) as u8;
+    let s3 = (s & 0x7F) as u8;
+    out.push(s0);
+    out.push(s1);
+    out.push(s2);
+    out.push(s3);
     out.extend_from_slice(&body);
+    if options.footer {
+        // Spec §3.4: footer identifier is "3DI"; the rest of the
+        // 10-byte block reproduces the header's version, flags, and
+        // synchsafe size verbatim.
+        out.extend_from_slice(b"3DI");
+        out.push(major);
+        out.push(0); // revision
+        out.push(flags);
+        out.push(s0);
+        out.push(s1);
+        out.push(s2);
+        out.push(s3);
+    }
     Ok(out)
 }
 
@@ -4334,5 +4434,318 @@ mod tests {
         let b = write_tag_with_options(&tag, Id3Version::V2_4, &WriteOptions::default()).unwrap();
         assert_eq!(a, b);
         assert_eq!(a[5] & 0x80, 0, "default writer must not set unsync flag");
+    }
+
+    // -----------------------------------------------------------------
+    // ID3v2.4 footer (spec §3.4)
+    // -----------------------------------------------------------------
+
+    /// `WriteOptions::with_footer(true)` on v2.4 sets header bit 0x10
+    /// and emits a 10-byte "3DI..." trailer that mirrors the header's
+    /// version / flags / size. The output round-trips through
+    /// `parse_tag` and `consumed` reports header + body + 10-byte
+    /// footer.
+    #[test]
+    fn write_then_parse_footer_v24_default() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["footer-bearing".into()],
+            }],
+        };
+        let opts = WriteOptions::new().with_footer(true);
+        let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts).unwrap();
+        // Header footer-flag set.
+        assert_eq!(bytes[5] & 0x10, 0x10);
+        // Footer is the last 10 bytes; identifier "3DI" + matching
+        // header bytes 3..10.
+        let footer = &bytes[bytes.len() - 10..];
+        assert_eq!(&footer[0..3], b"3DI");
+        assert_eq!(footer[3], 4); // major
+        assert_eq!(footer[4], 0); // revision
+        assert_eq!(footer[5], bytes[5]); // flags match
+        assert_eq!(&footer[6..10], &bytes[6..10]); // size match
+        let (parsed, consumed) = parse_tag(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(parsed.frames.len(), 1);
+        if let Id3Frame::Text { id, values } = &parsed.frames[0] {
+            assert_eq!(id, "TIT2");
+            assert_eq!(values, &vec!["footer-bearing".to_string()]);
+        } else {
+            panic!("expected Text frame");
+        }
+    }
+
+    /// Footer + WholeTag unsync compose: the body is unsynchronised
+    /// (header bit 0x80 also set), the footer is *outside* the unsync
+    /// region (it lives after the announced synchsafe size), and the
+    /// round-trip still recovers the original frames byte-exact.
+    #[test]
+    fn write_then_parse_footer_v24_with_whole_tag_unsync() {
+        let payload = vec![0xFF, 0xE0, 0x55, 0xFF, 0x00, 0xAA];
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Private {
+                owner: "owner".into(),
+                data: payload.clone(),
+            }],
+        };
+        let opts = WriteOptions::new()
+            .with_unsync(UnsyncMode::WholeTag)
+            .with_footer(true);
+        let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts).unwrap();
+        // Both flags set.
+        assert_eq!(bytes[5] & 0x80, 0x80);
+        assert_eq!(bytes[5] & 0x10, 0x10);
+        // Footer is the trailing 10 bytes; identifier matches.
+        assert_eq!(&bytes[bytes.len() - 10..bytes.len() - 7], b"3DI");
+        let (parsed, consumed) = parse_tag(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        if let Id3Frame::Private { data, .. } = &parsed.frames[0] {
+            assert_eq!(data, &payload);
+        } else {
+            panic!("expected Private frame");
+        }
+    }
+
+    /// Footer + extended-header CRC compose: ext-header bit 0x40,
+    /// footer bit 0x10, and the writer emits all three regions in the
+    /// right order (header → ext-header → frames → footer). The CRC
+    /// region (frames + padding, here just frames) is verified by the
+    /// parser even though a footer follows; the spec's "data between
+    /// the header and footer" wording is honoured because the footer
+    /// bytes live *outside* the announced synchsafe size.
+    #[test]
+    fn write_then_parse_footer_v24_with_crc() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["crc + footer".into()],
+            }],
+        };
+        let opts = WriteOptions::new().with_crc(true).with_footer(true);
+        let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts).unwrap();
+        assert_eq!(bytes[5] & 0x40, 0x40); // ext-header
+        assert_eq!(bytes[5] & 0x10, 0x10); // footer
+        assert_eq!(&bytes[bytes.len() - 10..bytes.len() - 7], b"3DI");
+        let (parsed, consumed) = parse_tag(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        if let Id3Frame::Text { id, values } = &parsed.frames[0] {
+            assert_eq!(id, "TIT2");
+            assert_eq!(values, &vec!["crc + footer".to_string()]);
+        } else {
+            panic!("expected Text frame");
+        }
+    }
+
+    /// Requesting a footer on a v2.3 target is rejected: the v2.3
+    /// spec doesn't define the footer-flag bit, so silently emitting
+    /// one would produce a tag that v2.3-only parsers would
+    /// misinterpret (and our own parser would reject on read).
+    #[test]
+    fn footer_request_on_v23_errors() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["x".into()],
+            }],
+        };
+        let opts = WriteOptions::new().with_footer(true);
+        let err = write_tag_with_options(&tag, Id3Version::V2_3, &opts).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("v2.4-only") || msg.contains("footer"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    /// A tag claiming a footer on its v2.3 header byte is rejected on
+    /// parse — the spec only defines the footer for v2.4.
+    #[test]
+    fn parse_rejects_footer_flag_on_v23() {
+        // Hand-assemble a minimal v2.3 tag with a single TIT2 frame
+        // and the spurious footer flag set on the header.
+        let frame = {
+            let mut f = Vec::new();
+            f.extend_from_slice(b"TIT2");
+            // size = 1 (encoding byte) + 1 (text byte) = 2; v2.3 size
+            // is a regular u32.
+            f.extend_from_slice(&[0, 0, 0, 2]);
+            f.extend_from_slice(&[0, 0]); // flags
+            f.push(0x00); // encoding = ISO-8859-1
+            f.push(b'x');
+            f
+        };
+        let size = frame.len() as u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"ID3");
+        bytes.push(3); // major
+        bytes.push(0); // revision
+        bytes.push(0x10); // footer flag — illegal on v2.3
+        bytes.push(((size >> 21) & 0x7F) as u8);
+        bytes.push(((size >> 14) & 0x7F) as u8);
+        bytes.push(((size >> 7) & 0x7F) as u8);
+        bytes.push((size & 0x7F) as u8);
+        bytes.extend_from_slice(&frame);
+        // Append 10 "3DI..." trailing bytes so the buffer is long
+        // enough to fail on the version check rather than NeedMore.
+        bytes.extend_from_slice(b"3DI");
+        bytes.push(3);
+        bytes.push(0);
+        bytes.push(0x10);
+        bytes.push(((size >> 21) & 0x7F) as u8);
+        bytes.push(((size >> 14) & 0x7F) as u8);
+        bytes.push(((size >> 7) & 0x7F) as u8);
+        bytes.push((size & 0x7F) as u8);
+        let err = parse_tag(&bytes).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("v2.4-only") || msg.contains("v2.4"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    /// A footer-bearing tag whose trailer is corrupted is rejected
+    /// with a specific error (not silently accepted).
+    #[test]
+    fn parse_rejects_corrupt_footer_magic() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["x".into()],
+            }],
+        };
+        let mut bytes = write_tag_with_options(
+            &tag,
+            Id3Version::V2_4,
+            &WriteOptions::new().with_footer(true),
+        )
+        .unwrap();
+        // Smash the footer identifier.
+        let f = bytes.len() - 10;
+        bytes[f] = b'X';
+        let err = parse_tag(&bytes).unwrap_err();
+        assert!(format!("{err}").contains("footer magic"));
+    }
+
+    /// Mismatched footer size relative to header size is rejected.
+    #[test]
+    fn parse_rejects_footer_size_mismatch() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["x".into()],
+            }],
+        };
+        let mut bytes = write_tag_with_options(
+            &tag,
+            Id3Version::V2_4,
+            &WriteOptions::new().with_footer(true),
+        )
+        .unwrap();
+        // Flip the last synchsafe byte of the footer's size field.
+        let len = bytes.len();
+        bytes[len - 1] ^= 0x01;
+        let err = parse_tag(&bytes).unwrap_err();
+        assert!(format!("{err}").contains("footer size"));
+    }
+
+    /// Mismatched footer flags relative to header flags are rejected.
+    #[test]
+    fn parse_rejects_footer_flags_mismatch() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["x".into()],
+            }],
+        };
+        let mut bytes = write_tag_with_options(
+            &tag,
+            Id3Version::V2_4,
+            &WriteOptions::new().with_footer(true),
+        )
+        .unwrap();
+        // Twiddle the footer's flag byte (offset len-10+5 = len-5).
+        let len = bytes.len();
+        bytes[len - 5] ^= 0x40;
+        let err = parse_tag(&bytes).unwrap_err();
+        assert!(format!("{err}").contains("footer flags"));
+    }
+
+    /// A truncated buffer (header announces footer but the 10 trailer
+    /// bytes are missing) is reported via `Error::NeedMore` so the
+    /// caller can read more — *not* as a parse failure that would
+    /// mislead the caller into discarding the file's cursor.
+    #[test]
+    fn parse_truncated_footer_returns_need_more() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["x".into()],
+            }],
+        };
+        let bytes = write_tag_with_options(
+            &tag,
+            Id3Version::V2_4,
+            &WriteOptions::new().with_footer(true),
+        )
+        .unwrap();
+        // Drop the last 5 footer bytes to simulate a short read.
+        let short = &bytes[..bytes.len() - 5];
+        match parse_tag(short) {
+            Err(Error::NeedMore) => {}
+            other => panic!("expected NeedMore, got {other:?}"),
+        }
+    }
+
+    /// `tag_size_at_head` already reports footer-inclusive totals (the
+    /// existing pre-implementation behaviour). Confirm the writer's
+    /// output is consistent with that: head-peeking the first 10 bytes
+    /// of a footer-bearing tag returns exactly the written length.
+    #[test]
+    fn tag_size_at_head_includes_footer() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["title".into()],
+            }],
+        };
+        let bytes = write_tag_with_options(
+            &tag,
+            Id3Version::V2_4,
+            &WriteOptions::new().with_footer(true),
+        )
+        .unwrap();
+        let total = tag_size_at_head(&bytes[..10]).unwrap();
+        assert_eq!(total, bytes.len());
+    }
+
+    /// Default writer (no options) does NOT set the footer flag and
+    /// does NOT emit a footer — historical behaviour preserved.
+    #[test]
+    fn write_tag_default_no_footer() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["x".into()],
+            }],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+        assert_eq!(
+            bytes[5] & 0x10,
+            0,
+            "default writer must not set footer flag"
+        );
+        // Footer is not present; the tail bytes are frame data, not "3DI".
+        assert!(bytes.len() < 13 || &bytes[bytes.len() - 10..bytes.len() - 7] != b"3DI");
     }
 }
