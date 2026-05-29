@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `RVRB` reverb frame (spec v2.3 §4.13 / v2.4 §4.13). Replaces the
+  previous opaque `Id3Frame::Unknown { id: "RVRB", .. }` fallthrough
+  with a structured `Id3Frame::Reverb` variant carrying the ten
+  spec-named fields: u16 BE `reverb_left_ms` / `reverb_right_ms`
+  delays, u8 `bounces_left` / `bounces_right` counts (where `$FF`
+  denotes the spec's "infinite number of bounces"), four u8 feedback
+  bytes (`feedback_ll` / `feedback_lr` / `feedback_rr` / `feedback_rl`
+  for the four bounce-to-channel routings on the spec's
+  `$00 = 0% .. $FF = 100%` scale, where `$7F` produces the worked
+  example of "50% volume reduction on the first bounce, 50% of that on
+  the second"), and two u8 premix bytes (`premix_lr` / `premix_rl`,
+  also `$00..$FF`, with both `$FF` producing mono output when reverb
+  is symmetric). The wire payload is exactly twelve bytes with no
+  encoding byte and no terminators, and the layout is identical
+  between v2.3 and v2.4 — the writer emits the same bytes under either
+  version envelope. A v2.2 `REV` frame promotes to the same
+  `Reverb` variant on parse (matching the `TT2 → TIT2`, `PIC → APIC`
+  table from §3.3 of the v2.2 spec). A payload shorter than 12 bytes
+  is preserved verbatim through `Id3Frame::Unknown { id: "RVRB", .. }`
+  because the spec layout is exact-size and a truncated frame cannot
+  be reconstructed unambiguously. Trailing bytes after the canonical
+  12 are dropped on read per spec "unknown bytes in a frame should be
+  skipped". `to_key_value_pairs` does not surface `Reverb` (the frame
+  carries no text values, only DSP descriptors). Six new lib tests
+  (writer pinned to a hand-computed 12-byte sequence; v2.3 + v2.4
+  round-trip; short-payload Unknown fallback for both 11-byte and
+  zero-byte inputs; trailing-byte drop; v2.2 `REV` promotion to
+  `Reverb`; zero-pair invariant for `to_key_value_pairs`) and two new
+  integration round-trip tests (`roundtrip_rvrb_v23_and_v24` and
+  `roundtrip_rvrb_extreme_values` exercising `$FF` bounces / feedback
+  / premix and the `0xFFFF` u16 delay extreme) cover the matrix. Spec
+  notes "There may only be one 'RVRB' frame in each tag" — uniqueness
+  is left to the caller, matching how the crate treats the analogous
+  single-instance constraints on `MCDI` / `MLLT` / `SEEK`.
+
 - `MLLT` MPEG location lookup table frame (spec v2.3 §4.7 / v2.4 §4.6).
   Replaces the previous opaque `Id3Frame::Unknown { id: "MLLT", .. }`
   fallthrough with a structured `Id3Frame::MpegLocationLookup` variant

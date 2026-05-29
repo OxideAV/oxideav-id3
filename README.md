@@ -243,10 +243,15 @@ peek still sizes the right number of bytes to read.
   ms_dev_bits)` constrained to a multiple of 4; widths capped at 32
   bits per field so each reference fits in `(u32, u32)`; writer
   rejects non-multiple-of-four sums, 24-bit-field overflows, and
-  per-reference values that exceed the declared width). All
-  twenty-four round-trip both directions for v2.3 and v2.4 (ASPI is
-  v2.4-only per spec but the wire layout is byte-aligned and
-  version-independent).
+  per-reference values that exceed the declared width), `RVRB` reverb
+  (v2.3 §4.13 / v2.4 §4.13: fixed twelve-byte payload — u16 BE delays
+  left/right, u8 bounce counts left/right with `$FF` = infinite, four
+  u8 feedback bytes L→L / L→R / R→R / R→L on the `$00..$FF` 0..100%
+  scale, two u8 premix bytes L→R / R→L; v2.2 `REV` promotes to the
+  same structured variant). All twenty-five round-trip both directions
+  for v2.3 and v2.4 (ASPI is v2.4-only per spec but the wire layout is
+  byte-aligned and version-independent; RVRB is byte-aligned and
+  version-independent as well).
 - Everything else surfaces as `Id3Frame::Unknown { id, raw }` with the
   payload preserved so it can be written back untouched.
 - `Id3Frame::timestamp_unit()` returns a typed `TimestampUnit`

@@ -365,6 +365,40 @@ pub enum Id3Frame {
         bits_for_ms_deviation: u8,
         references: Vec<(u32, u32)>,
     },
+    /// `RVRB` reverb frame (spec v2.3 §4.13 / v2.4 §4.13). A fixed
+    /// 12-byte payload describing a subjective reverb pre-set:
+    ///
+    /// * `reverb_left_ms` / `reverb_right_ms` — u16 BE, delay between
+    ///   bounces in milliseconds for each channel.
+    /// * `bounces_left` / `bounces_right` — u8, number of bounces; a
+    ///   value of `0xFF` means an infinite number of bounces per spec.
+    /// * `feedback_ll` / `feedback_lr` / `feedback_rr` / `feedback_rl`
+    ///   — u8, the four bounce-feedback amounts (left-to-left,
+    ///   left-to-right, right-to-right, right-to-left) on the
+    ///   spec's `$00 = 0% .. $FF = 100%` scale (a value of `0x7F`
+    ///   yields the spec's worked example of "50% volume reduction
+    ///   on the first bounce").
+    /// * `premix_lr` / `premix_rl` — u8, pre-reverb cross-channel mix
+    ///   on the same `$00..$FF` scale; both `0xFF` collapses to mono
+    ///   when the reverb is applied symmetrically.
+    ///
+    /// The wire layout is byte-aligned and version-independent (v2.3
+    /// and v2.4 are identical), so the writer accepts it under either
+    /// envelope. Spec § says "There may only be one 'RVRB' frame in
+    /// each tag" — uniqueness is a caller-level concern, not enforced
+    /// here.
+    Reverb {
+        reverb_left_ms: u16,
+        reverb_right_ms: u16,
+        bounces_left: u8,
+        bounces_right: u8,
+        feedback_ll: u8,
+        feedback_lr: u8,
+        feedback_rr: u8,
+        feedback_rl: u8,
+        premix_lr: u8,
+        premix_rl: u8,
+    },
     /// Any frame whose id we don't parse structurally (RGAD, CHAP,
     /// ...). The payload is preserved verbatim so callers or later
     /// versions can recognise it without needing to reparse.
@@ -796,6 +830,7 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
             | Id3Frame::LinkedInfo { .. }
             | Id3Frame::AudioSeekPointIndex { .. }
             | Id3Frame::MpegLocationLookup { .. }
+            | Id3Frame::Reverb { .. }
             | Id3Frame::Unknown { .. } => {}
         }
     }
@@ -1252,6 +1287,7 @@ fn dispatch_v23_v24(id: &str, payload: &[u8]) -> Id3Frame {
         "LINK" => parse_link(payload),
         "ASPI" => parse_aspi(payload),
         "MLLT" => parse_mllt(payload),
+        "RVRB" => parse_rvrb(payload),
         _ => Id3Frame::Unknown {
             id: id.to_string(),
             raw: payload.to_vec(),
@@ -1282,6 +1318,7 @@ fn dispatch_v22(id: &str, payload: &[u8]) -> Id3Frame {
         "COM" => parse_comm_like(payload, false),
         "ULT" => parse_comm_like(payload, true),
         "PIC" => parse_pic(payload),
+        "REV" => parse_rvrb(payload),
         _ => Id3Frame::Unknown {
             id: id.to_string(),
             raw: payload.to_vec(),
@@ -1331,6 +1368,7 @@ fn v22_promote(id: &str) -> &str {
         "TOL" => "TOLY",
         "TOR" => "TORY",
         "TXX" => "TXXX",
+        "REV" => "RVRB",
         "WAF" => "WOAF",
         "WAR" => "WOAR",
         "WAS" => "WOAS",
@@ -2261,6 +2299,52 @@ fn parse_mllt(payload: &[u8]) -> Id3Frame {
         bits_for_bytes_deviation,
         bits_for_ms_deviation,
         references,
+    }
+}
+
+/// Parse an `RVRB` reverb-frame payload (spec v2.3 §4.13 / v2.4 §4.13).
+/// The layout is a fixed twelve bytes:
+///
+/// ```text
+///   reverb_left_ms      $xx xx   (u16 BE)
+///   reverb_right_ms     $xx xx   (u16 BE)
+///   bounces_left        $xx
+///   bounces_right       $xx
+///   feedback_ll         $xx
+///   feedback_lr         $xx
+///   feedback_rr         $xx
+///   feedback_rl         $xx
+///   premix_lr           $xx
+///   premix_rl           $xx
+/// ```
+///
+/// A payload shorter than 12 bytes is preserved verbatim through
+/// [`Id3Frame::Unknown`] — the layout is exact-size with no
+/// terminators and a truncated frame cannot be interpreted
+/// unambiguously. A payload longer than 12 bytes is treated as a
+/// well-formed reverb followed by spurious trailing bytes per spec
+/// "all the unknown bytes in a frame should be skipped"; the leading
+/// 12 are decoded and the rest dropped.
+fn parse_rvrb(payload: &[u8]) -> Id3Frame {
+    if payload.len() < 12 {
+        return Id3Frame::Unknown {
+            id: "RVRB".to_string(),
+            raw: payload.to_vec(),
+        };
+    }
+    let reverb_left_ms = u16::from_be_bytes([payload[0], payload[1]]);
+    let reverb_right_ms = u16::from_be_bytes([payload[2], payload[3]]);
+    Id3Frame::Reverb {
+        reverb_left_ms,
+        reverb_right_ms,
+        bounces_left: payload[4],
+        bounces_right: payload[5],
+        feedback_ll: payload[6],
+        feedback_lr: payload[7],
+        feedback_rr: payload[8],
+        feedback_rl: payload[9],
+        premix_lr: payload[10],
+        premix_rl: payload[11],
     }
 }
 
@@ -3653,6 +3737,35 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
                 payload.extend_from_slice(&writer.into_bytes());
             }
             Ok(("MLLT".to_string(), payload))
+        }
+        Id3Frame::Reverb {
+            reverb_left_ms,
+            reverb_right_ms,
+            bounces_left,
+            bounces_right,
+            feedback_ll,
+            feedback_lr,
+            feedback_rr,
+            feedback_rl,
+            premix_lr,
+            premix_rl,
+        } => {
+            // Spec v2.3 §4.13 / v2.4 §4.13: fixed 12-byte payload, no
+            // encoding byte, no terminator. Layout is byte-aligned and
+            // version-independent, so the writer emits the same bytes
+            // under any version envelope.
+            let mut payload = Vec::with_capacity(12);
+            payload.extend_from_slice(&reverb_left_ms.to_be_bytes());
+            payload.extend_from_slice(&reverb_right_ms.to_be_bytes());
+            payload.push(*bounces_left);
+            payload.push(*bounces_right);
+            payload.push(*feedback_ll);
+            payload.push(*feedback_lr);
+            payload.push(*feedback_rr);
+            payload.push(*feedback_rl);
+            payload.push(*premix_lr);
+            payload.push(*premix_rl);
+            Ok(("RVRB".to_string(), payload))
         }
         Id3Frame::Unknown { id, raw } => {
             // Promote v2.2 ids (3 chars) to their v2.3 equivalents on
@@ -5058,5 +5171,195 @@ mod tests {
         assert_eq!(got.0, 9);
         assert_eq!(got.1, 7);
         assert_eq!(got.2, vec![(0x1FF, 0x7F), (0x000, 0x00), (0x100, 0x40)]);
+    }
+
+    /// `RVRB` writer emits exactly 12 bytes pinned to the spec field
+    /// order: u16 BE left ms, u16 BE right ms, then eight single bytes
+    /// (bounces L/R, four feedback bytes L→L / L→R / R→R / R→L, then
+    /// premix L→R / R→L).
+    #[test]
+    fn rvrb_writer_pinned_bytes() {
+        let frame = Id3Frame::Reverb {
+            reverb_left_ms: 0x1234,
+            reverb_right_ms: 0x5678,
+            bounces_left: 0x10,
+            bounces_right: 0xFF, // spec: $FF = infinite
+            feedback_ll: 0x7F,   // spec example: 50% reduction
+            feedback_lr: 0x01,
+            feedback_rr: 0x80,
+            feedback_rl: 0x02,
+            premix_lr: 0xAA,
+            premix_rl: 0x55,
+        };
+        let (id, payload) = encode_frame(Id3Version::V2_4, &frame).unwrap();
+        assert_eq!(id, "RVRB");
+        assert_eq!(
+            payload,
+            vec![0x12, 0x34, 0x56, 0x78, 0x10, 0xFF, 0x7F, 0x01, 0x80, 0x02, 0xAA, 0x55]
+        );
+    }
+
+    /// `RVRB` round-trips through `write_tag` / `parse_tag` for both
+    /// v2.3 and v2.4 (the wire layout is byte-aligned and
+    /// version-independent).
+    #[test]
+    fn rvrb_roundtrip_v23_and_v24() {
+        let original = Id3Frame::Reverb {
+            reverb_left_ms: 250,
+            reverb_right_ms: 300,
+            bounces_left: 4,
+            bounces_right: 4,
+            feedback_ll: 0x7F,
+            feedback_lr: 0x10,
+            feedback_rr: 0x7F,
+            feedback_rl: 0x10,
+            premix_lr: 0x20,
+            premix_rl: 0x20,
+        };
+        for version in [Id3Version::V2_3, Id3Version::V2_4] {
+            let tag = Id3Tag {
+                version,
+                frames: vec![original.clone()],
+            };
+            let bytes = write_tag(&tag, version).unwrap();
+            let (parsed, _) = parse_tag(&bytes).unwrap();
+            assert_eq!(parsed.frames.len(), 1);
+            match (&parsed.frames[0], &original) {
+                (
+                    Id3Frame::Reverb {
+                        reverb_left_ms: a_l,
+                        reverb_right_ms: a_r,
+                        bounces_left: a_bl,
+                        bounces_right: a_br,
+                        feedback_ll: a_fll,
+                        feedback_lr: a_flr,
+                        feedback_rr: a_frr,
+                        feedback_rl: a_frl,
+                        premix_lr: a_plr,
+                        premix_rl: a_prl,
+                    },
+                    Id3Frame::Reverb {
+                        reverb_left_ms: b_l,
+                        reverb_right_ms: b_r,
+                        bounces_left: b_bl,
+                        bounces_right: b_br,
+                        feedback_ll: b_fll,
+                        feedback_lr: b_flr,
+                        feedback_rr: b_frr,
+                        feedback_rl: b_frl,
+                        premix_lr: b_plr,
+                        premix_rl: b_prl,
+                    },
+                ) => {
+                    assert_eq!((a_l, a_r, a_bl, a_br), (b_l, b_r, b_bl, b_br));
+                    assert_eq!(
+                        (a_fll, a_flr, a_frr, a_frl, a_plr, a_prl),
+                        (b_fll, b_flr, b_frr, b_frl, b_plr, b_prl)
+                    );
+                }
+                (other, _) => panic!("expected Reverb after round-trip, got {other:?}"),
+            }
+        }
+    }
+
+    /// Truncated RVRB payloads (< 12 bytes) must NOT silently fabricate
+    /// zeroed fields. The parser surfaces the raw bytes through
+    /// `Id3Frame::Unknown` so the round-trip preserves the original.
+    #[test]
+    fn rvrb_short_payload_surfaces_unknown() {
+        // 11 bytes — one short of the spec layout.
+        let got = parse_rvrb(&[0; 11]);
+        match got {
+            Id3Frame::Unknown { id, raw } => {
+                assert_eq!(id, "RVRB");
+                assert_eq!(raw.len(), 11);
+            }
+            other => panic!("expected Unknown for short RVRB, got {other:?}"),
+        }
+        // Zero bytes — corner case.
+        let got = parse_rvrb(&[]);
+        match got {
+            Id3Frame::Unknown { id, raw } => {
+                assert_eq!(id, "RVRB");
+                assert!(raw.is_empty());
+            }
+            other => panic!("expected Unknown for empty RVRB, got {other:?}"),
+        }
+    }
+
+    /// RVRB payloads longer than 12 bytes decode the leading 12 and
+    /// drop the trailing bytes per spec "skip unknown bytes". The
+    /// extra bytes do not appear in the decoded frame so a writer
+    /// re-serialises only the canonical 12 — this is a deliberate
+    /// non-round-trip when the on-wire form had trailing junk.
+    #[test]
+    fn rvrb_trailing_bytes_are_dropped() {
+        let mut payload = vec![
+            0x00, 0x10, 0x00, 0x20, 0x05, 0x05, 0x7F, 0x10, 0x7F, 0x10, 0x40, 0x40,
+        ];
+        payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let got = parse_rvrb(&payload);
+        match got {
+            Id3Frame::Reverb {
+                reverb_left_ms,
+                reverb_right_ms,
+                bounces_left,
+                premix_rl,
+                ..
+            } => {
+                assert_eq!(reverb_left_ms, 0x0010);
+                assert_eq!(reverb_right_ms, 0x0020);
+                assert_eq!(bounces_left, 0x05);
+                assert_eq!(premix_rl, 0x40);
+            }
+            other => panic!("expected Reverb, got {other:?}"),
+        }
+    }
+
+    /// The v2.2 `REV` id is the 3-char form of v2.3 `RVRB`. The parser
+    /// must promote it to the structured variant when the payload is
+    /// well-formed, matching the existing v2.2 → v2.3 promotion table
+    /// (TT2 → TIT2, PIC → APIC, ...).
+    #[test]
+    fn rvrb_v22_rev_promotes_to_reverb() {
+        let payload = [
+            0x00, 0x64, 0x00, 0xC8, 0x03, 0x03, 0x40, 0x10, 0x40, 0x10, 0x20, 0x20,
+        ];
+        let got = dispatch_v22("REV", &payload);
+        match got {
+            Id3Frame::Reverb {
+                reverb_left_ms,
+                reverb_right_ms,
+                ..
+            } => {
+                assert_eq!(reverb_left_ms, 100);
+                assert_eq!(reverb_right_ms, 200);
+            }
+            other => panic!("expected Reverb from REV, got {other:?}"),
+        }
+    }
+
+    /// `to_key_value_pairs` is the Vorbis-style flat-pair view. RVRB
+    /// carries no text values (it is a pure DSP descriptor), so it
+    /// must contribute zero pairs — adding a `Reverb` frame to a tag
+    /// must not perturb the pair output of an otherwise-empty tag.
+    #[test]
+    fn rvrb_yields_no_key_value_pairs() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Reverb {
+                reverb_left_ms: 50,
+                reverb_right_ms: 50,
+                bounces_left: 1,
+                bounces_right: 1,
+                feedback_ll: 0,
+                feedback_lr: 0,
+                feedback_rr: 0,
+                feedback_rl: 0,
+                premix_lr: 0,
+                premix_rl: 0,
+            }],
+        };
+        assert!(to_key_value_pairs(&tag).is_empty());
     }
 }

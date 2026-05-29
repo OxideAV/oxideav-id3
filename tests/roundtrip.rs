@@ -2072,3 +2072,102 @@ fn write_footer_on_v23_errors() {
     let msg = format!("{err}");
     assert!(msg.contains("v2.4"), "unexpected error: {msg}");
 }
+
+/// `RVRB` reverb (spec v2.3 §4.13 / v2.4 §4.13) round-trip through
+/// `write_tag` → `parse_tag`. The on-wire layout is byte-aligned and
+/// version-independent, so the same `Reverb` value survives both
+/// envelopes byte-for-byte.
+#[test]
+fn roundtrip_rvrb_v23_and_v24() {
+    let original = Id3Frame::Reverb {
+        reverb_left_ms: 0x0064,
+        reverb_right_ms: 0x00C8,
+        bounces_left: 0x04,
+        bounces_right: 0x04,
+        feedback_ll: 0x7F,
+        feedback_lr: 0x10,
+        feedback_rr: 0x7F,
+        feedback_rl: 0x10,
+        premix_lr: 0x20,
+        premix_rl: 0x20,
+    };
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        let tag = Id3Tag {
+            version,
+            frames: vec![original.clone()],
+        };
+        let bytes = write_tag(&tag, version).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        assert_eq!(parsed.frames.len(), 1);
+        match &parsed.frames[0] {
+            Id3Frame::Reverb {
+                reverb_left_ms,
+                reverb_right_ms,
+                bounces_left,
+                bounces_right,
+                feedback_ll,
+                feedback_lr,
+                feedback_rr,
+                feedback_rl,
+                premix_lr,
+                premix_rl,
+            } => {
+                assert_eq!(*reverb_left_ms, 0x0064);
+                assert_eq!(*reverb_right_ms, 0x00C8);
+                assert_eq!(*bounces_left, 0x04);
+                assert_eq!(*bounces_right, 0x04);
+                assert_eq!(*feedback_ll, 0x7F);
+                assert_eq!(*feedback_lr, 0x10);
+                assert_eq!(*feedback_rr, 0x7F);
+                assert_eq!(*feedback_rl, 0x10);
+                assert_eq!(*premix_lr, 0x20);
+                assert_eq!(*premix_rl, 0x20);
+            }
+            other => panic!("expected Reverb, got {other:?}"),
+        }
+    }
+}
+
+/// The spec edge values for `RVRB` byte fields — `$FF` bounces means
+/// infinite, `$FF` feedback means 100% return, `$FF` premix means
+/// fully cross-mixed — must round-trip exactly. The 16-bit ms fields
+/// are also exercised at their u16 extreme (`0xFFFF`).
+#[test]
+fn roundtrip_rvrb_extreme_values() {
+    let original = Id3Frame::Reverb {
+        reverb_left_ms: 0xFFFF,
+        reverb_right_ms: 0x0000,
+        bounces_left: 0xFF,
+        bounces_right: 0x00,
+        feedback_ll: 0xFF,
+        feedback_lr: 0x00,
+        feedback_rr: 0xFF,
+        feedback_rl: 0x00,
+        premix_lr: 0xFF,
+        premix_rl: 0xFF,
+    };
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![original.clone()],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    assert_eq!(parsed.frames.len(), 1);
+    match &parsed.frames[0] {
+        Id3Frame::Reverb {
+            reverb_left_ms,
+            bounces_left,
+            feedback_ll,
+            premix_lr,
+            premix_rl,
+            ..
+        } => {
+            assert_eq!(*reverb_left_ms, 0xFFFF);
+            assert_eq!(*bounces_left, 0xFF);
+            assert_eq!(*feedback_ll, 0xFF);
+            assert_eq!(*premix_lr, 0xFF);
+            assert_eq!(*premix_rl, 0xFF);
+        }
+        other => panic!("expected Reverb, got {other:?}"),
+    }
+}
