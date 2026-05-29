@@ -236,9 +236,17 @@ peek still sizes the right number of bytes to read.
   additional data), `ASPI` audio seek point index (v2.4 §4.30:
   indexed-data start + length + 16-bit N + 8/16 bits-per-point + N
   `Fi` fractions; writer refuses non-8/16 bit widths since a
-  conformant parser couldn't reconstruct them). All twenty-three
-  round-trip both directions for v2.3 and v2.4 (ASPI is v2.4-only per
-  spec but the wire layout is byte-aligned and version-independent).
+  conformant parser couldn't reconstruct them), `MLLT` MPEG location
+  lookup table (v2.3 §4.7 / v2.4 §4.6: u16 mpeg-frames-between-ref +
+  3 × 24-bit fields + two bit-width bytes + N references packed
+  MSB-first across byte boundaries with `(bytes_dev_bits +
+  ms_dev_bits)` constrained to a multiple of 4; widths capped at 32
+  bits per field so each reference fits in `(u32, u32)`; writer
+  rejects non-multiple-of-four sums, 24-bit-field overflows, and
+  per-reference values that exceed the declared width). All
+  twenty-four round-trip both directions for v2.3 and v2.4 (ASPI is
+  v2.4-only per spec but the wire layout is byte-aligned and
+  version-independent).
 - Everything else surfaces as `Id3Frame::Unknown { id, raw }` with the
   payload preserved so it can be written back untouched.
 - `Id3Frame::timestamp_unit()` returns a typed `TimestampUnit`

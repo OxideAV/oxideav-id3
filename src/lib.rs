@@ -68,6 +68,7 @@
 //! * `ENCR` encryption method registration.
 //! * `AENC` audio encryption / `LINK` linked information.
 //! * `ASPI` audio seek point index (v2.4).
+//! * `MLLT` MPEG location lookup table.
 //!
 //! Everything else lands in [`Id3Frame::Unknown`] with the raw payload
 //! preserved so future code can extend recognition without reparsing.
@@ -324,6 +325,45 @@ pub enum Id3Frame {
         indexed_data_length: u32,
         bits_per_index_point: u8,
         fractions: Vec<u16>,
+    },
+    /// `MLLT` MPEG location lookup table (v2.3 §4.7 / v2.4 §4.6).
+    /// A jump-table for seeking inside an MPEG audio file: every Nth
+    /// MPEG frame produces one reference whose three fixed fields
+    /// describe what the encoder believes the cumulative byte offset
+    /// and millisecond timestamp are, plus two per-reference deviation
+    /// values (in bits) that correct the cumulative drift between
+    /// belief and reality. There may be at most one `MLLT` frame per
+    /// tag (spec §4.7 / §4.6).
+    ///
+    /// `mpeg_frames_between_reference` is the descriptor's u16
+    /// "frame counter" increment (a value of 2 means the first
+    /// reference is at the second MPEG frame, the second at the fourth,
+    /// etc.). `bytes_between_reference` and `ms_between_reference` are
+    /// 24-bit unsigned BE fields (the parser preserves the raw u32 in
+    /// `0..=0xFF_FFFF`).
+    ///
+    /// Per-reference layout is `bits_for_bytes_deviation` bits of byte
+    /// deviation followed by `bits_for_ms_deviation` bits of
+    /// millisecond deviation, MSB-first, packed across byte boundaries
+    /// in the spec's `%xxx....` form. The spec requires their sum to be
+    /// a multiple of four — the parser tolerates a non-multiple-of-four
+    /// sum by stopping once the remaining bits can no longer feed one
+    /// complete reference, and the writer enforces the constraint by
+    /// returning [`Error::invalid`] rather than emitting a stream the
+    /// spec's reference reader could not align on.
+    ///
+    /// The two deviation widths are bounded at 32 bits each so a single
+    /// reference fits in `(u32, u32)`. Anything wider is rejected on
+    /// write; on read the parser refuses to interpret an out-of-range
+    /// width and preserves the raw bytes via [`Id3Frame::Unknown`]
+    /// rather than silently truncating.
+    MpegLocationLookup {
+        mpeg_frames_between_reference: u16,
+        bytes_between_reference: u32,
+        ms_between_reference: u32,
+        bits_for_bytes_deviation: u8,
+        bits_for_ms_deviation: u8,
+        references: Vec<(u32, u32)>,
     },
     /// Any frame whose id we don't parse structurally (RGAD, CHAP,
     /// ...). The payload is preserved verbatim so callers or later
@@ -755,6 +795,7 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
             | Id3Frame::AudioEncryption { .. }
             | Id3Frame::LinkedInfo { .. }
             | Id3Frame::AudioSeekPointIndex { .. }
+            | Id3Frame::MpegLocationLookup { .. }
             | Id3Frame::Unknown { .. } => {}
         }
     }
@@ -1210,6 +1251,7 @@ fn dispatch_v23_v24(id: &str, payload: &[u8]) -> Id3Frame {
         "AENC" => parse_aenc(payload),
         "LINK" => parse_link(payload),
         "ASPI" => parse_aspi(payload),
+        "MLLT" => parse_mllt(payload),
         _ => Id3Frame::Unknown {
             id: id.to_string(),
             raw: payload.to_vec(),
@@ -2161,6 +2203,140 @@ fn parse_aspi(payload: &[u8]) -> Id3Frame {
         indexed_data_length,
         bits_per_index_point: bits,
         fractions,
+    }
+}
+
+/// Parse an `MLLT` MPEG location lookup table payload (spec v2.3 §4.7 /
+/// v2.4 §4.6). Layout:
+///
+/// ```text
+/// MPEG frames between reference  $xx xx
+/// Bytes between reference        $xx xx xx
+/// Milliseconds between reference $xx xx xx
+/// Bits for bytes deviation       $xx
+/// Bits for milliseconds dev.     $xx
+/// For each reference:
+///   Deviation in bytes           %xxx....   (bits_for_bytes_deviation bits)
+///   Deviation in milliseconds    %xxx....   (bits_for_ms_deviation bits)
+/// ```
+///
+/// The two deviation widths together (per reference) must be a multiple
+/// of four bits per spec. The parser tolerates a non-multiple-of-four
+/// sum by stopping once the remaining bits in the payload can no longer
+/// feed one complete reference. Per-reference widths above 32 bits are
+/// rejected — the descriptor is preserved but the references are
+/// dropped because we cannot fit them in `(u32, u32)`.
+fn parse_mllt(payload: &[u8]) -> Id3Frame {
+    if payload.len() < 10 {
+        // Truncated descriptor — preserve the raw bytes since a partial
+        // MLLT is not interpretable.
+        return Id3Frame::Unknown {
+            id: "MLLT".to_string(),
+            raw: payload.to_vec(),
+        };
+    }
+    let mpeg_frames_between_reference = u16::from_be_bytes([payload[0], payload[1]]);
+    let bytes_between_reference = regular_u24(payload[2], payload[3], payload[4]);
+    let ms_between_reference = regular_u24(payload[5], payload[6], payload[7]);
+    let bits_for_bytes_deviation = payload[8];
+    let bits_for_ms_deviation = payload[9];
+    let body = &payload[10..];
+    let mut references: Vec<(u32, u32)> = Vec::new();
+    if bits_for_bytes_deviation <= 32 && bits_for_ms_deviation <= 32 {
+        let total_bits = bits_for_bytes_deviation as usize + bits_for_ms_deviation as usize;
+        if total_bits > 0 && body.len().saturating_mul(8) >= total_bits {
+            // Pull references MSB-first across byte boundaries.
+            let mut reader = BitReader::new(body);
+            while reader.remaining() >= total_bits {
+                let bytes_dev = reader.take(bits_for_bytes_deviation as usize);
+                let ms_dev = reader.take(bits_for_ms_deviation as usize);
+                references.push((bytes_dev, ms_dev));
+            }
+        }
+    }
+    Id3Frame::MpegLocationLookup {
+        mpeg_frames_between_reference,
+        bytes_between_reference,
+        ms_between_reference,
+        bits_for_bytes_deviation,
+        bits_for_ms_deviation,
+        references,
+    }
+}
+
+/// MSB-first bit reader for the `MLLT` per-reference deviation pair.
+/// The spec packs `bits_for_bytes_deviation + bits_for_ms_deviation`
+/// bits per reference across byte boundaries, with the requirement that
+/// the sum is a multiple of four; the reader does not assume that
+/// requirement so a truncated or non-conforming sum is handled by
+/// stopping at the boundary rather than over-reading.
+struct BitReader<'a> {
+    buf: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, bit_pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.buf.len() * 8 - self.bit_pos
+    }
+
+    /// Pull `n` bits (0 ≤ n ≤ 32) MSB-first into a `u32`. Out-of-buffer
+    /// reads zero-fill, but callers gate on [`Self::remaining`] first.
+    fn take(&mut self, n: usize) -> u32 {
+        debug_assert!(n <= 32, "MLLT bit width clamped at 32");
+        let mut value: u32 = 0;
+        for _ in 0..n {
+            let byte_idx = self.bit_pos >> 3;
+            let bit_in_byte = 7 - (self.bit_pos & 7);
+            let bit = if byte_idx < self.buf.len() {
+                (self.buf[byte_idx] >> bit_in_byte) & 1
+            } else {
+                0
+            };
+            value = (value << 1) | bit as u32;
+            self.bit_pos += 1;
+        }
+        value
+    }
+}
+
+/// MSB-first bit writer dual to [`BitReader`]. Used by the `MLLT`
+/// encoder to pack each `(bytes_dev, ms_dev)` pair across byte
+/// boundaries per spec §4.7 / §4.6.
+struct BitWriter {
+    buf: Vec<u8>,
+    bit_pos: usize,
+}
+
+impl BitWriter {
+    fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            bit_pos: 0,
+        }
+    }
+
+    /// Push the low `n` bits of `value` MSB-first.
+    fn push(&mut self, value: u32, n: usize) {
+        debug_assert!(n <= 32, "MLLT bit width clamped at 32");
+        for i in (0..n).rev() {
+            let bit = ((value >> i) & 1) as u8;
+            let byte_idx = self.bit_pos >> 3;
+            let bit_in_byte = 7 - (self.bit_pos & 7);
+            if byte_idx >= self.buf.len() {
+                self.buf.push(0);
+            }
+            self.buf[byte_idx] |= bit << bit_in_byte;
+            self.bit_pos += 1;
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.buf
     }
 }
 
@@ -3412,6 +3588,71 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
                 }
             }
             Ok(("ASPI".to_string(), payload))
+        }
+        Id3Frame::MpegLocationLookup {
+            mpeg_frames_between_reference,
+            bytes_between_reference,
+            ms_between_reference,
+            bits_for_bytes_deviation,
+            bits_for_ms_deviation,
+            references,
+        } => {
+            // Spec §4.7 / §4.6:
+            //   - The 24-bit fields cap at 0x00FF_FFFF.
+            //   - Per-reference widths must each be ≤ 32 (so the value
+            //     fits in u32) AND their sum must be a multiple of 4.
+            //   - The descriptor (frames-between byte count + 3-byte
+            //     fields + the two deviation widths) is always 10 bytes.
+            if *bytes_between_reference > 0x00FF_FFFF {
+                return Err(Error::invalid(
+                    "MLLT bytes_between_reference exceeds 24-bit field",
+                ));
+            }
+            if *ms_between_reference > 0x00FF_FFFF {
+                return Err(Error::invalid(
+                    "MLLT ms_between_reference exceeds 24-bit field",
+                ));
+            }
+            if *bits_for_bytes_deviation > 32 || *bits_for_ms_deviation > 32 {
+                return Err(Error::invalid(
+                    "MLLT per-reference deviation width must fit in u32 (≤ 32 bits)",
+                ));
+            }
+            let total_bits = *bits_for_bytes_deviation as usize + *bits_for_ms_deviation as usize;
+            if total_bits % 4 != 0 {
+                return Err(Error::invalid(
+                    "MLLT bits_for_bytes_deviation + bits_for_ms_deviation must be a multiple of 4",
+                ));
+            }
+            let mut payload = Vec::with_capacity(10 + (total_bits * references.len()).div_ceil(8));
+            payload.extend_from_slice(&mpeg_frames_between_reference.to_be_bytes());
+            let bb = bytes_between_reference.to_be_bytes();
+            payload.extend_from_slice(&bb[1..4]);
+            let mb = ms_between_reference.to_be_bytes();
+            payload.extend_from_slice(&mb[1..4]);
+            payload.push(*bits_for_bytes_deviation);
+            payload.push(*bits_for_ms_deviation);
+            if total_bits > 0 && !references.is_empty() {
+                let mut writer = BitWriter::new();
+                for &(bytes_dev, ms_dev) in references {
+                    if *bits_for_bytes_deviation < 32
+                        && bytes_dev >= 1u32 << *bits_for_bytes_deviation
+                    {
+                        return Err(Error::invalid(
+                            "MLLT reference byte deviation exceeds bits_for_bytes_deviation",
+                        ));
+                    }
+                    if *bits_for_ms_deviation < 32 && ms_dev >= 1u32 << *bits_for_ms_deviation {
+                        return Err(Error::invalid(
+                            "MLLT reference ms deviation exceeds bits_for_ms_deviation",
+                        ));
+                    }
+                    writer.push(bytes_dev, *bits_for_bytes_deviation as usize);
+                    writer.push(ms_dev, *bits_for_ms_deviation as usize);
+                }
+                payload.extend_from_slice(&writer.into_bytes());
+            }
+            Ok(("MLLT".to_string(), payload))
         }
         Id3Frame::Unknown { id, raw } => {
             // Promote v2.2 ids (3 chars) to their v2.3 equivalents on
@@ -4747,5 +4988,75 @@ mod tests {
         );
         // Footer is not present; the tail bytes are frame data, not "3DI".
         assert!(bytes.len() < 13 || &bytes[bytes.len() - 10..bytes.len() - 7] != b"3DI");
+    }
+
+    /// `MLLT` bit writer / reader pinned against a hand-computed byte
+    /// sequence. The spec packs each per-reference `(bytes_dev, ms_dev)`
+    /// MSB-first across byte boundaries; this test makes the chosen
+    /// ordering hard to drift on. Two references at `bits_for_bytes = 12`
+    /// and `bits_for_ms = 4` (16 bits each = 2 bytes per reference, so
+    /// the result aligns on bytes for easy hand-checking):
+    ///
+    /// * Ref 0: bytes_dev = 0xABC, ms_dev = 0xD →
+    ///   bits = `1010 1011 1100 1101` = `0xAB 0xCD`.
+    /// * Ref 1: bytes_dev = 0x123, ms_dev = 0x4 →
+    ///   bits = `0001 0010 0011 0100` = `0x12 0x34`.
+    #[test]
+    fn mllt_bit_packing_pins_msb_first_order() {
+        let mut w = BitWriter::new();
+        w.push(0xABC, 12);
+        w.push(0xD, 4);
+        w.push(0x123, 12);
+        w.push(0x4, 4);
+        let packed = w.into_bytes();
+        assert_eq!(packed, vec![0xAB, 0xCD, 0x12, 0x34]);
+
+        let mut r = BitReader::new(&packed);
+        assert_eq!(r.take(12), 0xABC);
+        assert_eq!(r.take(4), 0xD);
+        assert_eq!(r.take(12), 0x123);
+        assert_eq!(r.take(4), 0x4);
+        assert_eq!(r.remaining(), 0);
+    }
+
+    /// `MLLT` encode → decode round-trip for the sub-byte-aligned case
+    /// where a reference crosses a byte boundary. `9 + 7 = 16` bits is
+    /// a multiple of 4 but neither field aligns; we want the byte
+    /// stream to still round-trip exactly.
+    #[test]
+    fn mllt_subbyte_alignment_roundtrip() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::MpegLocationLookup {
+                mpeg_frames_between_reference: 4,
+                bytes_between_reference: 0x10_0000,
+                ms_between_reference: 0x00_0FA0,
+                bits_for_bytes_deviation: 9,
+                bits_for_ms_deviation: 7,
+                references: vec![(0x1FF, 0x7F), (0x000, 0x00), (0x100, 0x40)],
+            }],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        let got = parsed
+            .frames
+            .iter()
+            .find_map(|f| match f {
+                Id3Frame::MpegLocationLookup {
+                    bits_for_bytes_deviation,
+                    bits_for_ms_deviation,
+                    references,
+                    ..
+                } => Some((
+                    *bits_for_bytes_deviation,
+                    *bits_for_ms_deviation,
+                    references.clone(),
+                )),
+                _ => None,
+            })
+            .expect("MLLT must survive sub-byte round-trip");
+        assert_eq!(got.0, 9);
+        assert_eq!(got.1, 7);
+        assert_eq!(got.2, vec![(0x1FF, 0x7F), (0x000, 0x00), (0x100, 0x40)]);
     }
 }

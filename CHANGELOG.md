@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `MLLT` MPEG location lookup table frame (spec v2.3 §4.7 / v2.4 §4.6).
+  Replaces the previous opaque `Id3Frame::Unknown { id: "MLLT", .. }`
+  fallthrough with a structured `Id3Frame::MpegLocationLookup` variant
+  carrying the u16 frame-counter increment, the two 24-bit
+  "between reference" fields (bytes + milliseconds), the two
+  per-reference deviation widths (bits), and the decoded
+  `Vec<(u32, u32)>` of `(bytes_dev, ms_dev)` pairs. Per-reference
+  packing is MSB-first across byte boundaries via a small bit-reader /
+  bit-writer pair; the writer enforces the spec's
+  `(bits_for_bytes_deviation + bits_for_ms_deviation) % 4 == 0`
+  constraint by returning `Error::invalid` rather than emitting a
+  stream a conforming reader could not realign on. The 24-bit fields
+  are capped at `0x00FF_FFFF` and per-reference deviation values are
+  capped at the declared per-field bit width — out-of-range values
+  fail the writer with a specific error. Per-reference widths above
+  32 bits are refused on read (descriptor preserved, references
+  empty) and on write (returned as `Error::invalid`) since the
+  in-memory representation tops out at `u32`. Six new lib tests
+  (bit-packing pinned to a hand-computed byte sequence; sub-byte
+  alignment round-trip) and six new integration round-trip tests
+  (v2.3 `12 + 4`, v2.4 `8 + 8`, four error-path tests: non-mult-of-4
+  total bits, 24-bit overflow, reference exceeds declared width, and
+  the >32-bit-width parser short-circuit) cover the matrix.
+
 - ID3v2.4 footer support (spec §3.4). The parser used to advance past
   the 10-byte trailer when the header's footer-present bit (0x10) was
   set without verifying any of it; it now requires the trailer's

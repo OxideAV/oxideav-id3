@@ -1500,6 +1500,281 @@ fn etco_truncated_trailing_byte_is_dropped() {
 }
 
 // ---------------------------------------------------------------------------
+// MLLT round-trip (spec v2.3 §4.7 / v2.4 §4.6)
+// ---------------------------------------------------------------------------
+
+/// `MLLT` round-trip in v2.4 with the byte-aligned `8 + 8 = 16`-bit
+/// per-reference layout that a real encoder would emit for a coarse
+/// jump table. The 100 references span the full u8 range in both
+/// deviation fields so a flipped MSB-first bit order would show up.
+#[test]
+fn roundtrip_mllt_v24_8plus8_bits() {
+    let references: Vec<(u32, u32)> = (0..100u32)
+        .map(|i| ((i * 251) % 256, (i * 17) % 256))
+        .collect();
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::MpegLocationLookup {
+            mpeg_frames_between_reference: 2,
+            bytes_between_reference: 65_536,
+            ms_between_reference: 1_500,
+            bits_for_bytes_deviation: 8,
+            bits_for_ms_deviation: 8,
+            references: references.clone(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::MpegLocationLookup {
+            mpeg_frames_between_reference,
+            bytes_between_reference,
+            ms_between_reference,
+            bits_for_bytes_deviation,
+            bits_for_ms_deviation,
+            references,
+        } => Some((
+            *mpeg_frames_between_reference,
+            *bytes_between_reference,
+            *ms_between_reference,
+            *bits_for_bytes_deviation,
+            *bits_for_ms_deviation,
+            references.clone(),
+        )),
+        _ => None,
+    });
+    assert_eq!(got, Some((2u16, 65_536u32, 1_500u32, 8u8, 8u8, references)));
+}
+
+/// `MLLT` round-trip in v2.3 with the spec's example `12 + 4 = 16`-bit
+/// shape — exercises sub-byte packing where neither field aligns on a
+/// byte boundary. 17 references → 17 * 16 = 272 bits = 34 bytes of
+/// reference area, no trailing padding needed.
+#[test]
+fn roundtrip_mllt_v23_12plus4_bits_subbyte_packing() {
+    // bytes_dev fits in 12 bits (0..=4095), ms_dev in 4 bits (0..=15).
+    let references: Vec<(u32, u32)> = vec![
+        (0, 0),
+        (1, 1),
+        (0xFFF, 0xF),
+        (0x800, 0x8),
+        (0x123, 0x4),
+        (0xABC, 0xD),
+        (0x7FF, 0x7),
+        (0xFFE, 0xE),
+        (0x000, 0xF),
+        (0xFFF, 0x0),
+        (0x555, 0xA),
+        (0xAAA, 0x5),
+        (0x100, 0x2),
+        (0x200, 0x4),
+        (0x300, 0x6),
+        (0x400, 0x8),
+        (0x500, 0xA),
+    ];
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![Id3Frame::MpegLocationLookup {
+            mpeg_frames_between_reference: 1,
+            bytes_between_reference: 0x00FF_FFFF,
+            ms_between_reference: 0x00FF_FFFF,
+            bits_for_bytes_deviation: 12,
+            bits_for_ms_deviation: 4,
+            references: references.clone(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::MpegLocationLookup {
+            mpeg_frames_between_reference,
+            bytes_between_reference,
+            ms_between_reference,
+            bits_for_bytes_deviation,
+            bits_for_ms_deviation,
+            references,
+        } => Some((
+            *mpeg_frames_between_reference,
+            *bytes_between_reference,
+            *ms_between_reference,
+            *bits_for_bytes_deviation,
+            *bits_for_ms_deviation,
+            references.clone(),
+        )),
+        _ => None,
+    });
+    assert_eq!(
+        got,
+        Some((1u16, 0x00FF_FFFFu32, 0x00FF_FFFFu32, 12u8, 4u8, references))
+    );
+}
+
+/// `MLLT` writer must refuse a per-reference width sum that's not a
+/// multiple of four (spec §4.7 / §4.6). A reader can't reliably align
+/// a non-conforming stream.
+#[test]
+fn mllt_writer_rejects_non_multiple_of_four_total_bits() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::MpegLocationLookup {
+            mpeg_frames_between_reference: 2,
+            bytes_between_reference: 1000,
+            ms_between_reference: 1000,
+            // 7 + 8 = 15 bits per reference, not a multiple of 4.
+            bits_for_bytes_deviation: 7,
+            bits_for_ms_deviation: 8,
+            references: vec![(1, 1)],
+        }],
+    };
+    let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("multiple of 4"),
+        "expected multiple-of-4 rejection, got: {msg}"
+    );
+}
+
+/// `MLLT` writer must refuse a 24-bit-field value that doesn't fit.
+#[test]
+fn mllt_writer_rejects_24bit_overflow() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::MpegLocationLookup {
+            mpeg_frames_between_reference: 1,
+            bytes_between_reference: 0x0100_0000, // 1 over the 24-bit cap
+            ms_between_reference: 0,
+            bits_for_bytes_deviation: 8,
+            bits_for_ms_deviation: 8,
+            references: vec![],
+        }],
+    };
+    let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("24-bit"),
+        "expected 24-bit overflow, got: {msg}"
+    );
+}
+
+/// `MLLT` writer must refuse a per-reference deviation value that's
+/// wider than the declared per-reference width.
+#[test]
+fn mllt_writer_rejects_reference_over_width() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::MpegLocationLookup {
+            mpeg_frames_between_reference: 1,
+            bytes_between_reference: 0,
+            ms_between_reference: 0,
+            bits_for_bytes_deviation: 4,
+            bits_for_ms_deviation: 4,
+            // Declared as 4 bits (max 0xF) but value is 0x10.
+            references: vec![(0x10, 0)],
+        }],
+    };
+    let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("byte deviation"),
+        "expected byte-deviation overflow, got: {msg}"
+    );
+}
+
+/// `MLLT` parser: a payload shorter than the 10-byte descriptor is
+/// preserved as `Unknown` rather than parsed into a half-built MLLT.
+#[test]
+fn mllt_parser_short_descriptor_is_unknown() {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(b"MLLT");
+    let body = vec![0x00u8; 9]; // 1 byte short of the 10-byte descriptor
+    let size = body.len() as u32;
+    frame.push(((size >> 21) & 0x7F) as u8);
+    frame.push(((size >> 14) & 0x7F) as u8);
+    frame.push(((size >> 7) & 0x7F) as u8);
+    frame.push((size & 0x7F) as u8);
+    frame.extend_from_slice(&[0, 0]);
+    frame.extend_from_slice(&body);
+
+    let mut tag_bytes = Vec::new();
+    tag_bytes.extend_from_slice(b"ID3");
+    tag_bytes.push(4);
+    tag_bytes.push(0);
+    tag_bytes.push(0);
+    let total = frame.len() as u32;
+    tag_bytes.push(((total >> 21) & 0x7F) as u8);
+    tag_bytes.push(((total >> 14) & 0x7F) as u8);
+    tag_bytes.push(((total >> 7) & 0x7F) as u8);
+    tag_bytes.push((total & 0x7F) as u8);
+    tag_bytes.extend_from_slice(&frame);
+
+    let (parsed, _) = parse_tag(&tag_bytes).unwrap();
+    let mut saw_unknown = false;
+    for f in &parsed.frames {
+        if let Id3Frame::Unknown { id, raw } = f {
+            assert_eq!(id, "MLLT");
+            assert_eq!(raw, &body);
+            saw_unknown = true;
+        }
+    }
+    assert!(saw_unknown, "MLLT short descriptor should land in Unknown");
+}
+
+/// `MLLT` parser: a non-conforming total bit width (>32 in either
+/// field) leaves references empty rather than truncating into u32.
+#[test]
+fn mllt_parser_rejects_excessive_bit_width() {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(b"MLLT");
+    // Descriptor + four bytes of reference area; widths set to 33 and
+    // 7 — sum is 40 (multiple of 4) but byte-dev width exceeds u32.
+    let mut body = vec![
+        0x00, 0x02, // mpeg_frames_between_reference = 2
+        0x00, 0x00, 0x10, // bytes = 0x10
+        0x00, 0x00, 0x20, // ms    = 0x20
+        33,   // bits_for_bytes_deviation (over u32 cap)
+        7,    // bits_for_ms_deviation
+    ];
+    body.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+    let size = body.len() as u32;
+    frame.push(((size >> 21) & 0x7F) as u8);
+    frame.push(((size >> 14) & 0x7F) as u8);
+    frame.push(((size >> 7) & 0x7F) as u8);
+    frame.push((size & 0x7F) as u8);
+    frame.extend_from_slice(&[0, 0]);
+    frame.extend_from_slice(&body);
+
+    let mut tag_bytes = Vec::new();
+    tag_bytes.extend_from_slice(b"ID3");
+    tag_bytes.push(4);
+    tag_bytes.push(0);
+    tag_bytes.push(0);
+    let total = frame.len() as u32;
+    tag_bytes.push(((total >> 21) & 0x7F) as u8);
+    tag_bytes.push(((total >> 14) & 0x7F) as u8);
+    tag_bytes.push(((total >> 7) & 0x7F) as u8);
+    tag_bytes.push((total & 0x7F) as u8);
+    tag_bytes.extend_from_slice(&frame);
+
+    let (parsed, _) = parse_tag(&tag_bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::MpegLocationLookup {
+            bits_for_bytes_deviation,
+            bits_for_ms_deviation,
+            references,
+            ..
+        } => Some((
+            *bits_for_bytes_deviation,
+            *bits_for_ms_deviation,
+            references.clone(),
+        )),
+        _ => None,
+    });
+    // Descriptor is captured, references are empty (we refuse to
+    // interpret a >32-bit width).
+    assert_eq!(got, Some((33u8, 7u8, vec![])));
+}
+
+// ---------------------------------------------------------------------------
 // Extended-header CRC round-trip (spec §3.2, v2.3 + v2.4)
 // ---------------------------------------------------------------------------
 
