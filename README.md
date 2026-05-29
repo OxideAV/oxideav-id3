@@ -248,10 +248,19 @@ peek still sizes the right number of bytes to read.
   left/right, u8 bounce counts left/right with `$FF` = infinite, four
   u8 feedback bytes L→L / L→R / R→R / R→L on the `$00..$FF` 0..100%
   scale, two u8 premix bytes L→R / R→L; v2.2 `REV` promotes to the
-  same structured variant). All twenty-five round-trip both directions
-  for v2.3 and v2.4 (ASPI is v2.4-only per spec but the wire layout is
-  byte-aligned and version-independent; RVRB is byte-aligned and
-  version-independent as well).
+  same structured variant), `RVAD` relative volume adjustment
+  (v2.3 §4.12: shared inc/dec bitfield carrying both presence and sign
+  per channel + `bits_used` width byte + spec-ordered blocks for front
+  / back / centre / bass, each block writing all deltas first then all
+  optional peaks; writer pads sub-byte widths on the high end per
+  spec, refuses `bits_used = $00`, refuses inc/dec bitfield vs
+  `Option` block mismatches and out-of-spec extension orderings, and
+  refuses to serialise under a v2.4 envelope since v2.4 dropped `RVAD`
+  in favour of `RVA2`). All twenty-six round-trip both directions
+  for v2.3 and v2.4 except `RVAD` which is v2.3-only by spec (ASPI is
+  v2.4-only per spec but the wire layout is byte-aligned and
+  version-independent; RVRB is byte-aligned and version-independent
+  as well).
 - Everything else surfaces as `Id3Frame::Unknown { id, raw }` with the
   payload preserved so it can be written back untouched.
 - `Id3Frame::timestamp_unit()` returns a typed `TimestampUnit`

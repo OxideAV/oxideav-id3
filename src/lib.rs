@@ -59,6 +59,7 @@
 //! * `OWNE` ownership / `COMR` commercial.
 //! * `SYTC` synchronised tempo codes.
 //! * `RVA2` / `EQU2` relative volume + equalisation (v2.4).
+//! * `RVAD` relative volume adjustment (v2.3 §4.12 — front/back/centre/bass).
 //! * `MCDI` music CD identifier (TOC).
 //! * `ETCO` event timing codes / `POSS` position synchronisation.
 //! * `SYLT` synchronised lyrics/text.
@@ -399,6 +400,55 @@ pub enum Id3Frame {
         premix_lr: u8,
         premix_rl: u8,
     },
+    /// `RVAD` relative volume adjustment (spec v2.3 §4.12). The v2.3
+    /// predecessor of v2.4's `RVA2`: per-channel signed volume deltas
+    /// where the sign comes from a shared inc/dec bitfield and each
+    /// magnitude is an unsigned big-endian integer whose width is
+    /// `ceil(bits_used / 8)` bytes. The wire order is fixed by spec —
+    /// front (right, then left), then optional back (right-back, then
+    /// left-back), then optional centre, then optional bass — and a
+    /// channel block appears iff at least one of its bits is set in
+    /// `increment_decrement` (bit 0 = right, 1 = left, 2 = right-back,
+    /// 3 = left-back, 4 = centre, 5 = bass; top two bits reserved
+    /// `%00`).
+    ///
+    /// Peak fields follow each delta with the same width. The spec
+    /// allows them to be omitted ("if no other data follows, be
+    /// completely omitted") — that's surfaced as `peak.is_empty()`
+    /// while `volume_delta` carries the `ceil(bits_used / 8)`-byte
+    /// magnitude. `bits_used` may not be `$00` per spec; the writer
+    /// rejects it. This frame is v2.3-only: v2.4 dropped it in favour
+    /// of `RVA2` (which the v2.4 frames doc describes without listing
+    /// `RVAD`), so the writer returns `Error::unsupported` when asked
+    /// to serialise an `Rvad` under a `V2_4` envelope, matching the
+    /// `with_footer` + `V2_3` rejection pattern.
+    Rvad {
+        /// Raw inc/dec bitfield (top two bits reserved `%00`). Bits
+        /// 0..=5 declare which channels are present and whether each
+        /// delta is positive (`1` = increment) or negative
+        /// (`0` = decrement). The bitfield drives both presence and
+        /// sign; we keep the raw byte so callers can inspect reserved
+        /// bits and so the writer round-trips bit-for-bit.
+        increment_decrement: u8,
+        /// Volume-description width in bits per spec ("normally `$10`
+        /// (16 bits) for MPEG 2 layer I, II and III and MPEG 2.5").
+        /// Must be non-zero. The on-wire byte width per delta or peak
+        /// is `ceil(bits_used / 8)`; the high bits are zero-padded
+        /// when `bits_used` is not a multiple of 8.
+        bits_used: u8,
+        /// Front-channel block (right then left). `Some` iff
+        /// `increment_decrement & 0b0000_0011 != 0`. Both magnitudes
+        /// always present together (the spec lists `right` and `left`
+        /// unconditionally as the first block).
+        front: Option<RvadFrontChannels>,
+        /// Back-channel block (right-back then left-back). `Some` iff
+        /// `increment_decrement & 0b0000_1100 != 0`.
+        back: Option<RvadBackChannels>,
+        /// Centre channel. `Some` iff `increment_decrement & 0b0001_0000 != 0`.
+        center: Option<RvadChannel>,
+        /// Bass channel. `Some` iff `increment_decrement & 0b0010_0000 != 0`.
+        bass: Option<RvadChannel>,
+    },
     /// Any frame whose id we don't parse structurally (RGAD, CHAP,
     /// ...). The payload is preserved verbatim so callers or later
     /// versions can recognise it without needing to reparse.
@@ -421,6 +471,49 @@ pub struct Rva2Channel {
     pub bits_peak: u8,
     /// Big-endian unsigned peak. Width = `ceil(bits_peak / 8)`.
     pub peak: Vec<u8>,
+}
+
+/// One `RVAD` channel entry (spec v2.3 §4.12). The volume delta is
+/// stored as an unsigned big-endian magnitude — the sign lives in
+/// the parent `Rvad::increment_decrement` bitfield where bit `n`
+/// being `1` means the channel's delta is positive and `0` means
+/// negative. Both fields are zero-padded to whole bytes when the
+/// parent `bits_used` is not a multiple of 8 (high bits zero per
+/// spec); the byte widths are always `ceil(bits_used / 8)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RvadChannel {
+    /// Big-endian unsigned magnitude of the volume change. Width =
+    /// `ceil(bits_used / 8)`. The on-wire value is the absolute
+    /// adjustment; sign comes from the parent's inc/dec bitfield.
+    pub volume_delta: Vec<u8>,
+    /// Big-endian unsigned peak volume for this channel. Width =
+    /// `ceil(bits_used / 8)`. Empty (`Vec::new()`) when the spec's
+    /// "completely omitted" form applies — the parser surfaces an
+    /// empty `peak` when the wire data ran out before the peak
+    /// position, and the writer omits the bytes when `peak` is empty.
+    pub peak: Vec<u8>,
+}
+
+/// Front-channel pair for `RVAD`. The spec lists `right` before
+/// `left` in the on-wire layout (§4.12), so the struct mirrors that.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RvadFrontChannels {
+    /// Right channel (inc/dec bit 0). Magnitude in `volume_delta`,
+    /// sign from the parent bitfield's bit 0.
+    pub right: RvadChannel,
+    /// Left channel (inc/dec bit 1). Magnitude in `volume_delta`,
+    /// sign from the parent bitfield's bit 1.
+    pub left: RvadChannel,
+}
+
+/// Back-channel pair for `RVAD`. Spec §4.12: "Relative volume change,
+/// right back" precedes "left back" on the wire.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RvadBackChannels {
+    /// Right-back channel (inc/dec bit 2).
+    pub right_back: RvadChannel,
+    /// Left-back channel (inc/dec bit 3).
+    pub left_back: RvadChannel,
 }
 
 /// Decoded form of the `time_stamp_format` byte that appears in
@@ -831,6 +924,7 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
             | Id3Frame::AudioSeekPointIndex { .. }
             | Id3Frame::MpegLocationLookup { .. }
             | Id3Frame::Reverb { .. }
+            | Id3Frame::Rvad { .. }
             | Id3Frame::Unknown { .. } => {}
         }
     }
@@ -1288,6 +1382,7 @@ fn dispatch_v23_v24(id: &str, payload: &[u8]) -> Id3Frame {
         "ASPI" => parse_aspi(payload),
         "MLLT" => parse_mllt(payload),
         "RVRB" => parse_rvrb(payload),
+        "RVAD" => parse_rvad(payload),
         _ => Id3Frame::Unknown {
             id: id.to_string(),
             raw: payload.to_vec(),
@@ -2325,6 +2420,128 @@ fn parse_mllt(payload: &[u8]) -> Id3Frame {
 /// well-formed reverb followed by spurious trailing bytes per spec
 /// "all the unknown bytes in a frame should be skipped"; the leading
 /// 12 are decoded and the rest dropped.
+/// Parse an `RVAD` relative-volume-adjustment payload (spec v2.3
+/// §4.12). Layout is:
+///
+/// ```text
+/// Increment/decrement              %00xxxxxx
+/// Bits used for volume description $xx                  (must be != 0)
+/// Relative volume change, right    ceil(bits/8) bytes BE (unsigned magnitude)
+/// Relative volume change, left     ceil(bits/8) bytes BE
+/// Peak volume right                ceil(bits/8) bytes BE (optional)
+/// Peak volume left                 ceil(bits/8) bytes BE (optional)
+/// [back-channel block: right-back delta, left-back delta, right-back peak, left-back peak]
+/// [centre block: centre delta, centre peak]
+/// [bass block: bass delta, bass peak]
+/// ```
+///
+/// The spec presents the wire order as: **all deltas for a block,
+/// then all peaks for the same block** (not interleaved
+/// `delta + peak` per channel). Front-block presence is gated on
+/// `increment_decrement & 0b0000_0011 != 0`; the back / centre / bass
+/// blocks are appended extensions gated on bits 2..=5 in the same
+/// byte. Peak fields are spec-optional ("if no other data follows,
+/// be completely omitted") and are read greedily — the parser
+/// consumes as many full peak-width slots as the remaining payload
+/// affords. A short trailing peak (e.g. front-right peak present but
+/// front-left peak missing) surfaces as the longer one carrying
+/// bytes and the shorter as `peak.is_empty()`, preserving wire
+/// truthfully.
+///
+/// A `bits_used` of `$00` is reserved per spec; the parser still
+/// accepts it (zero-width fields => empty Vecs) so a non-conforming
+/// source surfaces with zero-width channels rather than crashing.
+/// The writer rejects `$00`.
+///
+/// A payload shorter than the 2-byte preamble preserves the raw
+/// bytes through `Id3Frame::Unknown { id: "RVAD", .. }` since the
+/// inc/dec + bits_used pair is the smallest interpretable form.
+fn parse_rvad(payload: &[u8]) -> Id3Frame {
+    if payload.len() < 2 {
+        return Id3Frame::Unknown {
+            id: "RVAD".to_string(),
+            raw: payload.to_vec(),
+        };
+    }
+    let increment_decrement = payload[0];
+    let bits_used = payload[1];
+    let width = (bits_used as usize).div_ceil(8);
+    let mut cursor = 2usize;
+    // Read a `width`-byte field from the payload, advancing the
+    // cursor. Returns `Vec::new()` if the remaining payload is too
+    // short, surfacing the "completely omitted" spec form.
+    let take_field = |cursor: &mut usize, p: &[u8]| -> Vec<u8> {
+        if *cursor + width <= p.len() {
+            let v = p[*cursor..*cursor + width].to_vec();
+            *cursor += width;
+            v
+        } else {
+            Vec::new()
+        }
+    };
+    // Pull a block of `n` (delta, peak) pairs per spec layout —
+    // first the n deltas, then the n peaks. Returns the per-channel
+    // Vec.
+    let take_block = |cursor: &mut usize, n: usize, p: &[u8]| -> Vec<RvadChannel> {
+        let mut deltas = Vec::with_capacity(n);
+        for _ in 0..n {
+            deltas.push(take_field(cursor, p));
+        }
+        let mut peaks = Vec::with_capacity(n);
+        for _ in 0..n {
+            peaks.push(take_field(cursor, p));
+        }
+        deltas
+            .into_iter()
+            .zip(peaks)
+            .map(|(volume_delta, peak)| RvadChannel { volume_delta, peak })
+            .collect()
+    };
+    let front_present = increment_decrement & 0b0000_0011 != 0;
+    let back_present = increment_decrement & 0b0000_1100 != 0;
+    let center_present = increment_decrement & 0b0001_0000 != 0;
+    let bass_present = increment_decrement & 0b0010_0000 != 0;
+    let front = if front_present {
+        let mut chans = take_block(&mut cursor, 2, payload);
+        let left = chans.pop().unwrap();
+        let right = chans.pop().unwrap();
+        Some(RvadFrontChannels { right, left })
+    } else {
+        None
+    };
+    let back = if back_present {
+        let mut chans = take_block(&mut cursor, 2, payload);
+        let left_back = chans.pop().unwrap();
+        let right_back = chans.pop().unwrap();
+        Some(RvadBackChannels {
+            right_back,
+            left_back,
+        })
+    } else {
+        None
+    };
+    let center = if center_present {
+        let mut chans = take_block(&mut cursor, 1, payload);
+        Some(chans.pop().unwrap())
+    } else {
+        None
+    };
+    let bass = if bass_present {
+        let mut chans = take_block(&mut cursor, 1, payload);
+        Some(chans.pop().unwrap())
+    } else {
+        None
+    };
+    Id3Frame::Rvad {
+        increment_decrement,
+        bits_used,
+        front,
+        back,
+        center,
+        bass,
+    }
+}
+
 fn parse_rvrb(payload: &[u8]) -> Id3Frame {
     if payload.len() < 12 {
         return Id3Frame::Unknown {
@@ -3766,6 +3983,153 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
             payload.push(*premix_lr);
             payload.push(*premix_rl);
             Ok(("RVRB".to_string(), payload))
+        }
+        Id3Frame::Rvad {
+            increment_decrement,
+            bits_used,
+            front,
+            back,
+            center,
+            bass,
+        } => {
+            // Spec v2.3 §4.12 — frame only exists in v2.3. v2.4
+            // replaced it with `RVA2`, so emitting `RVAD` under a
+            // v2.4 envelope is a write-time error (matching the
+            // `with_footer` + `V2_3` rejection pattern). Callers that
+            // want to write a relative volume adjustment into a v2.4
+            // tag use the `Rva2` variant.
+            if matches!(version, Id3Version::V2_4) {
+                return Err(Error::unsupported(
+                    "RVAD frame is v2.3-only; use Rva2 under V2_4",
+                ));
+            }
+            // Top two bits of inc/dec are reserved %00 per spec.
+            if increment_decrement & 0b1100_0000 != 0 {
+                return Err(Error::invalid(
+                    "RVAD increment_decrement reserved bits (top two) must be zero",
+                ));
+            }
+            // Spec: "This value may not be $00."
+            if *bits_used == 0 {
+                return Err(Error::invalid(
+                    "RVAD bits_used must be non-zero per spec §4.12",
+                ));
+            }
+            let width = (*bits_used as usize).div_ceil(8);
+            let front_present = increment_decrement & 0b0000_0011 != 0;
+            let back_present = increment_decrement & 0b0000_1100 != 0;
+            let center_present = increment_decrement & 0b0001_0000 != 0;
+            let bass_present = increment_decrement & 0b0010_0000 != 0;
+            // The inc/dec bitfield and the per-channel `Option`s must
+            // agree, otherwise the round-trip parser+writer would
+            // produce a different wire form than the caller asked for.
+            // Reject the mismatch explicitly so the bug surfaces at
+            // the call site instead of silently dropping data.
+            if front_present != front.is_some() {
+                return Err(Error::invalid(
+                    "RVAD inc/dec front bits and `front` channel block disagree",
+                ));
+            }
+            if back_present != back.is_some() {
+                return Err(Error::invalid(
+                    "RVAD inc/dec back bits and `back` channel block disagree",
+                ));
+            }
+            if center_present != center.is_some() {
+                return Err(Error::invalid(
+                    "RVAD inc/dec centre bit and `center` channel disagree",
+                ));
+            }
+            if bass_present != bass.is_some() {
+                return Err(Error::invalid(
+                    "RVAD inc/dec bass bit and `bass` channel disagree",
+                ));
+            }
+            // Spec presents back/centre/bass as extensions appended
+            // after the front pair. A higher-tier channel without
+            // front channels is not constructible from a spec-
+            // conforming stream; reject it so the writer never emits
+            // a layout a reader couldn't reassemble.
+            if !front_present && (back_present || center_present || bass_present) {
+                return Err(Error::invalid(
+                    "RVAD back/centre/bass channels require front channels per spec",
+                ));
+            }
+            if !back_present && (center_present || bass_present) {
+                return Err(Error::invalid(
+                    "RVAD centre/bass channels require back channels per spec",
+                ));
+            }
+            if !center_present && bass_present {
+                return Err(Error::invalid(
+                    "RVAD bass channel requires centre channel per spec",
+                ));
+            }
+            let mut payload = Vec::new();
+            payload.push(*increment_decrement);
+            payload.push(*bits_used);
+            // Helper: pad-or-validate a single magnitude/peak field to
+            // the spec width and append to `payload`. Sub-spec-width
+            // values are zero-padded on the high end per spec
+            // ("padded in the beginning (highest bits) when 'bits
+            // used for volume description' is not a multiple of
+            // eight"); over-wide values are rejected since silently
+            // truncating would change the value.
+            fn append_field(
+                payload: &mut Vec<u8>,
+                bytes: &[u8],
+                width: usize,
+                what: &str,
+            ) -> Result<()> {
+                if bytes.len() > width {
+                    return Err(Error::invalid(format!(
+                        "RVAD {what} wider than bits_used field width"
+                    )));
+                }
+                if bytes.len() < width {
+                    let pad = width - bytes.len();
+                    payload.resize(payload.len() + pad, 0);
+                }
+                payload.extend_from_slice(bytes);
+                Ok(())
+            }
+            // Emit one block per spec: all deltas first, then all
+            // peaks. A peak with `is_empty()` is the spec-legal
+            // "completely omitted" form. The writer mirrors the
+            // parser's all-or-nothing peak handling per block: if any
+            // peak in a block is non-empty, all peaks in that block
+            // are emitted (filled with the spec-width zero-pad
+            // otherwise). This keeps the wire form unambiguous —
+            // mixing present-and-omitted peaks within a block has no
+            // spec layout.
+            let emit_block = |payload: &mut Vec<u8>, chans: &[&RvadChannel]| -> Result<()> {
+                for ch in chans {
+                    append_field(payload, &ch.volume_delta, width, "volume_delta")?;
+                }
+                let any_peak = chans.iter().any(|c| !c.peak.is_empty());
+                if any_peak {
+                    for ch in chans {
+                        // Empty peak in a partially-peaked block
+                        // pads to zero (matches the parser's
+                        // greedy-read symmetry).
+                        append_field(payload, &ch.peak, width, "peak")?;
+                    }
+                }
+                Ok(())
+            };
+            if let Some(f) = front {
+                emit_block(&mut payload, &[&f.right, &f.left])?;
+            }
+            if let Some(b) = back {
+                emit_block(&mut payload, &[&b.right_back, &b.left_back])?;
+            }
+            if let Some(c) = center {
+                emit_block(&mut payload, &[c])?;
+            }
+            if let Some(b) = bass {
+                emit_block(&mut payload, &[b])?;
+            }
+            Ok(("RVAD".to_string(), payload))
         }
         Id3Frame::Unknown { id, raw } => {
             // Promote v2.2 ids (3 chars) to their v2.3 equivalents on
@@ -5358,6 +5722,384 @@ mod tests {
                 feedback_rl: 0,
                 premix_lr: 0,
                 premix_rl: 0,
+            }],
+        };
+        assert!(to_key_value_pairs(&tag).is_empty());
+    }
+
+    /// `RVAD` front-only writer pinned to a hand-computed byte
+    /// sequence. Spec v2.3 §4.12: with bits_used = 0x10 (16 bits)
+    /// each delta is 2 bytes BE and each peak is 2 bytes BE. The
+    /// inc/dec byte 0x03 sets bits 0 + 1, meaning both front channels
+    /// present and both deltas positive (increment).
+    #[test]
+    fn rvad_writer_pinned_bytes_front_only() {
+        let frame = Id3Frame::Rvad {
+            increment_decrement: 0b0000_0011,
+            bits_used: 16,
+            front: Some(RvadFrontChannels {
+                right: RvadChannel {
+                    volume_delta: vec![0x12, 0x34],
+                    peak: vec![0x56, 0x78],
+                },
+                left: RvadChannel {
+                    volume_delta: vec![0xAB, 0xCD],
+                    peak: vec![0xEF, 0x01],
+                },
+            }),
+            back: None,
+            center: None,
+            bass: None,
+        };
+        let (id, payload) = encode_frame(Id3Version::V2_3, &frame).unwrap();
+        assert_eq!(id, "RVAD");
+        // Spec §4.12 layout: inc/dec, bits_used, then per block: all
+        // deltas (right, left) followed by all peaks (right, left).
+        assert_eq!(
+            payload,
+            vec![0x03, 0x10, 0x12, 0x34, 0xAB, 0xCD, 0x56, 0x78, 0xEF, 0x01]
+        );
+    }
+
+    /// `RVAD` round-trip with both front and back channels. The back
+    /// pair is appended after the front pair on the wire (spec §4.12).
+    #[test]
+    fn rvad_roundtrip_front_and_back() {
+        let original = Id3Frame::Rvad {
+            // bits 0,1 (front: right inc, left inc) + bits 2,3 (back:
+            // right-back inc, left-back dec).
+            increment_decrement: 0b0000_0111,
+            bits_used: 16,
+            front: Some(RvadFrontChannels {
+                right: RvadChannel {
+                    volume_delta: vec![0x00, 0x40],
+                    peak: vec![0x00, 0x80],
+                },
+                left: RvadChannel {
+                    volume_delta: vec![0x00, 0x40],
+                    peak: vec![0x00, 0x80],
+                },
+            }),
+            back: Some(RvadBackChannels {
+                right_back: RvadChannel {
+                    volume_delta: vec![0x00, 0x10],
+                    peak: vec![0x00, 0x20],
+                },
+                left_back: RvadChannel {
+                    volume_delta: vec![0x00, 0x08],
+                    peak: vec![0x00, 0x10],
+                },
+            }),
+            center: None,
+            bass: None,
+        };
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![original],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        assert_eq!(parsed.frames.len(), 1);
+        match &parsed.frames[0] {
+            Id3Frame::Rvad {
+                increment_decrement,
+                bits_used,
+                front,
+                back,
+                center,
+                bass,
+            } => {
+                assert_eq!(*increment_decrement, 0b0000_0111);
+                assert_eq!(*bits_used, 16);
+                let f = front.as_ref().expect("front");
+                assert_eq!(f.right.volume_delta, vec![0x00, 0x40]);
+                assert_eq!(f.right.peak, vec![0x00, 0x80]);
+                assert_eq!(f.left.volume_delta, vec![0x00, 0x40]);
+                assert_eq!(f.left.peak, vec![0x00, 0x80]);
+                let b = back.as_ref().expect("back");
+                assert_eq!(b.right_back.volume_delta, vec![0x00, 0x10]);
+                assert_eq!(b.right_back.peak, vec![0x00, 0x20]);
+                assert_eq!(b.left_back.volume_delta, vec![0x00, 0x08]);
+                assert_eq!(b.left_back.peak, vec![0x00, 0x10]);
+                assert!(center.is_none());
+                assert!(bass.is_none());
+            }
+            other => panic!("expected Rvad, got {other:?}"),
+        }
+    }
+
+    /// Centre + bass extensions round-trip on top of front + back per
+    /// the spec's appended-block layout. Bit 4 = centre, bit 5 = bass.
+    #[test]
+    fn rvad_roundtrip_all_six_channels() {
+        let original = Id3Frame::Rvad {
+            increment_decrement: 0b0011_1111,
+            bits_used: 8, // single-byte deltas to keep the wire tight
+            front: Some(RvadFrontChannels {
+                right: RvadChannel {
+                    volume_delta: vec![0x11],
+                    peak: vec![0x21],
+                },
+                left: RvadChannel {
+                    volume_delta: vec![0x12],
+                    peak: vec![0x22],
+                },
+            }),
+            back: Some(RvadBackChannels {
+                right_back: RvadChannel {
+                    volume_delta: vec![0x13],
+                    peak: vec![0x23],
+                },
+                left_back: RvadChannel {
+                    volume_delta: vec![0x14],
+                    peak: vec![0x24],
+                },
+            }),
+            center: Some(RvadChannel {
+                volume_delta: vec![0x15],
+                peak: vec![0x25],
+            }),
+            bass: Some(RvadChannel {
+                volume_delta: vec![0x16],
+                peak: vec![0x26],
+            }),
+        };
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![original],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        match &parsed.frames[0] {
+            Id3Frame::Rvad {
+                increment_decrement,
+                bits_used,
+                front,
+                back,
+                center,
+                bass,
+            } => {
+                assert_eq!(*increment_decrement, 0b0011_1111);
+                assert_eq!(*bits_used, 8);
+                let f = front.as_ref().expect("front");
+                assert_eq!(f.right.volume_delta, vec![0x11]);
+                assert_eq!(f.right.peak, vec![0x21]);
+                assert_eq!(f.left.volume_delta, vec![0x12]);
+                assert_eq!(f.left.peak, vec![0x22]);
+                let b = back.as_ref().expect("back");
+                assert_eq!(b.right_back.volume_delta, vec![0x13]);
+                assert_eq!(b.right_back.peak, vec![0x23]);
+                assert_eq!(b.left_back.volume_delta, vec![0x14]);
+                assert_eq!(b.left_back.peak, vec![0x24]);
+                let c = center.as_ref().expect("center");
+                assert_eq!(c.volume_delta, vec![0x15]);
+                assert_eq!(c.peak, vec![0x25]);
+                let ba = bass.as_ref().expect("bass");
+                assert_eq!(ba.volume_delta, vec![0x16]);
+                assert_eq!(ba.peak, vec![0x26]);
+            }
+            other => panic!("expected Rvad, got {other:?}"),
+        }
+    }
+
+    /// Spec: "if no other data follows, [the peak fields] could be
+    /// left zeroed or, if no other data follows, be completely
+    /// omitted." Front-only with peaks omitted means a 6-byte payload
+    /// (2-byte preamble + 2 × 2-byte delta) — no peak bytes on the
+    /// wire. The parser surfaces `peak.is_empty()`, and the writer
+    /// reproduces the same minimal form.
+    #[test]
+    fn rvad_peak_omitted_minimal_wire() {
+        // Hand-rolled minimal payload: inc/dec=0x03 (front right+left,
+        // both increment), bits=16, two 2-byte deltas, no peaks.
+        let payload = vec![0x03, 0x10, 0x00, 0x40, 0x00, 0x40];
+        let parsed = parse_rvad(&payload);
+        match &parsed {
+            Id3Frame::Rvad { front, .. } => {
+                let f = front.as_ref().expect("front block");
+                assert_eq!(f.right.volume_delta, vec![0x00, 0x40]);
+                assert!(f.right.peak.is_empty(), "peak omitted");
+                assert_eq!(f.left.volume_delta, vec![0x00, 0x40]);
+                assert!(f.left.peak.is_empty(), "peak omitted");
+            }
+            other => panic!("expected Rvad, got {other:?}"),
+        }
+        // Re-encode and confirm the writer reproduces the 6-byte form.
+        let (id, re) = encode_frame(Id3Version::V2_3, &parsed).unwrap();
+        assert_eq!(id, "RVAD");
+        assert_eq!(re, payload);
+    }
+
+    /// Sub-byte `bits_used` widths round up to whole bytes per spec
+    /// ("padded in the beginning (highest bits) when 'bits used for
+    /// volume description' is not a multiple of eight"). bits=12
+    /// gives 2-byte fields with the top 4 bits zero.
+    #[test]
+    fn rvad_padded_subbyte_width() {
+        let frame = Id3Frame::Rvad {
+            increment_decrement: 0b0000_0011,
+            bits_used: 12,
+            front: Some(RvadFrontChannels {
+                right: RvadChannel {
+                    volume_delta: vec![0x0F, 0xFF],
+                    peak: vec![0x0F, 0xFF],
+                },
+                left: RvadChannel {
+                    volume_delta: vec![0x00, 0x01],
+                    peak: vec![0x00, 0x01],
+                },
+            }),
+            back: None,
+            center: None,
+            bass: None,
+        };
+        let (_, payload) = encode_frame(Id3Version::V2_3, &frame).unwrap();
+        // 2 preamble + 4 × 2 bytes
+        assert_eq!(payload.len(), 2 + 4 * 2);
+        match parse_rvad(&payload[..]) {
+            Id3Frame::Rvad {
+                bits_used, front, ..
+            } => {
+                assert_eq!(bits_used, 12);
+                let f = front.as_ref().expect("front");
+                assert_eq!(f.right.volume_delta, vec![0x0F, 0xFF]);
+                assert_eq!(f.right.peak, vec![0x0F, 0xFF]);
+                assert_eq!(f.left.volume_delta, vec![0x00, 0x01]);
+                assert_eq!(f.left.peak, vec![0x00, 0x01]);
+            }
+            other => panic!("expected Rvad, got {other:?}"),
+        }
+    }
+
+    /// Spec gating: `bits_used = $00` is reserved per §4.12 ("This
+    /// value may not be $00"); the writer rejects it rather than
+    /// emitting a degenerate stream.
+    #[test]
+    fn rvad_writer_rejects_zero_bits() {
+        let frame = Id3Frame::Rvad {
+            increment_decrement: 0b0000_0011,
+            bits_used: 0,
+            front: Some(RvadFrontChannels {
+                right: RvadChannel {
+                    volume_delta: Vec::new(),
+                    peak: Vec::new(),
+                },
+                left: RvadChannel {
+                    volume_delta: Vec::new(),
+                    peak: Vec::new(),
+                },
+            }),
+            back: None,
+            center: None,
+            bass: None,
+        };
+        let err = encode_frame(Id3Version::V2_3, &frame).unwrap_err();
+        assert!(format!("{err}").contains("bits_used"));
+    }
+
+    /// `RVAD` is v2.3-only — v2.4 dropped it for `RVA2`. Asking the
+    /// writer to emit one under a V2_4 envelope must error rather
+    /// than silently producing a frame v2.4 readers wouldn't parse.
+    #[test]
+    fn rvad_writer_rejects_v24() {
+        let frame = Id3Frame::Rvad {
+            increment_decrement: 0b0000_0011,
+            bits_used: 16,
+            front: Some(RvadFrontChannels {
+                right: RvadChannel {
+                    volume_delta: vec![0x00, 0x40],
+                    peak: vec![0x00, 0x80],
+                },
+                left: RvadChannel {
+                    volume_delta: vec![0x00, 0x40],
+                    peak: vec![0x00, 0x80],
+                },
+            }),
+            back: None,
+            center: None,
+            bass: None,
+        };
+        let err = encode_frame(Id3Version::V2_4, &frame).unwrap_err();
+        assert!(format!("{err}").contains("v2.3-only"));
+    }
+
+    /// The inc/dec bitfield and the per-channel `Option` slots must
+    /// stay aligned. Passing a `Some(back)` without setting any of
+    /// bits 2 / 3 is a wire-form mismatch — the writer rejects it
+    /// rather than silently dropping the block or fabricating bits.
+    #[test]
+    fn rvad_writer_rejects_block_bitfield_mismatch() {
+        let frame = Id3Frame::Rvad {
+            // Front bits set; back bits NOT set.
+            increment_decrement: 0b0000_0011,
+            bits_used: 16,
+            front: Some(RvadFrontChannels {
+                right: RvadChannel {
+                    volume_delta: vec![0x00, 0x40],
+                    peak: Vec::new(),
+                },
+                left: RvadChannel {
+                    volume_delta: vec![0x00, 0x40],
+                    peak: Vec::new(),
+                },
+            }),
+            back: Some(RvadBackChannels {
+                right_back: RvadChannel {
+                    volume_delta: vec![0x00, 0x10],
+                    peak: Vec::new(),
+                },
+                left_back: RvadChannel {
+                    volume_delta: vec![0x00, 0x10],
+                    peak: Vec::new(),
+                },
+            }),
+            center: None,
+            bass: None,
+        };
+        let err = encode_frame(Id3Version::V2_3, &frame).unwrap_err();
+        assert!(format!("{err}").contains("back"));
+    }
+
+    /// A short payload (< 2 bytes — not even the inc/dec + bits_used
+    /// pair) preserves the raw bytes through `Unknown` since there's
+    /// no spec-defined fallback layout. Mirrors the `RVRB` short-form
+    /// behaviour.
+    #[test]
+    fn rvad_short_payload_surfaces_unknown() {
+        for short in [&[][..], &[0x03][..]] {
+            match parse_rvad(short) {
+                Id3Frame::Unknown { id, raw } => {
+                    assert_eq!(id, "RVAD");
+                    assert_eq!(raw, short);
+                }
+                other => panic!("expected Unknown for short RVAD, got {other:?}"),
+            }
+        }
+    }
+
+    /// `RVAD` carries DSP descriptors, not text values — it should
+    /// not surface in `to_key_value_pairs`, matching the
+    /// `RVA2`/`Reverb` precedent.
+    #[test]
+    fn rvad_yields_no_key_value_pairs() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![Id3Frame::Rvad {
+                increment_decrement: 0b0000_0011,
+                bits_used: 16,
+                front: Some(RvadFrontChannels {
+                    right: RvadChannel {
+                        volume_delta: vec![0x00, 0x40],
+                        peak: Vec::new(),
+                    },
+                    left: RvadChannel {
+                        volume_delta: vec![0x00, 0x40],
+                        peak: Vec::new(),
+                    },
+                }),
+                back: None,
+                center: None,
+                bass: None,
             }],
         };
         assert!(to_key_value_pairs(&tag).is_empty());

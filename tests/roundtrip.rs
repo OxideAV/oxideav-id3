@@ -6,8 +6,8 @@
 use oxideav_core::{AttachedPicture, PictureType};
 use oxideav_id3::{
     attached_pictures, parse_id3v1, parse_tag, to_key_value_pairs, write_id3v1, write_tag,
-    write_tag_with_options, Id3Frame, Id3Tag, Id3Version, Rva2Channel, TimestampUnit, UnsyncMode,
-    WriteOptions,
+    write_tag_with_options, Id3Frame, Id3Tag, Id3Version, Rva2Channel, RvadBackChannels,
+    RvadChannel, RvadFrontChannels, TimestampUnit, UnsyncMode, WriteOptions,
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
@@ -2170,4 +2170,109 @@ fn roundtrip_rvrb_extreme_values() {
         }
         other => panic!("expected Reverb, got {other:?}"),
     }
+}
+
+/// `RVAD` (spec v2.3 §4.12) round-trips through `write_tag` /
+/// `parse_tag` under v2.3 with front + back + centre + bass blocks
+/// all populated. Sub-byte `bits_used = 12` exercises the zero-pad
+/// width handling.
+#[test]
+fn roundtrip_rvad_v23_all_channels_12bit() {
+    let original = Id3Frame::Rvad {
+        increment_decrement: 0b0011_1111, // all six channel bits set
+        bits_used: 12,                    // 2 bytes per field (sub-byte width)
+        front: Some(RvadFrontChannels {
+            right: RvadChannel {
+                volume_delta: vec![0x01, 0x23],
+                peak: vec![0x04, 0x56],
+            },
+            left: RvadChannel {
+                volume_delta: vec![0x07, 0x89],
+                peak: vec![0x0A, 0xBC],
+            },
+        }),
+        back: Some(RvadBackChannels {
+            right_back: RvadChannel {
+                volume_delta: vec![0x00, 0x11],
+                peak: vec![0x00, 0x22],
+            },
+            left_back: RvadChannel {
+                volume_delta: vec![0x00, 0x33],
+                peak: vec![0x00, 0x44],
+            },
+        }),
+        center: Some(RvadChannel {
+            volume_delta: vec![0x0F, 0xFF],
+            peak: vec![0x0F, 0xFE],
+        }),
+        bass: Some(RvadChannel {
+            volume_delta: vec![0x00, 0x01],
+            peak: vec![0x00, 0x02],
+        }),
+    };
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![original],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    assert_eq!(parsed.frames.len(), 1);
+    match &parsed.frames[0] {
+        Id3Frame::Rvad {
+            increment_decrement,
+            bits_used,
+            front,
+            back,
+            center,
+            bass,
+        } => {
+            assert_eq!(*increment_decrement, 0b0011_1111);
+            assert_eq!(*bits_used, 12);
+            let f = front.as_ref().expect("front");
+            assert_eq!(f.right.volume_delta, vec![0x01, 0x23]);
+            assert_eq!(f.right.peak, vec![0x04, 0x56]);
+            assert_eq!(f.left.volume_delta, vec![0x07, 0x89]);
+            assert_eq!(f.left.peak, vec![0x0A, 0xBC]);
+            let b = back.as_ref().expect("back");
+            assert_eq!(b.right_back.volume_delta, vec![0x00, 0x11]);
+            assert_eq!(b.right_back.peak, vec![0x00, 0x22]);
+            assert_eq!(b.left_back.volume_delta, vec![0x00, 0x33]);
+            assert_eq!(b.left_back.peak, vec![0x00, 0x44]);
+            let c = center.as_ref().expect("centre");
+            assert_eq!(c.volume_delta, vec![0x0F, 0xFF]);
+            assert_eq!(c.peak, vec![0x0F, 0xFE]);
+            let ba = bass.as_ref().expect("bass");
+            assert_eq!(ba.volume_delta, vec![0x00, 0x01]);
+            assert_eq!(ba.peak, vec![0x00, 0x02]);
+        }
+        other => panic!("expected Rvad after round-trip, got {other:?}"),
+    }
+}
+
+/// `RVAD` is v2.3-only. Emitting it under a `V2_4` envelope must
+/// fail rather than producing a frame v2.4 readers would not parse.
+#[test]
+fn roundtrip_rvad_writer_rejects_v24() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Rvad {
+            increment_decrement: 0b0000_0011,
+            bits_used: 16,
+            front: Some(RvadFrontChannels {
+                right: RvadChannel {
+                    volume_delta: vec![0x00, 0x40],
+                    peak: vec![0x00, 0x80],
+                },
+                left: RvadChannel {
+                    volume_delta: vec![0x00, 0x40],
+                    peak: vec![0x00, 0x80],
+                },
+            }),
+            back: None,
+            center: None,
+            bass: None,
+        }],
+    };
+    let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("v2.3"));
 }

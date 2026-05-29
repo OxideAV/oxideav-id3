@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `RVAD` relative volume adjustment frame (spec v2.3 §4.12). Replaces
+  the previous opaque `Id3Frame::Unknown { id: "RVAD", .. }`
+  fallthrough with a structured `Id3Frame::Rvad` variant. Carries the
+  spec's raw inc/dec bitfield (top two bits reserved `%00`; bits 0..=5
+  declare per-channel presence + sign per "1 is increment and 0 is
+  decrement"), the `bits_used` byte (per-field width in bits;
+  spec-forbidden `$00` rejected by the writer), and four optional
+  channel blocks in the spec's wire order — front (`right` then
+  `left`), back (`right_back` then `left_back`), centre, bass — each
+  exposed as nested `Option<RvadFrontChannels>` / `RvadBackChannels` /
+  `RvadChannel` so a caller can distinguish "block absent" from "block
+  present, peak omitted". Each `RvadChannel` carries an unsigned
+  big-endian `volume_delta` magnitude (sign comes from the parent
+  bitfield) and an optional unsigned big-endian `peak`, both
+  zero-padded to `ceil(bits_used / 8)` bytes when `bits_used` is not a
+  multiple of 8 per spec "padded in the beginning (highest bits)". The
+  on-wire layout per block is **all deltas first, then all optional
+  peaks** — not interleaved per channel — matching the spec's listing
+  order (right delta, left delta, then right peak, left peak); a block
+  with `peak.is_empty()` on every channel writes no peak bytes,
+  surfacing the spec's "completely omitted" form. The writer rejects
+  inc/dec bitfield vs `Option`-block mismatches (e.g. bit 2 set but
+  `back == None`), out-of-spec extension orderings (e.g. bass without
+  centre, or any extension without front), volume_delta or peak
+  exceeding the declared `bits_used` width, the reserved `%00` top
+  two bits being non-zero, and most importantly emission under
+  `Id3Version::V2_4` — v2.4 dropped `RVAD` entirely in favour of
+  `RVA2` (the v2.4 frames doc lists `RVA2` and does not mention
+  `RVAD`), so the writer returns `Error::unsupported` mirroring the
+  `with_footer` + `V2_3` rejection pattern. Ten new lib tests
+  (front-only writer pinned to a hand-computed 10-byte sequence;
+  front+back round-trip; six-channel round-trip exercising centre +
+  bass extensions; peak-omitted minimal wire form with bytes pinned;
+  sub-byte width round-trip at `bits_used = 12`; `bits_used = $00`
+  writer rejection; v2.4 emission rejection; inc/dec ↔ block-Option
+  mismatch rejection; short-payload Unknown fallback for both 0-byte
+  and 1-byte inputs; zero-pair invariant for `to_key_value_pairs`)
+  plus two new integration round-trip tests
+  (`roundtrip_rvad_v23_all_channels_12bit` exercising all six channel
+  blocks at sub-byte width; `roundtrip_rvad_writer_rejects_v24`
+  pinning the v2.3-only writer contract through the public
+  `write_tag` surface) cover the matrix. Spec notes "There may only
+  be one 'RVAD' frame in each tag" — uniqueness is a caller-level
+  concern, matching how the crate treats `MCDI` / `MLLT` / `RVRB`.
+
 - `RVRB` reverb frame (spec v2.3 §4.13 / v2.4 §4.13). Replaces the
   previous opaque `Id3Frame::Unknown { id: "RVRB", .. }` fallthrough
   with a structured `Id3Frame::Reverb` variant carrying the ten
