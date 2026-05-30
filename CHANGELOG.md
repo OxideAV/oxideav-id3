@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `IPLS` involved-people-list frame (spec v2.3 §4.4). Replaces the
+  previous opaque `Id3Frame::Unknown { id: "IPLS", .. }` fallthrough
+  with a structured `Id3Frame::Ipls { pairs }` variant. `pairs` is a
+  `Vec<(String, String)>` of `(involvement, involvee)` so a writer can
+  never emit an odd count — the spec pairing is fundamental, each
+  involvement (role, e.g. `producer`, `mixing engineer`, `guitar`)
+  names exactly one involvee. The on-wire layout per spec is a single
+  encoding byte followed by alternating NUL-terminated strings in the
+  declared encoding: `involvement_0\0 involvee_0\0 involvement_1\0
+  involvee_1\0 …`. The writer follows the crate's default text
+  encoding (UTF-16 with BOM for v2.3 / UTF-8 for the v2.4 envelope
+  selector), so arbitrary Unicode role/name strings round-trip
+  losslessly. The parser tolerates a non-conforming source that omits
+  the final involvee terminator by folding the dangling involvement
+  into a pair with an empty involvee — the truncation surfaces
+  structurally rather than crashing or silently dropping the string.
+  An empty payload surfaces as `Id3Frame::Unknown` so the wire bytes
+  round-trip untouched, matching the `EQUA` empty-payload behaviour
+  (the spec encoding byte is mandatory). A payload that's only the
+  encoding byte parses to an empty pair list (spec lets the pair list
+  follow but doesn't forbid zero pairs). IPLS is v2.3-only — v2.4
+  dropped it in favour of the `TIPL` text frame (involved-people list)
+  and the new `TMCL` musician-credits list, both of which are ordinary
+  text frames the existing `Id3Frame::Text` variant already handles —
+  so the writer returns `Error::unsupported` under an
+  `Id3Version::V2_4` envelope mirroring the `RVAD` / `EQUA` v2.3-only
+  contract. Spec also notes "There may only be one `IPLS` frame in
+  each tag" — uniqueness is a caller-level concern, matching how the
+  crate treats `EQU2` / `MCDI` / `MLLT` / `RVRB` / `RVAD` / `EQUA`.
+  Nine new lib tests cover the matrix (UTF-16 BOM writer pinned to a
+  hand-computed exact byte sequence; latin1 two-pair parser through
+  the encoding-0 path; v2.3 round-trip with three pairs; dangling
+  trailing involvement folds into an empty-involvee pair;
+  empty-payload Unknown fallback; encoding-byte-only payload yields
+  empty pair list; v2.4 writer rejection; zero-pair `to_key_value_pairs`
+  invariant; empty pair list round-trip). Two new integration
+  round-trip tests (`roundtrip_ipls_v23_multi_pair_unicode` exercising
+  five pairs including a Japanese role/name pair through the public
+  `write_tag` + `parse_tag` surface, and
+  `roundtrip_ipls_writer_rejects_v24` pinning the v2.3-only writer
+  contract through the public `write_tag` surface) finish the
+  coverage.
+
 - `EQUA` equalisation frame (spec v2.3 §4.13). Replaces the previous
   opaque `Id3Frame::Unknown { id: "EQUA", .. }` fallthrough with a
   structured `Id3Frame::Equa { adjustment_bits, bands }` variant.

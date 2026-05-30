@@ -496,6 +496,34 @@ pub enum Id3Frame {
         /// adjustments between adjacent bands.
         bands: Vec<EquaBand>,
     },
+    /// `IPLS` involved people list (spec v2.3 §4.4). A flat list of
+    /// `(involvement, involvee)` pairs describing the role and the
+    /// person filling it. The spec body is a single encoding byte
+    /// followed by alternating NUL-terminated strings:
+    /// `involvement_0\0 involvee_0\0 involvement_1\0 involvee_1\0 …`.
+    /// Each pair carries one role/name binding (e.g. `producer\0Alice\0`,
+    /// `mixing engineer\0Bob\0`).
+    ///
+    /// The spec also says "There may only be one `IPLS` frame in each
+    /// tag" — uniqueness is a caller-level concern, matching how the
+    /// crate treats `EQU2` / `MCDI` / `MLLT` / `RVRB` / `RVAD` / `EQUA`.
+    ///
+    /// `IPLS` is v2.3-only: v2.4 dropped it in favour of `TIPL`
+    /// (involved-people-list, §4.2.2) and `TMCL` (musician-credits
+    /// list), both of which are ordinary text frames the existing
+    /// `Id3Frame::Text` variant already handles. The writer returns
+    /// [`Error::unsupported`] when asked to serialise an `Ipls` under
+    /// a `V2_4` envelope, matching the `RVAD` / `EQUA` v2.3-only
+    /// contract.
+    ///
+    /// Pairs are stored as `Vec<(String, String)>` rather than a flat
+    /// `Vec<String>` so a writer can never emit an odd count (the spec
+    /// pairing is fundamental: each involvement names exactly one
+    /// involvee). The parser folds a dangling final involvement (a
+    /// non-conforming source that omits the trailing involvee) into a
+    /// pair with an empty involvee, surfacing the truncation without
+    /// crashing.
+    Ipls { pairs: Vec<(String, String)> },
     /// Any frame whose id we don't parse structurally (RGAD, CHAP,
     /// ...). The payload is preserved verbatim so callers or later
     /// versions can recognise it without needing to reparse.
@@ -999,6 +1027,7 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
             | Id3Frame::Reverb { .. }
             | Id3Frame::Rvad { .. }
             | Id3Frame::Equa { .. }
+            | Id3Frame::Ipls { .. }
             | Id3Frame::Unknown { .. } => {}
         }
     }
@@ -1458,6 +1487,7 @@ fn dispatch_v23_v24(id: &str, payload: &[u8]) -> Id3Frame {
         "RVRB" => parse_rvrb(payload),
         "RVAD" => parse_rvad(payload),
         "EQUA" => parse_equa(payload),
+        "IPLS" => parse_ipls(payload),
         _ => Id3Frame::Unknown {
             id: id.to_string(),
             raw: payload.to_vec(),
@@ -2672,6 +2702,42 @@ fn parse_equa(payload: &[u8]) -> Id3Frame {
         adjustment_bits,
         bands,
     }
+}
+
+/// Parse an `IPLS` involved-people-list payload (spec v2.3 §4.4).
+/// Layout: `encoding $xx` followed by alternating NUL-terminated
+/// strings in the declared encoding — pair-wise
+/// `(involvement, involvee)`. An empty payload (no even encoding
+/// byte) surfaces as `Id3Frame::Unknown` so the wire bytes round-trip
+/// untouched; otherwise we walk the string list pair-wise. A dangling
+/// final involvement (a non-conforming source that omits the trailing
+/// involvee) folds into a pair with an empty involvee rather than
+/// being dropped, surfacing the truncation structurally.
+fn parse_ipls(payload: &[u8]) -> Id3Frame {
+    if payload.is_empty() {
+        return Id3Frame::Unknown {
+            id: "IPLS".to_string(),
+            raw: payload.to_vec(),
+        };
+    }
+    let enc = payload[0];
+    let mut rest = &payload[1..];
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    while !rest.is_empty() {
+        let (involvement, after_invol) = split_once_nul(enc, rest);
+        if after_invol.is_empty() {
+            // Truncated trailing involvement with no involvee follow-up
+            // — fold into a pair with an empty involvee so a caller can
+            // detect the non-conforming source without us silently
+            // dropping the dangling string.
+            pairs.push((involvement, String::new()));
+            break;
+        }
+        let (involvee, after_pair) = split_once_nul(enc, after_invol);
+        pairs.push((involvement, involvee));
+        rest = after_pair;
+    }
+    Id3Frame::Ipls { pairs }
 }
 
 fn parse_rvrb(payload: &[u8]) -> Id3Frame {
@@ -4328,6 +4394,32 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
                 payload.extend_from_slice(&band.adjustment);
             }
             Ok(("EQUA".to_string(), payload))
+        }
+        Id3Frame::Ipls { pairs } => {
+            // Spec v2.3 §4.4 — frame only exists in v2.3. v2.4 replaced
+            // it with the `TIPL` text frame (involved people list) and
+            // the new `TMCL` musician credits list. Both are ordinary
+            // text frames the existing `Id3Frame::Text` variant
+            // handles, so emitting `IPLS` under a v2.4 envelope is a
+            // write-time error (matching the `RVAD` / `EQUA` v2.3-only
+            // contract). Callers that want a v2.4 involved-people list
+            // build an `Id3Frame::Text { id: "TIPL", values: … }` with
+            // the spec's role/name pairing flattened into the text
+            // value string.
+            if matches!(version, Id3Version::V2_4) {
+                return Err(Error::unsupported(
+                    "IPLS frame is v2.3-only; use TIPL text frame under V2_4",
+                ));
+            }
+            let mut payload = Vec::new();
+            payload.push(text_enc);
+            for (involvement, involvee) in pairs {
+                encode_string(&mut payload, text_enc, involvement);
+                encode_terminator(&mut payload, text_enc);
+                encode_string(&mut payload, text_enc, involvee);
+                encode_terminator(&mut payload, text_enc);
+            }
+            Ok(("IPLS".to_string(), payload))
         }
         Id3Frame::Unknown { id, raw } => {
             // Promote v2.2 ids (3 chars) to their v2.3 equivalents on
@@ -6632,5 +6724,184 @@ mod tests {
     #[test]
     fn equa_v22_promotion() {
         assert_eq!(v22_promote("EQU"), "EQUA");
+    }
+
+    // ----- IPLS (spec v2.3 §4.4) -----
+
+    /// `IPLS` writer pinned bytes: encoding-1 (UTF-16 BOM-LE) with two
+    /// pairs. Each string is UTF-16-LE with a BOM and a 2-byte NUL
+    /// terminator, so the wire layout is exact and version-independent
+    /// for a given encoding byte. We pin it so a future writer change
+    /// surfaces at the bit level rather than only at the round-trip
+    /// level.
+    #[test]
+    fn ipls_writer_pinned_bytes_v23_utf16() {
+        let frame = Id3Frame::Ipls {
+            pairs: vec![("producer".to_string(), "Alice".to_string())],
+        };
+        let (id, payload) = encode_frame(Id3Version::V2_3, &frame).unwrap();
+        assert_eq!(id, "IPLS");
+        // encoding=1, then "producer\0" (UTF-16 BOM-LE + double-NUL),
+        // then "Alice\0" (UTF-16 BOM-LE + double-NUL).
+        let mut expected = vec![0x01];
+        // "producer" in UTF-16-LE with BOM, then double-NUL terminator.
+        expected.extend_from_slice(&[0xFF, 0xFE]);
+        for ch in "producer".encode_utf16() {
+            expected.extend_from_slice(&ch.to_le_bytes());
+        }
+        expected.extend_from_slice(&[0x00, 0x00]);
+        expected.extend_from_slice(&[0xFF, 0xFE]);
+        for ch in "Alice".encode_utf16() {
+            expected.extend_from_slice(&ch.to_le_bytes());
+        }
+        expected.extend_from_slice(&[0x00, 0x00]);
+        assert_eq!(payload, expected);
+    }
+
+    /// `IPLS` round-trip with two pairs through the latin1 encoding
+    /// path (encoding byte 0). Round-tripping through the writer + the
+    /// parser preserves both the role and the name strings byte-for-byte.
+    #[test]
+    fn ipls_parser_handles_latin1_two_pairs() {
+        // encoding=0 (latin1), then NUL-terminated pairs.
+        let mut payload = vec![0x00];
+        payload.extend_from_slice(b"producer\0Alice\0mixing engineer\0Bob\0");
+        let got = parse_ipls(&payload);
+        match got {
+            Id3Frame::Ipls { pairs } => {
+                assert_eq!(
+                    pairs,
+                    vec![
+                        ("producer".to_string(), "Alice".to_string()),
+                        ("mixing engineer".to_string(), "Bob".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected Ipls, got {other:?}"),
+        }
+    }
+
+    /// `IPLS` round-trip through `write_tag` → `parse_tag` at the
+    /// public API layer pins that the v2.3 envelope writes and parses
+    /// the frame without losing pair data.
+    #[test]
+    fn ipls_roundtrip_v23() {
+        let original = Id3Frame::Ipls {
+            pairs: vec![
+                ("producer".to_string(), "Alice Bloggs".to_string()),
+                ("guitar".to_string(), "Bob Smith".to_string()),
+                ("vocals".to_string(), "Carol Jones".to_string()),
+            ],
+        };
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![original.clone()],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        assert_eq!(parsed.frames.len(), 1);
+        match &parsed.frames[0] {
+            Id3Frame::Ipls { pairs } => {
+                assert_eq!(pairs.len(), 3);
+                assert_eq!(pairs[0].0, "producer");
+                assert_eq!(pairs[0].1, "Alice Bloggs");
+                assert_eq!(pairs[1].0, "guitar");
+                assert_eq!(pairs[1].1, "Bob Smith");
+                assert_eq!(pairs[2].0, "vocals");
+                assert_eq!(pairs[2].1, "Carol Jones");
+            }
+            other => panic!("expected Ipls after round-trip, got {other:?}"),
+        }
+    }
+
+    /// A trailing involvement with no involvee folds into a pair with
+    /// an empty involvee instead of being silently dropped, surfacing
+    /// a non-conforming source without crashing.
+    #[test]
+    fn ipls_parser_folds_dangling_involvement() {
+        let mut payload = vec![0x00];
+        // First pair fully present, second pair is just an involvement
+        // with no terminator (non-conforming source).
+        payload.extend_from_slice(b"producer\0Alice\0lyricist");
+        let got = parse_ipls(&payload);
+        match got {
+            Id3Frame::Ipls { pairs } => {
+                assert_eq!(pairs.len(), 2);
+                assert_eq!(pairs[0], ("producer".to_string(), "Alice".to_string()));
+                // The dangling "lyricist" without a NUL is treated as
+                // the involvement of a pair whose involvee is empty.
+                assert_eq!(pairs[1], ("lyricist".to_string(), String::new()));
+            }
+            other => panic!("expected Ipls, got {other:?}"),
+        }
+    }
+
+    /// An empty payload surfaces as `Unknown` so the wire bytes
+    /// round-trip untouched — matches the spec-required encoding byte
+    /// being mandatory and the `EQUA` empty-payload behaviour.
+    #[test]
+    fn ipls_empty_payload_surfaces_unknown() {
+        match parse_ipls(&[]) {
+            Id3Frame::Unknown { id, raw } => {
+                assert_eq!(id, "IPLS");
+                assert!(raw.is_empty());
+            }
+            other => panic!("expected Unknown for empty IPLS, got {other:?}"),
+        }
+    }
+
+    /// A payload that's *only* the encoding byte parses to an empty
+    /// pair list — the spec says the pair list "follows" the encoding
+    /// byte but doesn't forbid zero pairs.
+    #[test]
+    fn ipls_parser_encoding_byte_only_yields_empty() {
+        match parse_ipls(&[0x00]) {
+            Id3Frame::Ipls { pairs } => assert!(pairs.is_empty()),
+            other => panic!("expected Ipls with empty pairs, got {other:?}"),
+        }
+    }
+
+    /// `IPLS` is v2.3-only. Emitting it under a `V2_4` envelope must
+    /// fail rather than producing a frame v2.4 readers would not
+    /// understand (v2.4 dropped `IPLS` in favour of the `TIPL` text
+    /// frame).
+    #[test]
+    fn ipls_writer_rejects_v24() {
+        let frame = Id3Frame::Ipls {
+            pairs: vec![("producer".to_string(), "Alice".to_string())],
+        };
+        let err = encode_frame(Id3Version::V2_4, &frame).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("v2.3"));
+    }
+
+    /// `IPLS` carries pair-wise text descriptors that don't fit the
+    /// flat key/value model `to_key_value_pairs` exposes (a single role
+    /// can repeat — two producers, multiple guitarists, etc.). It
+    /// should not surface there, matching the `Equa` / `Equ2` / `Rvad`
+    /// precedent for structurally non-text frames.
+    #[test]
+    fn ipls_yields_no_key_value_pairs() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![Id3Frame::Ipls {
+                pairs: vec![("producer".to_string(), "Alice".to_string())],
+            }],
+        };
+        assert!(to_key_value_pairs(&tag).is_empty());
+    }
+
+    /// Empty pair list writes only the encoding byte and re-parses to
+    /// an empty pair list — pins the zero-pair round-trip invariant.
+    #[test]
+    fn ipls_empty_pair_list_roundtrip() {
+        let frame = Id3Frame::Ipls { pairs: Vec::new() };
+        let (id, payload) = encode_frame(Id3Version::V2_3, &frame).unwrap();
+        assert_eq!(id, "IPLS");
+        // Just the encoding byte (1 = UTF-16 BOM in v2.3 default).
+        assert_eq!(payload, vec![0x01]);
+        match parse_ipls(&payload) {
+            Id3Frame::Ipls { pairs } => assert!(pairs.is_empty()),
+            other => panic!("expected empty Ipls, got {other:?}"),
+        }
     }
 }

@@ -266,11 +266,19 @@ peek still sizes the right number of bytes to read.
   frequencies that collide with the inc/dec bit (`>= 0x8000`), refuses
   over-wide adjustments, and refuses to serialise under a v2.4
   envelope since v2.4 dropped `EQUA` in favour of `EQU2`; v2.2 `EQU`
-  promotes to the same structured variant). All twenty-seven
-  round-trip both directions for v2.3 and v2.4 except `RVAD` and
-  `EQUA` which are v2.3-only by spec (ASPI is v2.4-only per spec but
-  the wire layout is byte-aligned and version-independent; RVRB is
-  byte-aligned and version-independent as well).
+  promotes to the same structured variant), `IPLS` involved people list
+  (v2.3 §4.4: encoding byte + alternating NUL-terminated
+  `(involvement, involvee)` pairs in the declared encoding; pairs are
+  stored as `Vec<(String, String)>` so a writer can never emit an odd
+  count, a non-conforming trailing involvement with no involvee folds
+  into a pair with an empty involvee, and the writer refuses to
+  serialise under a v2.4 envelope since v2.4 dropped `IPLS` in favour
+  of the `TIPL` text frame and the new `TMCL` musician-credits list).
+  All twenty-eight round-trip both directions for v2.3 and v2.4 except
+  `RVAD`, `EQUA`, and `IPLS` which are v2.3-only by spec (ASPI is
+  v2.4-only per spec but the wire layout is byte-aligned and
+  version-independent; RVRB is byte-aligned and version-independent as
+  well).
 - Everything else surfaces as `Id3Frame::Unknown { id, raw }` with the
   payload preserved so it can be written back untouched.
 - `Id3Frame::timestamp_unit()` returns a typed `TimestampUnit`

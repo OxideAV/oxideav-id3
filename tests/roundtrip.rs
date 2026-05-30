@@ -2359,3 +2359,60 @@ fn roundtrip_equa_writer_rejects_v24() {
     let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();
     assert!(format!("{err}").to_lowercase().contains("v2.3"));
 }
+
+/// `IPLS` round-trip through the public `write_tag` + `parse_tag`
+/// surface for a multi-pair tag. Pairs survive the writer + parser
+/// trip with their role/name strings intact, the v2.3 default
+/// encoding (UTF-16 with BOM) carries arbitrary Unicode roles and
+/// names safely, and the pair ordering is preserved.
+#[test]
+fn roundtrip_ipls_v23_multi_pair_unicode() {
+    let original = Id3Frame::Ipls {
+        pairs: vec![
+            ("producer".to_string(), "Alice Bloggs".to_string()),
+            ("guitar".to_string(), "Bob Smith".to_string()),
+            ("ヴォーカル".to_string(), "山田 太郎".to_string()),
+            ("mixing engineer".to_string(), "Carol Jones".to_string()),
+            ("mastering".to_string(), "David Müller".to_string()),
+        ],
+    };
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![original.clone()],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    assert_eq!(parsed.frames.len(), 1);
+    match &parsed.frames[0] {
+        Id3Frame::Ipls { pairs } => {
+            assert_eq!(pairs.len(), 5);
+            assert_eq!(pairs[0].0, "producer");
+            assert_eq!(pairs[0].1, "Alice Bloggs");
+            assert_eq!(pairs[1].0, "guitar");
+            assert_eq!(pairs[1].1, "Bob Smith");
+            assert_eq!(pairs[2].0, "ヴォーカル");
+            assert_eq!(pairs[2].1, "山田 太郎");
+            assert_eq!(pairs[3].0, "mixing engineer");
+            assert_eq!(pairs[3].1, "Carol Jones");
+            assert_eq!(pairs[4].0, "mastering");
+            assert_eq!(pairs[4].1, "David Müller");
+        }
+        other => panic!("expected Ipls after round-trip, got {other:?}"),
+    }
+}
+
+/// `IPLS` is v2.3-only. Emitting it under a `V2_4` envelope must fail
+/// (v2.4 replaced it with the `TIPL` text frame; the writer surfaces
+/// the rejection at the `write_tag` boundary rather than silently
+/// emitting an unrecognised id).
+#[test]
+fn roundtrip_ipls_writer_rejects_v24() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Ipls {
+            pairs: vec![("producer".to_string(), "Alice".to_string())],
+        }],
+    };
+    let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("v2.3"));
+}
