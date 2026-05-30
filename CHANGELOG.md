@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `EQUA` equalisation frame (spec v2.3 §4.13). Replaces the previous
+  opaque `Id3Frame::Unknown { id: "EQUA", .. }` fallthrough with a
+  structured `Id3Frame::Equa { adjustment_bits, bands }` variant.
+  `adjustment_bits` is the per-band magnitude width in bits ($10 = 16
+  is the spec-listed norm for MPEG audio; writer rejects the
+  spec-forbidden $00). Each `EquaBand` carries the spec's
+  increment-decrement bit (`true` for `1 = increment`, `false` for
+  `0 = decrement` — stored on the wire as the most-significant bit of
+  the 2-byte BE frequency word), a 15-bit `frequency` in Hz
+  (0..=32767), and an unsigned big-endian `adjustment` magnitude whose
+  width is `ceil(adjustment_bits / 8)` bytes. The writer enforces the
+  two spec ordering rules at write time — "the equalisation bands
+  should be ordered increasingly with reference to frequency" and "a
+  frequency should only be described once in the frame" — by requiring
+  the `bands` list to be sorted strictly increasing by frequency; the
+  parser preserves wire order so callers can detect a non-conforming
+  source. Sub-byte adjustment widths zero-pad at the high end per spec
+  "padded in the beginning (highest bits) when not a multiple of
+  eight"; over-wide adjustments and frequencies whose top bit collides
+  with the inc/dec flag (`>= 0x8000`) are rejected with
+  `Error::invalid`. EQUA is v2.3-only — v2.4 dropped it in favour of
+  `EQU2` (the v2.4 frames doc lists `EQU2` and does not mention
+  `EQUA`), so the writer returns `Error::unsupported` under an
+  `Id3Version::V2_4` envelope mirroring the `RVAD` v2.3-only contract.
+  v2.2 `EQU` (3-char id) promotes to the same `Equa` variant via the
+  dispatch + `v22_promote` table, matching how v2.2 `REV` promotes to
+  `RVRB`. Fourteen new lib tests cover the matrix (two-band writer
+  pinned to a hand-computed 9-byte sequence; multi-band 16-bit
+  round-trip including the 15-bit frequency boundary; sub-byte
+  12-bit-width round-trip; `adjustment_bits = $00` writer rejection;
+  v2.4 emission rejection; unsorted-bands rejection; duplicate-
+  frequency rejection; frequency-overflow rejection; over-wide
+  adjustment rejection; empty-payload Unknown fallback; short-trailing
+  band drop; zero-pair invariant for `to_key_value_pairs`; v2.2 `EQU`
+  → `Equa` dispatch; `v22_promote("EQU") == "EQUA"`). Two new
+  integration round-trip tests (`roundtrip_equa_v23_multi_band_16bit`
+  exercising five bands across the full 15-bit frequency range and
+  `roundtrip_equa_writer_rejects_v24` pinning the v2.3-only writer
+  contract through the public `write_tag` surface) finish the
+  coverage. Spec notes "There may only be one 'EQUA' frame in each
+  tag" — uniqueness is a caller-level concern, matching how the crate
+  treats `EQU2` / `MCDI` / `MLLT` / `RVRB` / `RVAD`.
+
 - `RVAD` relative volume adjustment frame (spec v2.3 §4.12). Replaces
   the previous opaque `Id3Frame::Unknown { id: "RVAD", .. }`
   fallthrough with a structured `Id3Frame::Rvad` variant. Carries the

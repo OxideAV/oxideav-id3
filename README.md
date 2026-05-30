@@ -256,11 +256,21 @@ peek still sizes the right number of bytes to read.
   spec, refuses `bits_used = $00`, refuses inc/dec bitfield vs
   `Option` block mismatches and out-of-spec extension orderings, and
   refuses to serialise under a v2.4 envelope since v2.4 dropped `RVAD`
-  in favour of `RVA2`). All twenty-six round-trip both directions
-  for v2.3 and v2.4 except `RVAD` which is v2.3-only by spec (ASPI is
-  v2.4-only per spec but the wire layout is byte-aligned and
-  version-independent; RVRB is byte-aligned and version-independent
-  as well).
+  in favour of `RVA2`), `EQUA` equalisation (v2.3 §4.13: 1-byte
+  `adjustment_bits` width prefix + `(increment_decrement bit, 15-bit
+  frequency, ceil(adjustment_bits/8)-byte BE adjustment magnitude)`
+  bands in strictly-ascending frequency order; writer enforces the
+  ordering + uniqueness rules per spec "ordered increasingly with
+  reference to frequency" and "a frequency should only be described
+  once in the frame", refuses `adjustment_bits = $00`, refuses
+  frequencies that collide with the inc/dec bit (`>= 0x8000`), refuses
+  over-wide adjustments, and refuses to serialise under a v2.4
+  envelope since v2.4 dropped `EQUA` in favour of `EQU2`; v2.2 `EQU`
+  promotes to the same structured variant). All twenty-seven
+  round-trip both directions for v2.3 and v2.4 except `RVAD` and
+  `EQUA` which are v2.3-only by spec (ASPI is v2.4-only per spec but
+  the wire layout is byte-aligned and version-independent; RVRB is
+  byte-aligned and version-independent as well).
 - Everything else surfaces as `Id3Frame::Unknown { id, raw }` with the
   payload preserved so it can be written back untouched.
 - `Id3Frame::timestamp_unit()` returns a typed `TimestampUnit`

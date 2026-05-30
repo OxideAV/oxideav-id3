@@ -6,7 +6,7 @@
 use oxideav_core::{AttachedPicture, PictureType};
 use oxideav_id3::{
     attached_pictures, parse_id3v1, parse_tag, to_key_value_pairs, write_id3v1, write_tag,
-    write_tag_with_options, Id3Frame, Id3Tag, Id3Version, Rva2Channel, RvadBackChannels,
+    write_tag_with_options, EquaBand, Id3Frame, Id3Tag, Id3Version, Rva2Channel, RvadBackChannels,
     RvadChannel, RvadFrontChannels, TimestampUnit, UnsyncMode, WriteOptions,
 };
 
@@ -2271,6 +2271,89 @@ fn roundtrip_rvad_writer_rejects_v24() {
             back: None,
             center: None,
             bass: None,
+        }],
+    };
+    let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("v2.3"));
+}
+
+/// `EQUA` multi-band round-trip at the spec-norm 16-bit adjustment
+/// width. Exercises the writer's frequency ordering + the 15-bit
+/// frequency boundary + multiple inc/dec sign combinations through the
+/// public `write_tag` surface.
+#[test]
+fn roundtrip_equa_v23_multi_band_16bit() {
+    let original = Id3Frame::Equa {
+        adjustment_bits: 16,
+        bands: vec![
+            EquaBand {
+                increment: true,
+                frequency: 50,
+                adjustment: vec![0x00, 0x80],
+            },
+            EquaBand {
+                increment: false,
+                frequency: 250,
+                adjustment: vec![0x01, 0x00],
+            },
+            EquaBand {
+                increment: true,
+                frequency: 4_000,
+                adjustment: vec![0x02, 0x00],
+            },
+            EquaBand {
+                increment: false,
+                frequency: 16_000,
+                adjustment: vec![0x00, 0x40],
+            },
+            EquaBand {
+                increment: true,
+                frequency: 32_767,
+                adjustment: vec![0xFF, 0xFF],
+            },
+        ],
+    };
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![original.clone()],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    assert_eq!(parsed.frames.len(), 1);
+    match &parsed.frames[0] {
+        Id3Frame::Equa {
+            adjustment_bits,
+            bands,
+        } => {
+            assert_eq!(*adjustment_bits, 16);
+            assert_eq!(bands.len(), 5);
+            assert!(bands[0].increment);
+            assert_eq!(bands[0].frequency, 50);
+            assert!(!bands[1].increment);
+            assert_eq!(bands[1].frequency, 250);
+            assert_eq!(bands[2].frequency, 4_000);
+            assert_eq!(bands[3].frequency, 16_000);
+            assert_eq!(bands[4].frequency, 32_767);
+            assert_eq!(bands[4].adjustment, vec![0xFF, 0xFF]);
+        }
+        other => panic!("expected Equa after round-trip, got {other:?}"),
+    }
+}
+
+/// `EQUA` is v2.3-only. Emitting it under a `V2_4` envelope must fail
+/// rather than producing a frame v2.4 readers would not understand
+/// (v2.4 dropped `EQUA` in favour of `EQU2`).
+#[test]
+fn roundtrip_equa_writer_rejects_v24() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Equa {
+            adjustment_bits: 16,
+            bands: vec![EquaBand {
+                increment: true,
+                frequency: 100,
+                adjustment: vec![0x00, 0x80],
+            }],
         }],
     };
     let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();

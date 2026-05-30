@@ -60,6 +60,7 @@
 //! * `SYTC` synchronised tempo codes.
 //! * `RVA2` / `EQU2` relative volume + equalisation (v2.4).
 //! * `RVAD` relative volume adjustment (v2.3 §4.12 — front/back/centre/bass).
+//! * `EQUA` equalisation (v2.3 §4.13 — adjustment-bits + interpolated bands).
 //! * `MCDI` music CD identifier (TOC).
 //! * `ETCO` event timing codes / `POSS` position synchronisation.
 //! * `SYLT` synchronised lyrics/text.
@@ -449,10 +450,82 @@ pub enum Id3Frame {
         /// Bass channel. `Some` iff `increment_decrement & 0b0010_0000 != 0`.
         bass: Option<RvadChannel>,
     },
+    /// `EQUA` equalisation (spec v2.3 §4.13). The v2.3 predecessor of
+    /// v2.4's `EQU2`: an interpolated equalisation curve described as a
+    /// sequence of `(frequency, adjustment)` bands. Each band's
+    /// `frequency` is a 15-bit unsigned integer in Hz (0..=32767) and
+    /// its `adjustment` is an unsigned big-endian magnitude whose width
+    /// in bytes is `ceil(adjustment_bits / 8)`. The sign of the
+    /// adjustment is carried by `EquaBand::increment` (`true` for the
+    /// spec's `1 = increment`, `false` for `0 = decrement`) — the spec
+    /// stores that bit as the most-significant bit of the 16-bit
+    /// frequency word, so the wire byte order is
+    /// `[(inc<<7) | (freq>>8 & 0x7F), freq & 0xFF, adjustment_bytes...]`.
+    ///
+    /// Spec rules carried into the writer:
+    ///
+    /// * `adjustment_bits` may not be `$00` — rejected with
+    ///   [`Error::invalid`]. The parser accepts `$00` and surfaces a
+    ///   zero-byte `adjustment` per band so a non-conforming source
+    ///   surfaces structurally rather than crashing.
+    /// * `bands` must be sorted by `frequency` strictly increasing and
+    ///   carry no duplicates (spec: "A frequency should only be
+    ///   described once in the frame"); the writer rejects an
+    ///   unsorted-or-duplicated list. The parser preserves wire order
+    ///   so a caller can detect a non-conforming source.
+    /// * Each `EquaBand::adjustment` must not exceed `ceil(adjustment_bits / 8)`
+    ///   bytes on write; sub-width values are zero-padded at the high
+    ///   end per spec "padded in the beginning (highest bits) when not
+    ///   a multiple of eight".
+    ///
+    /// This frame is v2.3-only: v2.4 dropped it in favour of `EQU2`
+    /// (the v2.4 frames doc lists `EQU2` and does not mention `EQUA`),
+    /// so the writer returns [`Error::unsupported`] when asked to
+    /// serialise an `Equa` under a `V2_4` envelope, matching the
+    /// `RVAD` v2.3-only contract.
+    Equa {
+        /// Number of bits used per adjustment field per spec — `$10`
+        /// (16 bits) is the spec-listed norm for MPEG audio. May not
+        /// be `$00`. The on-wire byte width per adjustment is
+        /// `ceil(adjustment_bits / 8)`; sub-byte widths zero-pad the
+        /// high bits.
+        adjustment_bits: u8,
+        /// Equalisation bands in ascending frequency order. The spec
+        /// requires the list to be sorted strictly increasing by
+        /// frequency and to contain no duplicates; a reader interpolates
+        /// adjustments between adjacent bands.
+        bands: Vec<EquaBand>,
+    },
     /// Any frame whose id we don't parse structurally (RGAD, CHAP,
     /// ...). The payload is preserved verbatim so callers or later
     /// versions can recognise it without needing to reparse.
     Unknown { id: String, raw: Vec<u8> },
+}
+
+/// One band of an `EQUA` equalisation curve (spec v2.3 §4.13). The
+/// `increment` bit is stored on the wire as the most-significant bit
+/// of the 2-byte big-endian frequency word; `frequency` carries the
+/// low 15 bits (0..=32767 Hz). `adjustment` is an unsigned big-endian
+/// magnitude — the sign comes from `increment` per the spec's "1 is
+/// increment and 0 is decrement". The byte width of `adjustment`
+/// matches the parent `Equa::adjustment_bits` rounded up; sub-byte
+/// widths zero-pad the high bits when serialised.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EquaBand {
+    /// Spec: the sign of the volume adjustment for this band. `true`
+    /// for the spec's `1 = increment` (positive), `false` for
+    /// `0 = decrement` (negative). Stored as the MSB of the on-wire
+    /// 16-bit frequency word.
+    pub increment: bool,
+    /// 15-bit frequency in Hz (0..=32767). Values with the top bit
+    /// set (>= 0x8000) are rejected by the writer since they collide
+    /// with the increment/decrement bit.
+    pub frequency: u16,
+    /// Big-endian unsigned magnitude of the adjustment for this band.
+    /// Width = `ceil(parent.adjustment_bits / 8)`. The sign comes from
+    /// `increment`. The writer zero-pads sub-width values on the high
+    /// end and rejects over-wide values.
+    pub adjustment: Vec<u8>,
 }
 
 /// One `RVA2` channel entry (spec v2.4 §4.11). The raw 16-bit signed
@@ -925,6 +998,7 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
             | Id3Frame::MpegLocationLookup { .. }
             | Id3Frame::Reverb { .. }
             | Id3Frame::Rvad { .. }
+            | Id3Frame::Equa { .. }
             | Id3Frame::Unknown { .. } => {}
         }
     }
@@ -1383,6 +1457,7 @@ fn dispatch_v23_v24(id: &str, payload: &[u8]) -> Id3Frame {
         "MLLT" => parse_mllt(payload),
         "RVRB" => parse_rvrb(payload),
         "RVAD" => parse_rvad(payload),
+        "EQUA" => parse_equa(payload),
         _ => Id3Frame::Unknown {
             id: id.to_string(),
             raw: payload.to_vec(),
@@ -1414,6 +1489,7 @@ fn dispatch_v22(id: &str, payload: &[u8]) -> Id3Frame {
         "ULT" => parse_comm_like(payload, true),
         "PIC" => parse_pic(payload),
         "REV" => parse_rvrb(payload),
+        "EQU" => parse_equa(payload),
         _ => Id3Frame::Unknown {
             id: id.to_string(),
             raw: payload.to_vec(),
@@ -1464,6 +1540,7 @@ fn v22_promote(id: &str) -> &str {
         "TOR" => "TORY",
         "TXX" => "TXXX",
         "REV" => "RVRB",
+        "EQU" => "EQUA",
         "WAF" => "WOAF",
         "WAR" => "WOAR",
         "WAS" => "WOAS",
@@ -2539,6 +2616,61 @@ fn parse_rvad(payload: &[u8]) -> Id3Frame {
         back,
         center,
         bass,
+    }
+}
+
+/// Parse an `EQUA` equalisation payload (spec v2.3 §4.13). Layout is:
+///
+/// ```text
+/// Adjustment bits   $xx                       (must be != $00 per spec)
+/// For each band:
+///   inc/freq        2 bytes BE                (MSB = increment bit, low 15 = frequency)
+///   adjustment      ceil(adjustment_bits / 8) bytes BE (unsigned magnitude)
+/// ```
+///
+/// A payload that is empty preserves the raw bytes through
+/// [`Id3Frame::Unknown { id: "EQUA", .. }`][Id3Frame::Unknown] since the
+/// single-byte `adjustment_bits` prefix is the smallest interpretable
+/// form. `adjustment_bits = $00` is reserved per spec; the parser still
+/// accepts it (zero-width `adjustment` => empty Vec per band) so a
+/// non-conforming source surfaces structurally rather than crashing.
+/// The writer rejects `$00`.
+///
+/// Spec rule "the equalisation bands should be ordered increasingly
+/// with reference to frequency" is checked at write time, not parse
+/// time — the parser preserves wire order so a caller can detect a
+/// non-conforming source. A trailing band whose adjustment is short of
+/// the spec width is dropped (the inc/freq bytes are consumed but no
+/// truncated band is emitted), matching the parser's treatment of
+/// short fields elsewhere in the crate.
+fn parse_equa(payload: &[u8]) -> Id3Frame {
+    if payload.is_empty() {
+        return Id3Frame::Unknown {
+            id: "EQUA".to_string(),
+            raw: payload.to_vec(),
+        };
+    }
+    let adjustment_bits = payload[0];
+    let width = (adjustment_bits as usize).div_ceil(8);
+    let mut bands: Vec<EquaBand> = Vec::new();
+    let mut i = 1usize;
+    while i + 2 + width <= payload.len() {
+        let high = payload[i];
+        let low = payload[i + 1];
+        i += 2;
+        let increment = high & 0x80 != 0;
+        let frequency = (((high as u16) & 0x7F) << 8) | (low as u16);
+        let adjustment = payload[i..i + width].to_vec();
+        i += width;
+        bands.push(EquaBand {
+            increment,
+            frequency,
+            adjustment,
+        });
+    }
+    Id3Frame::Equa {
+        adjustment_bits,
+        bands,
     }
 }
 
@@ -4130,6 +4262,72 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
                 emit_block(&mut payload, &[b])?;
             }
             Ok(("RVAD".to_string(), payload))
+        }
+        Id3Frame::Equa {
+            adjustment_bits,
+            bands,
+        } => {
+            // Spec v2.3 §4.13 — frame only exists in v2.3. v2.4 replaced
+            // it with `EQU2`, so emitting `EQUA` under a v2.4 envelope
+            // is a write-time error (matching the `RVAD` v2.3-only
+            // contract). Callers that want a v2.4 equalisation curve
+            // use the `Equ2` variant.
+            if matches!(version, Id3Version::V2_4) {
+                return Err(Error::unsupported(
+                    "EQUA frame is v2.3-only; use Equ2 under V2_4",
+                ));
+            }
+            // Spec: "This value may not be $00."
+            if *adjustment_bits == 0 {
+                return Err(Error::invalid(
+                    "EQUA adjustment_bits must be non-zero per spec §4.13",
+                ));
+            }
+            // Spec: "The equalisation bands should be ordered
+            // increasingly with reference to frequency" and "A
+            // frequency should only be described once in the frame".
+            // Reject both violations at write time so the writer never
+            // emits a stream a conforming reader would have to
+            // re-sort to interpret.
+            for pair in bands.windows(2) {
+                if pair[0].frequency >= pair[1].frequency {
+                    return Err(Error::invalid(
+                        "EQUA bands must be sorted strictly increasing by frequency per spec",
+                    ));
+                }
+            }
+            let width = (*adjustment_bits as usize).div_ceil(8);
+            let mut payload = Vec::new();
+            payload.push(*adjustment_bits);
+            for band in bands {
+                if band.frequency & 0x8000 != 0 {
+                    return Err(Error::invalid(
+                        "EQUA band frequency exceeds 15-bit range (collides with inc/dec bit)",
+                    ));
+                }
+                if band.adjustment.len() > width {
+                    return Err(Error::invalid(
+                        "EQUA band adjustment wider than adjustment_bits field width",
+                    ));
+                }
+                let mut high = ((band.frequency >> 8) & 0x7F) as u8;
+                if band.increment {
+                    high |= 0x80;
+                }
+                let low = (band.frequency & 0xFF) as u8;
+                payload.push(high);
+                payload.push(low);
+                // Sub-spec-width adjustments zero-pad at the high end
+                // per spec "padded in the beginning (highest bits) when
+                // 'bits used for volume description' is not a multiple
+                // of eight".
+                if band.adjustment.len() < width {
+                    let pad = width - band.adjustment.len();
+                    payload.resize(payload.len() + pad, 0);
+                }
+                payload.extend_from_slice(&band.adjustment);
+            }
+            Ok(("EQUA".to_string(), payload))
         }
         Id3Frame::Unknown { id, raw } => {
             // Promote v2.2 ids (3 chars) to their v2.3 equivalents on
@@ -6103,5 +6301,336 @@ mod tests {
             }],
         };
         assert!(to_key_value_pairs(&tag).is_empty());
+    }
+
+    /// `EQUA` two-band writer pinned to hand-computed bytes. Spec v2.3
+    /// §4.13: `adjustment_bits = 0x10` (16 bits) gives 2-byte BE
+    /// adjustments. Each band is `inc<<7 | freq_high(7), freq_low,
+    /// adj_high, adj_low`. Band 0 is `freq = 0x0100 (256 Hz)` with
+    /// `increment` set; band 1 is `freq = 0x4000 (16384 Hz)` with
+    /// `increment` cleared.
+    #[test]
+    fn equa_writer_pinned_bytes_two_bands() {
+        let frame = Id3Frame::Equa {
+            adjustment_bits: 16,
+            bands: vec![
+                EquaBand {
+                    increment: true,
+                    frequency: 0x0100,
+                    adjustment: vec![0x12, 0x34],
+                },
+                EquaBand {
+                    increment: false,
+                    frequency: 0x4000,
+                    adjustment: vec![0xAB, 0xCD],
+                },
+            ],
+        };
+        let (id, payload) = encode_frame(Id3Version::V2_3, &frame).unwrap();
+        assert_eq!(id, "EQUA");
+        // adjustment_bits, then for each band: inc/freq-high, freq-low,
+        // adjustment bytes BE.
+        // Band 0: inc=1, freq=0x0100 → high = 0x81, low = 0x00.
+        // Band 1: inc=0, freq=0x4000 → high = 0x40, low = 0x00.
+        assert_eq!(
+            payload,
+            vec![0x10, 0x81, 0x00, 0x12, 0x34, 0x40, 0x00, 0xAB, 0xCD]
+        );
+    }
+
+    /// `EQUA` round-trip with multiple bands at the spec-norm 16-bit
+    /// adjustment width. Bands are emitted in ascending frequency
+    /// order and round-trip preserves the inc/dec flag, the 15-bit
+    /// frequency, and the full adjustment magnitude.
+    #[test]
+    fn equa_roundtrip_multi_band_16bit() {
+        let original = Id3Frame::Equa {
+            adjustment_bits: 16,
+            bands: vec![
+                EquaBand {
+                    increment: true,
+                    frequency: 100,
+                    adjustment: vec![0x00, 0x80],
+                },
+                EquaBand {
+                    increment: false,
+                    frequency: 1000,
+                    adjustment: vec![0x01, 0x00],
+                },
+                EquaBand {
+                    increment: true,
+                    frequency: 10000,
+                    adjustment: vec![0x02, 0x00],
+                },
+                EquaBand {
+                    increment: false,
+                    frequency: 0x7FFF,
+                    adjustment: vec![0xFF, 0xFF],
+                },
+            ],
+        };
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![original.clone()],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        assert_eq!(parsed.frames.len(), 1);
+        match &parsed.frames[0] {
+            Id3Frame::Equa {
+                adjustment_bits,
+                bands,
+            } => {
+                assert_eq!(*adjustment_bits, 16);
+                assert_eq!(bands.len(), 4);
+                assert!(bands[0].increment);
+                assert_eq!(bands[0].frequency, 100);
+                assert_eq!(bands[0].adjustment, vec![0x00, 0x80]);
+                assert!(!bands[3].increment);
+                assert_eq!(bands[3].frequency, 0x7FFF);
+                assert_eq!(bands[3].adjustment, vec![0xFF, 0xFF]);
+            }
+            other => panic!("expected Equa, got {other:?}"),
+        }
+    }
+
+    /// `EQUA` sub-byte adjustment width round-trip: `adjustment_bits =
+    /// 12` rounds up to 2 bytes per spec "padded in the beginning
+    /// (highest bits)", and the wire layout preserves that width
+    /// faithfully across writer + parser.
+    #[test]
+    fn equa_roundtrip_sub_byte_width_12bit() {
+        let original = Id3Frame::Equa {
+            adjustment_bits: 12,
+            bands: vec![
+                EquaBand {
+                    increment: true,
+                    frequency: 500,
+                    adjustment: vec![0x0A, 0xBC],
+                },
+                EquaBand {
+                    increment: false,
+                    frequency: 5000,
+                    adjustment: vec![0x01, 0x23],
+                },
+            ],
+        };
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![original],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        match &parsed.frames[0] {
+            Id3Frame::Equa {
+                adjustment_bits,
+                bands,
+            } => {
+                assert_eq!(*adjustment_bits, 12);
+                assert_eq!(bands.len(), 2);
+                assert_eq!(bands[0].adjustment, vec![0x0A, 0xBC]);
+                assert_eq!(bands[1].adjustment, vec![0x01, 0x23]);
+            }
+            other => panic!("expected Equa, got {other:?}"),
+        }
+    }
+
+    /// Writer rejects `adjustment_bits = $00` per spec "This value may
+    /// not be $00".
+    #[test]
+    fn equa_writer_rejects_zero_adjustment_bits() {
+        let frame = Id3Frame::Equa {
+            adjustment_bits: 0,
+            bands: vec![EquaBand {
+                increment: true,
+                frequency: 100,
+                adjustment: Vec::new(),
+            }],
+        };
+        let err = encode_frame(Id3Version::V2_3, &frame).unwrap_err();
+        assert!(format!("{err}").contains("adjustment_bits"));
+    }
+
+    /// Writer rejects emission under `V2_4` since EQUA was dropped in
+    /// favour of EQU2 in v2.4. Mirrors the `RVAD` v2.3-only contract.
+    #[test]
+    fn equa_writer_rejects_v24() {
+        let frame = Id3Frame::Equa {
+            adjustment_bits: 16,
+            bands: vec![EquaBand {
+                increment: true,
+                frequency: 100,
+                adjustment: vec![0x00, 0x80],
+            }],
+        };
+        let err = encode_frame(Id3Version::V2_4, &frame).unwrap_err();
+        assert!(format!("{err}").contains("v2.3-only"));
+    }
+
+    /// Writer rejects out-of-order bands per spec "ordered increasingly
+    /// with reference to frequency".
+    #[test]
+    fn equa_writer_rejects_unsorted_bands() {
+        let frame = Id3Frame::Equa {
+            adjustment_bits: 16,
+            bands: vec![
+                EquaBand {
+                    increment: true,
+                    frequency: 1000,
+                    adjustment: vec![0x00, 0x80],
+                },
+                EquaBand {
+                    increment: true,
+                    frequency: 100,
+                    adjustment: vec![0x00, 0x80],
+                },
+            ],
+        };
+        let err = encode_frame(Id3Version::V2_3, &frame).unwrap_err();
+        assert!(format!("{err}").contains("sorted"));
+    }
+
+    /// Writer rejects duplicate frequencies per spec "A frequency
+    /// should only be described once in the frame". The sort check
+    /// uses strictly-increasing so a duplicate trips the same gate.
+    #[test]
+    fn equa_writer_rejects_duplicate_frequencies() {
+        let frame = Id3Frame::Equa {
+            adjustment_bits: 16,
+            bands: vec![
+                EquaBand {
+                    increment: true,
+                    frequency: 1000,
+                    adjustment: vec![0x00, 0x80],
+                },
+                EquaBand {
+                    increment: false,
+                    frequency: 1000,
+                    adjustment: vec![0x00, 0x40],
+                },
+            ],
+        };
+        let err = encode_frame(Id3Version::V2_3, &frame).unwrap_err();
+        assert!(format!("{err}").contains("sorted"));
+    }
+
+    /// Writer rejects a frequency that overflows the 15-bit on-wire
+    /// field (top bit collides with the inc/dec flag).
+    #[test]
+    fn equa_writer_rejects_frequency_overflow() {
+        let frame = Id3Frame::Equa {
+            adjustment_bits: 16,
+            bands: vec![EquaBand {
+                increment: true,
+                frequency: 0x8000,
+                adjustment: vec![0x00, 0x80],
+            }],
+        };
+        let err = encode_frame(Id3Version::V2_3, &frame).unwrap_err();
+        assert!(format!("{err}").contains("15-bit"));
+    }
+
+    /// Writer rejects an adjustment wider than `ceil(adjustment_bits / 8)`
+    /// since silently truncating would change the magnitude.
+    #[test]
+    fn equa_writer_rejects_over_wide_adjustment() {
+        let frame = Id3Frame::Equa {
+            adjustment_bits: 8,
+            bands: vec![EquaBand {
+                increment: true,
+                frequency: 100,
+                adjustment: vec![0x12, 0x34],
+            }],
+        };
+        let err = encode_frame(Id3Version::V2_3, &frame).unwrap_err();
+        assert!(format!("{err}").contains("wider than"));
+    }
+
+    /// An empty payload preserves the raw bytes through `Unknown`
+    /// since there's no spec-defined fallback layout. Mirrors the
+    /// `RVAD` / `RVRB` short-form behaviour.
+    #[test]
+    fn equa_empty_payload_surfaces_unknown() {
+        match parse_equa(&[]) {
+            Id3Frame::Unknown { id, raw } => {
+                assert_eq!(id, "EQUA");
+                assert!(raw.is_empty());
+            }
+            other => panic!("expected Unknown for empty EQUA, got {other:?}"),
+        }
+    }
+
+    /// A trailing band whose adjustment is short of the declared width
+    /// is dropped — the inc/freq bytes are consumed but the band is
+    /// not emitted. Bands that fit are returned in wire order.
+    #[test]
+    fn equa_short_trailing_band_dropped() {
+        // adjustment_bits = 16 → 2-byte adjustments. One complete
+        // band (freq 100, inc, adj 0x0080) then a stray inc/freq pair
+        // without enough trailing adjustment bytes.
+        let payload = vec![0x10, 0x80, 0x64, 0x00, 0x80, 0x00, 0xC8, 0x00];
+        match parse_equa(&payload) {
+            Id3Frame::Equa {
+                adjustment_bits,
+                bands,
+            } => {
+                assert_eq!(adjustment_bits, 16);
+                assert_eq!(bands.len(), 1);
+                assert!(bands[0].increment);
+                assert_eq!(bands[0].frequency, 100);
+                assert_eq!(bands[0].adjustment, vec![0x00, 0x80]);
+            }
+            other => panic!("expected Equa, got {other:?}"),
+        }
+    }
+
+    /// `EQUA` carries DSP descriptors, not text values — it should not
+    /// surface in `to_key_value_pairs`, matching the `EQU2` / `RVAD`
+    /// precedent.
+    #[test]
+    fn equa_yields_no_key_value_pairs() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![Id3Frame::Equa {
+                adjustment_bits: 16,
+                bands: vec![EquaBand {
+                    increment: true,
+                    frequency: 100,
+                    adjustment: vec![0x00, 0x80],
+                }],
+            }],
+        };
+        assert!(to_key_value_pairs(&tag).is_empty());
+    }
+
+    /// A `v2.2` `EQU` payload should dispatch through `parse_equa` and
+    /// surface as an `Equa` variant — same wire layout as the v2.3
+    /// frame, just with the 3-char id that v2.2 used.
+    #[test]
+    fn equa_v22_dispatch_promotes_to_equa() {
+        // adjustment_bits = 8 (so 1 byte per adjustment), one band
+        // freq = 256 with increment, adjustment = 0x40.
+        let payload = vec![0x08, 0x81, 0x00, 0x40];
+        let got = dispatch_v22("EQU", &payload);
+        match got {
+            Id3Frame::Equa {
+                adjustment_bits,
+                bands,
+            } => {
+                assert_eq!(adjustment_bits, 8);
+                assert_eq!(bands.len(), 1);
+                assert!(bands[0].increment);
+                assert_eq!(bands[0].frequency, 256);
+                assert_eq!(bands[0].adjustment, vec![0x40]);
+            }
+            other => panic!("expected Equa from v2.2 EQU, got {other:?}"),
+        }
+    }
+
+    /// `v22_promote` resolves the 3-char `EQU` id to `EQUA` so a
+    /// caller-facing id is consistent with v2.3.
+    #[test]
+    fn equa_v22_promotion() {
+        assert_eq!(v22_promote("EQU"), "EQUA");
     }
 }
