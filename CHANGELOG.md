@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-id3/compare/v0.0.5...v0.0.6) - 2026-05-31
+
+### Other
+
+- structural TIPL / TMCL text frames (spec v2.4 §4.2.2)
+- structural IPLS involved-people-list frame (spec v2.3 §4.4)
+- structural EQUA equalisation frame (spec v2.3 §4.13)
+- structural RVAD relative volume adjustment frame (spec v2.3 §4.12)
+- Add structured RVRB reverb frame (spec v2.3 §4.13 / v2.4 §4.13)
+- structural MLLT MPEG location lookup table frame
+- ID3v2.4 footer emission + parse validation (spec §3.4)
+- cover extended-header CRC × unsync combinations
+- extended-header CRC-32 verification + emission (spec §3.2)
+- drop enumerated reader names from fuzz.yml comment
+- daily CI workflow + curated ID3 seed corpus for parse target
+- writer-side unsynchronisation (WholeTag + v2.4 PerFrame)
+- cargo-fuzz target driving panic-freedom over the ID3 parser
+- typed TimestampUnit accessor for ETCO/SYTC/SYLT/POSS
+- add ASPI audio seek point index frame (v2.4 §4.30)
+- add ENCR encryption method registration frame
+- add GRID group identification registration frame
+- structural MCDI/ETCO/SYLT/POSS/RBUF/SEEK/SIGN/AENC/LINK frames
+- structural USER/OWNE/COMR/SYTC/RVA2/EQU2 frames
+- structural POPM / PCNT / PRIV / GEOB / UFID frames
+- replace never-match regex with semver_check = false
+- drop enable_miri input (miri now manual-only via workflow_dispatch)
+- grant release-plz shim contents+pull-requests write
+- migrate to OxideAV/.github reusable workflows
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - `TIPL` involved-people-list and `TMCL` musician-credits-list
