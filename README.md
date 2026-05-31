@@ -273,12 +273,27 @@ peek still sizes the right number of bytes to read.
   count, a non-conforming trailing involvement with no involvee folds
   into a pair with an empty involvee, and the writer refuses to
   serialise under a v2.4 envelope since v2.4 dropped `IPLS` in favour
-  of the `TIPL` text frame and the new `TMCL` musician-credits list).
-  All twenty-eight round-trip both directions for v2.3 and v2.4 except
-  `RVAD`, `EQUA`, and `IPLS` which are v2.3-only by spec (ASPI is
-  v2.4-only per spec but the wire layout is byte-aligned and
-  version-independent; RVRB is byte-aligned and version-independent as
-  well).
+  of the `TIPL` text frame and the new `TMCL` musician-credits list),
+  `TIPL` involved-people-list text frame (v2.4 §4.2.2: regular
+  text-frame envelope — encoding byte + NUL-separated strings — but
+  spec mandates "every odd field is" a function "and every even is" a
+  name; structured `Id3Frame::Tipl { pairs: Vec<(String, String)> }`
+  preserves the role/name binding the generic `Id3Frame::Text`
+  variant would collapse, the parser folds a dangling final role into
+  a pair with an empty value, the writer handles both terminator-
+  style and separator-style payloads on read, and refuses to
+  serialise under a v2.3 envelope since v2.3 did not define `TIPL` —
+  v2.3 callers should use the `Ipls` variant instead), `TMCL`
+  musician-credits-list text frame (v2.4 §4.2.2: same wire layout
+  and structural treatment as `TIPL` but the role half names an
+  instrument and the value half names "an artist or a comma
+  delimited list of artists" who played it; same v2.3 writer
+  rejection).
+  All thirty round-trip both directions for v2.3 and v2.4 except
+  `RVAD`, `EQUA`, and `IPLS` (v2.3-only by spec), and `TIPL` / `TMCL`
+  (v2.4-only by spec) — ASPI is v2.4-only per spec but the wire
+  layout is byte-aligned and version-independent; RVRB is
+  byte-aligned and version-independent as well.
 - Everything else surfaces as `Id3Frame::Unknown { id, raw }` with the
   payload preserved so it can be written back untouched.
 - `Id3Frame::timestamp_unit()` returns a typed `TimestampUnit`

@@ -524,6 +524,59 @@ pub enum Id3Frame {
     /// pair with an empty involvee, surfacing the truncation without
     /// crashing.
     Ipls { pairs: Vec<(String, String)> },
+    /// `TIPL` involved-people-list text frame (spec v2.4 §4.2.2). On
+    /// the wire this is a regular text-information frame — an encoding
+    /// byte followed by a NUL-separated list of strings in the
+    /// declared encoding — but the spec mandates that "every odd field
+    /// is" a function (e.g. `producer`, `mixing engineer`) "and every
+    /// even is" a name. The text-frame variant `Id3Frame::Text { id:
+    /// "TIPL", values }` would parse the same bytes but loses the
+    /// role/value pair structure — a writer could emit an odd number
+    /// of values, a consumer could not tell `TIPL` apart from an
+    /// arbitrary multi-value `T***` text frame, and the spec's pair
+    /// semantics would only be enforced by convention. This structured
+    /// variant stores `pairs: Vec<(String, String)>` so a writer can
+    /// never emit an odd count and a consumer can iterate the
+    /// mappings as such.
+    ///
+    /// `TIPL` was introduced in v2.4 to replace `IPLS` (v2.3 §4.4),
+    /// which carried NUL-terminated strings between every field;
+    /// `TIPL` uses the v2.4 text-frame layout (NUL as separator, not
+    /// terminator) so callers should not assume on-wire byte-for-byte
+    /// equivalence with `IPLS`. The writer returns
+    /// [`Error::unsupported`] when asked to serialise a `Tipl` under
+    /// a `V2_3` envelope, mirroring the inverse `Ipls` rejection
+    /// under v2.4 — v2.3 had no `TIPL` definition.
+    ///
+    /// The parser folds a dangling final role (a non-conforming
+    /// source whose value list ends on an odd index) into a pair with
+    /// an empty value, surfacing the truncation structurally rather
+    /// than silently dropping the string.
+    ///
+    /// The spec's "There may only be one text information frame of
+    /// its kind in an tag" applies to `TIPL` as a text frame —
+    /// uniqueness is a caller-level concern, matching how the crate
+    /// treats `EQU2` / `MCDI` / `MLLT` / `RVRB` / `RVAD` / `EQUA` /
+    /// `IPLS`.
+    Tipl { pairs: Vec<(String, String)> },
+    /// `TMCL` musician-credits-list text frame (spec v2.4 §4.2.2).
+    /// Same on-wire layout as `TIPL` (encoding byte + NUL-separated
+    /// strings) and same pair structure, but the role half names an
+    /// instrument and the value half names "an artist or a comma
+    /// delimited list of artists" who played it (e.g. `guitar\0Alice,
+    /// Bob\0`). Per the spec the two frames differ only in the
+    /// semantic domain of the roles: `TIPL` maps functions to people,
+    /// `TMCL` maps instruments to musicians.
+    ///
+    /// `TMCL` was introduced in v2.4 alongside `TIPL` as the
+    /// replacement for `IPLS` (v2.3 §4.4). The writer returns
+    /// [`Error::unsupported`] when asked to serialise a `Tmcl` under
+    /// a `V2_3` envelope.
+    ///
+    /// Like `Tipl`, pairs are `Vec<(String, String)>` so a writer
+    /// can never emit an odd count, and a dangling final instrument
+    /// folds into a pair with an empty musician string.
+    Tmcl { pairs: Vec<(String, String)> },
     /// Any frame whose id we don't parse structurally (RGAD, CHAP,
     /// ...). The payload is preserved verbatim so callers or later
     /// versions can recognise it without needing to reparse.
@@ -1028,6 +1081,8 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
             | Id3Frame::Rvad { .. }
             | Id3Frame::Equa { .. }
             | Id3Frame::Ipls { .. }
+            | Id3Frame::Tipl { .. }
+            | Id3Frame::Tmcl { .. }
             | Id3Frame::Unknown { .. } => {}
         }
     }
@@ -1446,6 +1501,19 @@ fn parse_v24_frame(buf: &[u8]) -> Result<(Id3Frame, usize)> {
 fn dispatch_v23_v24(id: &str, payload: &[u8]) -> Id3Frame {
     if id == "TXXX" {
         return parse_txxx(id, payload);
+    }
+    // TIPL / TMCL are v2.4 text frames whose payload semantics are
+    // role/value pair lists (spec §4.2.2). Intercept BEFORE the
+    // generic T*** branch so the pair structure is preserved rather
+    // than collapsed into an opaque multi-value `Id3Frame::Text`.
+    // The wire-level layout is still a regular text frame — encoding
+    // byte + NUL-separated strings — so a v2.3 stream that carries
+    // these ids (out-of-spec but possible) also parses structurally.
+    if id == "TIPL" {
+        return parse_tipl_tmcl(id, payload);
+    }
+    if id == "TMCL" {
+        return parse_tipl_tmcl(id, payload);
     }
     if id.starts_with('T') && id != "TXXX" {
         return parse_text_frame(id, payload);
@@ -2738,6 +2806,70 @@ fn parse_ipls(payload: &[u8]) -> Id3Frame {
         rest = after_pair;
     }
     Id3Frame::Ipls { pairs }
+}
+
+/// Parse a `TIPL` or `TMCL` payload (spec v2.4 §4.2.2) into the
+/// matching structured pair-list variant. Both frames share the v2.4
+/// text-information-frame layout — a single encoding byte followed by
+/// the NUL-separated string list per spec §4.2 — but the spec assigns
+/// pair semantics: "every odd field is" the role half (function or
+/// instrument) "and every even is" the value half (name or
+/// musicians). An empty payload (no encoding byte) surfaces as
+/// `Id3Frame::Unknown` so the wire bytes round-trip untouched —
+/// matching the `IPLS` empty-payload fallback. A payload that's only
+/// the encoding byte parses to an empty pair list (the spec lets the
+/// list follow but does not require any pairs to be present). A
+/// dangling final role (a non-conforming source whose value list ends
+/// on an odd index) folds into a pair with an empty value rather than
+/// being silently dropped, so the truncation surfaces structurally
+/// just as it does for `IPLS`.
+///
+/// Note the on-wire NUL-handling difference vs `IPLS`: v2.3 `IPLS`
+/// uses NUL as a per-string TERMINATOR; v2.4 text frames use NUL as a
+/// SEPARATOR. A v2.4 multi-value text frame typically lacks the final
+/// terminator. We split on NUL unconditionally and treat trailing
+/// empty splits as absent — the implementation reuses
+/// `split_once_nul` and stops naturally when `rest` runs out, so
+/// both terminator-style and separator-style payloads decode to the
+/// same logical pair list.
+fn parse_tipl_tmcl(id: &str, payload: &[u8]) -> Id3Frame {
+    if payload.is_empty() {
+        return Id3Frame::Unknown {
+            id: id.to_string(),
+            raw: payload.to_vec(),
+        };
+    }
+    let enc = payload[0];
+    let mut rest = &payload[1..];
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    while !rest.is_empty() {
+        let (role, after_role) = split_once_nul(enc, rest);
+        // Skip trailing empty splits — a separator-style v2.4 payload
+        // that ends without a final NUL leaves a single empty trailer
+        // after the last value's NUL; treat it as not-a-pair rather
+        // than emitting an empty-role/empty-value pair.
+        if role.is_empty() && after_role.is_empty() {
+            break;
+        }
+        if after_role.is_empty() {
+            // Dangling final role with no value follow-up — fold into a
+            // pair with an empty value so a caller can detect the
+            // non-conforming source without us silently dropping it.
+            pairs.push((role, String::new()));
+            break;
+        }
+        let (value, after_pair) = split_once_nul(enc, after_role);
+        pairs.push((role, value));
+        rest = after_pair;
+    }
+    match id {
+        "TIPL" => Id3Frame::Tipl { pairs },
+        "TMCL" => Id3Frame::Tmcl { pairs },
+        _ => Id3Frame::Unknown {
+            id: id.to_string(),
+            raw: payload.to_vec(),
+        },
+    }
 }
 
 fn parse_rvrb(payload: &[u8]) -> Id3Frame {
@@ -4421,6 +4553,8 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
             }
             Ok(("IPLS".to_string(), payload))
         }
+        Id3Frame::Tipl { pairs } => encode_tipl_tmcl("TIPL", version, text_enc, pairs),
+        Id3Frame::Tmcl { pairs } => encode_tipl_tmcl("TMCL", version, text_enc, pairs),
         Id3Frame::Unknown { id, raw } => {
             // Promote v2.2 ids (3 chars) to their v2.3 equivalents on
             // write so the output is always a well-formed v2.3/v2.4
@@ -4433,6 +4567,47 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
             Ok((promoted, raw.clone()))
         }
     }
+}
+
+/// Serialise a `TIPL` or `TMCL` pair list into a v2.4 text-frame
+/// payload (spec §4.2.2 + §4.2 wire layout). Layout: encoding byte +
+/// the flattened role/value strings, separated by NUL per the v2.4
+/// text-frame multi-string convention. The crate's default text
+/// encoding is UTF-16-with-BOM for the v2.3 envelope and UTF-8 for
+/// the v2.4 envelope; `text_enc` is the chosen encoding byte. Because
+/// v2.4 introduced these frames, emitting them under a v2.3 envelope
+/// returns [`Error::unsupported`] — v2.3 does not define `TIPL` or
+/// `TMCL`, so a v2.3 reader would mis-decode them as opaque text
+/// frames. This mirrors the `IPLS` → v2.4 rejection inversely.
+///
+/// Wire-layout choice: we emit `role0\0value0\0role1\0value1\0…`
+/// where `\0` is the encoding-appropriate NUL (`0x00` for UTF-8,
+/// `0x00 0x00` for UTF-16). The trailing NUL after the final value
+/// is included so the layout matches the v2.3 `IPLS` byte sequence
+/// for a given encoding — this is a SUPERSET of the spec's
+/// "NUL-separated" form (the trailing NUL is harmless to readers
+/// that treat NUL as a separator and required by readers that treat
+/// it as a terminator). The parser handles both forms.
+fn encode_tipl_tmcl(
+    id: &str,
+    version: Id3Version,
+    text_enc: u8,
+    pairs: &[(String, String)],
+) -> Result<(String, Vec<u8>)> {
+    if matches!(version, Id3Version::V2_3) {
+        return Err(Error::unsupported(format!(
+            "{id} frame is v2.4-only; v2.3 has no equivalent text frame"
+        )));
+    }
+    let mut payload = Vec::new();
+    payload.push(text_enc);
+    for (role, value) in pairs {
+        encode_string(&mut payload, text_enc, role);
+        encode_terminator(&mut payload, text_enc);
+        encode_string(&mut payload, text_enc, value);
+        encode_terminator(&mut payload, text_enc);
+    }
+    Ok((id.to_string(), payload))
 }
 
 fn encode_comm_like(enc: u8, lang: &[u8; 3], description: &str, text: &str) -> Vec<u8> {
@@ -6903,5 +7078,241 @@ mod tests {
             Id3Frame::Ipls { pairs } => assert!(pairs.is_empty()),
             other => panic!("expected empty Ipls, got {other:?}"),
         }
+    }
+
+    // ----- TIPL / TMCL (spec v2.4 §4.2.2) -----
+
+    /// `TIPL` writer pinned bytes under the v2.4 default encoding
+    /// (UTF-8, byte 3): the layout is `enc + "producer\0Alice\0\0"`
+    /// where each NUL is a single byte (UTF-8 has 1-byte terminators
+    /// per `encode_terminator`). Pin it so a future writer change
+    /// surfaces at the bit level.
+    #[test]
+    fn tipl_writer_pinned_bytes_v24_utf8() {
+        let frame = Id3Frame::Tipl {
+            pairs: vec![("producer".to_string(), "Alice".to_string())],
+        };
+        let (id, payload) = encode_frame(Id3Version::V2_4, &frame).unwrap();
+        assert_eq!(id, "TIPL");
+        // encoding=3 (UTF-8), "producer", NUL, "Alice", NUL.
+        let mut expected = vec![0x03];
+        expected.extend_from_slice(b"producer");
+        expected.push(0);
+        expected.extend_from_slice(b"Alice");
+        expected.push(0);
+        assert_eq!(payload, expected);
+    }
+
+    /// `TMCL` writer pinned bytes — same wire shape as `TIPL`, just
+    /// the id differs. Pair semantics carry instrument/musician
+    /// instead of function/name, but the wire layout is identical.
+    #[test]
+    fn tmcl_writer_pinned_bytes_v24_utf8() {
+        let frame = Id3Frame::Tmcl {
+            pairs: vec![("guitar".to_string(), "Alice, Bob".to_string())],
+        };
+        let (id, payload) = encode_frame(Id3Version::V2_4, &frame).unwrap();
+        assert_eq!(id, "TMCL");
+        let mut expected = vec![0x03];
+        expected.extend_from_slice(b"guitar");
+        expected.push(0);
+        expected.extend_from_slice(b"Alice, Bob");
+        expected.push(0);
+        assert_eq!(payload, expected);
+    }
+
+    /// `TIPL` parser exercising the latin1 (encoding-byte 0) path
+    /// with two pairs. Latin1 strings use a single NUL as terminator
+    /// per `encode_terminator(_, 0)`.
+    #[test]
+    fn tipl_parser_handles_latin1_two_pairs() {
+        let mut payload = vec![0x00];
+        payload.extend_from_slice(b"producer\0Alice\0engineer\0Bob\0");
+        let got = parse_tipl_tmcl("TIPL", &payload);
+        match got {
+            Id3Frame::Tipl { pairs } => {
+                assert_eq!(pairs.len(), 2);
+                assert_eq!(pairs[0], ("producer".to_string(), "Alice".to_string()));
+                assert_eq!(pairs[1], ("engineer".to_string(), "Bob".to_string()));
+            }
+            other => panic!("expected Tipl, got {other:?}"),
+        }
+    }
+
+    /// `TMCL` parser handles a v2.4-style separator-only payload (no
+    /// trailing NUL after the final value), which is the form a
+    /// strictly-conforming v2.4 text-frame writer might emit. The
+    /// trailing empty split should NOT produce an extra
+    /// empty-instrument/empty-musician pair.
+    #[test]
+    fn tmcl_parser_handles_v24_separator_only_payload() {
+        // encoding=3 (UTF-8), "guitar\0Alice, Bob" — no trailing NUL.
+        let mut payload = vec![0x03];
+        payload.extend_from_slice(b"guitar\0Alice, Bob");
+        let got = parse_tipl_tmcl("TMCL", &payload);
+        match got {
+            Id3Frame::Tmcl { pairs } => {
+                assert_eq!(pairs.len(), 1);
+                assert_eq!(pairs[0].0, "guitar");
+                assert_eq!(pairs[0].1, "Alice, Bob");
+            }
+            other => panic!("expected Tmcl, got {other:?}"),
+        }
+    }
+
+    /// `TIPL` parser folds a dangling final role (a role with no
+    /// matching value) into a pair with an empty value, mirroring
+    /// the `IPLS` dangling-involvement fallback.
+    #[test]
+    fn tipl_parser_folds_dangling_role() {
+        // encoding=3 (UTF-8), "producer\0Alice\0engineer" — the
+        // final role has no terminator and no following value.
+        let mut payload = vec![0x03];
+        payload.extend_from_slice(b"producer\0Alice\0engineer");
+        let got = parse_tipl_tmcl("TIPL", &payload);
+        match got {
+            Id3Frame::Tipl { pairs } => {
+                assert_eq!(pairs.len(), 2);
+                assert_eq!(pairs[0], ("producer".to_string(), "Alice".to_string()));
+                assert_eq!(pairs[1], ("engineer".to_string(), String::new()));
+            }
+            other => panic!("expected Tipl with dangling role, got {other:?}"),
+        }
+    }
+
+    /// `TIPL` round-trip through `write_tag` → `parse_tag` at the
+    /// v2.4 envelope: a multi-pair payload with three role/name
+    /// bindings survives intact, with pair order preserved.
+    #[test]
+    fn tipl_roundtrip_v24() {
+        let original = Id3Frame::Tipl {
+            pairs: vec![
+                ("producer".to_string(), "Alice".to_string()),
+                ("mixing engineer".to_string(), "Bob".to_string()),
+                ("mastering".to_string(), "Carol".to_string()),
+            ],
+        };
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![original.clone()],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        assert_eq!(parsed.frames.len(), 1);
+        match &parsed.frames[0] {
+            Id3Frame::Tipl { pairs } => assert_eq!(
+                pairs,
+                &match &original {
+                    Id3Frame::Tipl { pairs } => pairs.clone(),
+                    _ => unreachable!(),
+                }
+            ),
+            other => panic!("expected Tipl after round-trip, got {other:?}"),
+        }
+    }
+
+    /// `TMCL` round-trip through `write_tag` → `parse_tag` at the
+    /// v2.4 envelope. Confirms the `Tmcl` arm of the writer + parser
+    /// is wired independently from `Tipl` even though they share the
+    /// helper.
+    #[test]
+    fn tmcl_roundtrip_v24() {
+        let original = Id3Frame::Tmcl {
+            pairs: vec![
+                ("guitar".to_string(), "Alice".to_string()),
+                ("bass".to_string(), "Bob".to_string()),
+            ],
+        };
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![original.clone()],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        assert_eq!(parsed.frames.len(), 1);
+        match &parsed.frames[0] {
+            Id3Frame::Tmcl { pairs } => assert_eq!(
+                pairs,
+                &match &original {
+                    Id3Frame::Tmcl { pairs } => pairs.clone(),
+                    _ => unreachable!(),
+                }
+            ),
+            other => panic!("expected Tmcl after round-trip, got {other:?}"),
+        }
+    }
+
+    /// Empty `TIPL` payload (no encoding byte) round-trips through
+    /// the `Unknown` fallback so the wire bytes are preserved — matches
+    /// the `IPLS` empty-payload behaviour. The encoding byte is
+    /// mandatory in the spec layout, so an empty payload cannot be a
+    /// structured `Tipl`.
+    #[test]
+    fn tipl_empty_payload_surfaces_unknown() {
+        match parse_tipl_tmcl("TIPL", &[]) {
+            Id3Frame::Unknown { id, raw } => {
+                assert_eq!(id, "TIPL");
+                assert!(raw.is_empty());
+            }
+            other => panic!("expected Unknown for empty TIPL payload, got {other:?}"),
+        }
+    }
+
+    /// Encoding-byte-only `TMCL` payload yields an empty pair list
+    /// (spec lets the pair list follow but does not require any
+    /// pairs to be present).
+    #[test]
+    fn tmcl_parser_encoding_byte_only_yields_empty() {
+        match parse_tipl_tmcl("TMCL", &[0x00]) {
+            Id3Frame::Tmcl { pairs } => assert!(pairs.is_empty()),
+            other => panic!("expected Tmcl with empty pairs, got {other:?}"),
+        }
+    }
+
+    /// `TIPL` is v2.4-only. Emitting it under a `V2_3` envelope must
+    /// fail rather than producing a frame v2.3 readers would not
+    /// understand (v2.3 did not define `TIPL` — the spec instead
+    /// defined `IPLS` for the same purpose).
+    #[test]
+    fn tipl_writer_rejects_v23() {
+        let frame = Id3Frame::Tipl {
+            pairs: vec![("producer".to_string(), "Alice".to_string())],
+        };
+        let err = encode_frame(Id3Version::V2_3, &frame).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("v2.4"));
+    }
+
+    /// `TMCL` is v2.4-only. Emitting it under a `V2_3` envelope must
+    /// fail (same reason as `TIPL` — v2.3 had no equivalent text
+    /// frame for instrument/musician credits).
+    #[test]
+    fn tmcl_writer_rejects_v23() {
+        let frame = Id3Frame::Tmcl {
+            pairs: vec![("guitar".to_string(), "Alice".to_string())],
+        };
+        let err = encode_frame(Id3Version::V2_3, &frame).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("v2.4"));
+    }
+
+    /// `TIPL` / `TMCL` carry pair-wise text descriptors that don't
+    /// fit the flat key/value model `to_key_value_pairs` exposes (a
+    /// single role can repeat — two producers, multiple guitarists,
+    /// etc.). They should not surface there, matching the `Ipls` /
+    /// `Equa` / `Equ2` / `Rvad` precedent for structurally non-text
+    /// frames.
+    #[test]
+    fn tipl_and_tmcl_yield_no_key_value_pairs() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![
+                Id3Frame::Tipl {
+                    pairs: vec![("producer".to_string(), "Alice".to_string())],
+                },
+                Id3Frame::Tmcl {
+                    pairs: vec![("guitar".to_string(), "Bob".to_string())],
+                },
+            ],
+        };
+        assert!(to_key_value_pairs(&tag).is_empty());
     }
 }

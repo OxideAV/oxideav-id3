@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `TIPL` involved-people-list and `TMCL` musician-credits-list
+  text frames (spec v2.4 §4.2.2). These are v2.4 text frames that
+  share the regular text-information-frame wire layout — a single
+  encoding byte followed by NUL-separated strings — but the spec
+  mandates pair semantics: "every odd field is" the role half (a
+  function for `TIPL`, an instrument for `TMCL`) "and every even is"
+  the value half (a person's name for `TIPL`, "an artist or a comma
+  delimited list of artists" for `TMCL`). Previously these landed in
+  the generic `Id3Frame::Text { values: Vec<String> }` variant which
+  loses the pair semantics — a writer could emit an odd value count,
+  consumers could not distinguish them from any other multi-value
+  text frame, and the role/value binding was only enforced by
+  convention. Replaces that fall-through with structured
+  `Id3Frame::Tipl { pairs }` and `Id3Frame::Tmcl { pairs }` variants
+  whose `pairs: Vec<(String, String)>` makes the spec contract
+  unforgeable at the type level. The dispatch intercepts `"TIPL"`
+  and `"TMCL"` ids BEFORE the generic `T***` branch in
+  `dispatch_v23_v24` so the pair structure is preserved regardless
+  of envelope version on read; the writer rejects emission under a
+  `V2_3` envelope with `Error::unsupported` since v2.3 had no
+  equivalent text frame (v2.3 used the separate `IPLS` frame for the
+  same purpose; the inverse rejection mirrors the existing `Ipls`
+  refusal under `V2_4`). The parser folds a dangling final role into
+  a pair with an empty value, surfacing the truncation structurally
+  instead of silently dropping the string, and tolerates both
+  terminator-style payloads (every string followed by NUL, matching
+  the `IPLS` shape) and the strict v2.4 separator-style form (no
+  trailing NUL after the final value). Twelve new lib tests cover
+  the matrix per frame (UTF-8 writer pinned to a hand-computed exact
+  byte sequence for both `TIPL` and `TMCL`; latin1 two-pair parser
+  through the encoding-0 path; v2.4 separator-only payload parses
+  cleanly without an empty trailing pair; v2.4 round-trip with
+  multiple pairs; dangling trailing role folds into an empty-value
+  pair; empty-payload Unknown fallback; encoding-byte-only payload
+  yields empty pair list; v2.3 writer rejection for both; zero-pair
+  `to_key_value_pairs` invariant). Four new integration round-trip
+  tests (`roundtrip_tipl_v24_multi_pair_unicode` exercising five
+  pairs including a Japanese role/name pair through the public
+  `write_tag` + `parse_tag` surface,
+  `roundtrip_tmcl_v24_multi_pair` exercising three instrument/
+  musician pairs with comma-delimited musician lists per spec
+  §4.2.2, plus `roundtrip_tipl_writer_rejects_v23` and
+  `roundtrip_tmcl_writer_rejects_v23` pinning the v2.4-only writer
+  contract through the public `write_tag` surface) finish the
+  coverage. `TIPL` / `TMCL` carry pair-wise text descriptors that
+  don't fit the flat key/value model `to_key_value_pairs` exposes
+  (one role can repeat — two producers, multiple guitarists), so
+  they don't surface there, matching the `Ipls` / `Equa` / `Equ2` /
+  `Rvad` precedent for structurally non-text frames. The spec's
+  "There may only be one text information frame of its kind in an
+  tag" applies — uniqueness is a caller-level concern.
+
 - `IPLS` involved-people-list frame (spec v2.3 §4.4). Replaces the
   previous opaque `Id3Frame::Unknown { id: "IPLS", .. }` fallthrough
   with a structured `Id3Frame::Ipls { pairs }` variant. `pairs` is a

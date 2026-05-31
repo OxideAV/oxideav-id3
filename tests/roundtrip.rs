@@ -2416,3 +2416,107 @@ fn roundtrip_ipls_writer_rejects_v24() {
     let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();
     assert!(format!("{err}").to_lowercase().contains("v2.3"));
 }
+
+/// `TIPL` round-trip through the public `write_tag` + `parse_tag`
+/// surface for a multi-pair tag carrying Unicode roles and names.
+/// Pairs survive the writer + parser trip with their role/value
+/// strings intact, the v2.4 default encoding (UTF-8) carries
+/// arbitrary Unicode role/value strings safely, and the pair
+/// ordering is preserved.
+#[test]
+fn roundtrip_tipl_v24_multi_pair_unicode() {
+    let original = Id3Frame::Tipl {
+        pairs: vec![
+            ("producer".to_string(), "Alice Bloggs".to_string()),
+            ("engineer".to_string(), "Bob Smith".to_string()),
+            ("ヴォーカル".to_string(), "山田 太郎".to_string()),
+            ("mixing engineer".to_string(), "Carol Jones".to_string()),
+            ("mastering".to_string(), "David Müller".to_string()),
+        ],
+    };
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![original.clone()],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    assert_eq!(parsed.frames.len(), 1);
+    match &parsed.frames[0] {
+        Id3Frame::Tipl { pairs } => {
+            assert_eq!(pairs.len(), 5);
+            assert_eq!(pairs[0].0, "producer");
+            assert_eq!(pairs[0].1, "Alice Bloggs");
+            assert_eq!(pairs[1].0, "engineer");
+            assert_eq!(pairs[1].1, "Bob Smith");
+            assert_eq!(pairs[2].0, "ヴォーカル");
+            assert_eq!(pairs[2].1, "山田 太郎");
+            assert_eq!(pairs[3].0, "mixing engineer");
+            assert_eq!(pairs[3].1, "Carol Jones");
+            assert_eq!(pairs[4].0, "mastering");
+            assert_eq!(pairs[4].1, "David Müller");
+        }
+        other => panic!("expected Tipl after round-trip, got {other:?}"),
+    }
+}
+
+/// `TMCL` round-trip through the public `write_tag` + `parse_tag`
+/// surface — verifies the instrument/musician variant is wired
+/// independently from `Tipl` (different enum arm, same on-wire
+/// helper) and that comma-delimited musician lists survive the trip
+/// intact per spec §4.2.2 "a comma delimited list of artists".
+#[test]
+fn roundtrip_tmcl_v24_multi_pair() {
+    let original = Id3Frame::Tmcl {
+        pairs: vec![
+            ("guitar".to_string(), "Alice, Bob".to_string()),
+            ("bass".to_string(), "Carol".to_string()),
+            ("drums".to_string(), "Dave".to_string()),
+        ],
+    };
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![original.clone()],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    assert_eq!(parsed.frames.len(), 1);
+    match &parsed.frames[0] {
+        Id3Frame::Tmcl { pairs } => {
+            assert_eq!(pairs.len(), 3);
+            assert_eq!(pairs[0], ("guitar".to_string(), "Alice, Bob".to_string()));
+            assert_eq!(pairs[1], ("bass".to_string(), "Carol".to_string()));
+            assert_eq!(pairs[2], ("drums".to_string(), "Dave".to_string()));
+        }
+        other => panic!("expected Tmcl after round-trip, got {other:?}"),
+    }
+}
+
+/// `TIPL` is v2.4-only. Emitting it under a `V2_3` envelope must
+/// fail (v2.3 instead used `IPLS` for the same purpose; the writer
+/// surfaces the rejection at the `write_tag` boundary rather than
+/// silently emitting a frame v2.3 readers would not recognise).
+#[test]
+fn roundtrip_tipl_writer_rejects_v23() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![Id3Frame::Tipl {
+            pairs: vec![("producer".to_string(), "Alice".to_string())],
+        }],
+    };
+    let err = write_tag(&tag, Id3Version::V2_3).unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("v2.4"));
+}
+
+/// `TMCL` is v2.4-only. Emitting it under a `V2_3` envelope must
+/// fail (same v2.4-introduced-frame rejection as `TIPL`).
+#[test]
+fn roundtrip_tmcl_writer_rejects_v23() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![Id3Frame::Tmcl {
+            pairs: vec![("guitar".to_string(), "Alice".to_string())],
+        }],
+    };
+    let err = write_tag(&tag, Id3Version::V2_3).unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("v2.4"));
+}
