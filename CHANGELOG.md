@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- v2.4 extended-header sub-fields surfaced via the new
+  `parse_tag_with_extended_header` entry point and emitted via two
+  new `WriteOptions` builders (`with_update`, `with_restrictions`).
+  Spec §3.2 defines three optional ext-header sub-fields: `b` "Tag
+  is an update", `c` CRC-32, and `d` restrictions. Previously the
+  crate parsed and verified only `c` (CRC); `b` and `d` were
+  consumed structurally to keep parsing valid but their values were
+  dropped. They now decode into a typed `ExtendedHeader` struct
+  carrying `is_update: bool`, `crc: Option<u32>`, and
+  `restrictions: Option<Restrictions>`. The five restrictions
+  sub-fields each get their own enum so a caller can pattern-match
+  the advisory limits without parsing the wire byte by hand:
+  `TagSizeRestriction` (bits 7..=6, `%pp`),
+  `TextEncodingRestriction` (bit 5, `%q`),
+  `TextFieldsRestriction` (bits 4..=3, `%rr`),
+  `ImageEncodingRestriction` (bit 2, `%s`), and
+  `ImageSizeRestriction` (bits 1..=0, `%tt`).
+  `Restrictions::{from_wire, to_wire}` is a bijection over all 256
+  bytes — the typed sub-fields cover every bit position with no
+  gaps. The writer emits an extended header whenever any of `crc`,
+  `is_update`, or `restrictions` is set, with the attached-data area
+  laid out in the spec-mandated `b, c, d` flag-bit order. Both
+  v2.4-only sub-fields (`is_update` + `restrictions`) reject a v2.3
+  target with `Error::unsupported`, matching the `with_footer`
+  v2.4-only rejection pattern. `parse_tag` is unchanged — it
+  internally consumes the verified extended header and returns the
+  same `(Id3Tag, usize)` pair as before, so existing callers keep
+  working; `parse_tag_with_extended_header` is the additive richer
+  sibling.
+
+### Fixed
+
+- v2.4 extended-header CRC writer was silently truncating CRC bit 31
+  when serialising the 32-bit CRC into the spec's 5-byte synchsafe
+  encoding. Spec §3.2 specifies 5×7-bit bytes = 35 bits, of which
+  the top 4 bits of the top synchsafe byte carry CRC bits 31..=28
+  (the remaining 3 bits are reserved zero). The writer masked the
+  top byte with `0x07` instead of `0x0F`, which clipped CRC bit 31.
+  Round-trip with `WriteOptions::with_crc(true)` happened to work
+  for tags whose body CRC had bit 31 clear, but ~half of all bodies
+  hit the bug and the parser would reject them with "CRC mismatch".
+  Mask is now `0x0F` and a regression test (cycles through bodies
+  until it lands on a top-bit-set CRC) asserts the round-trip.
+
 - `IPLS` involved-people-list frame (spec v2.3 §4.4). Replaces the
   previous opaque `Id3Frame::Unknown { id: "IPLS", .. }` fallthrough
   with a structured `Id3Frame::Ipls { pairs }` variant. `pairs` is a

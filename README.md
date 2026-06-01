@@ -189,6 +189,52 @@ never touches it and the CRC region is unchanged. `tag_size_at_head`
 already reports footer-inclusive totals so a one-shot 10-byte file
 peek still sizes the right number of bytes to read.
 
+### Extended-header sub-fields (v2.4)
+
+ID3v2.4 §3.2 defines two optional extended-header sub-fields beyond
+the CRC: the `b` "Tag is an update" flag and the `d` restrictions
+byte. Both are surfaced as typed `WriteOptions` builders on emission
+and recovered from a tag via the richer `parse_tag_with_extended_header`
+entry point:
+
+```rust
+use oxideav_id3::{
+    parse_tag_with_extended_header, write_tag_with_options, Id3Tag, Id3Version,
+    ImageEncodingRestriction, ImageSizeRestriction, Restrictions, TagSizeRestriction,
+    TextEncodingRestriction, TextFieldsRestriction, WriteOptions,
+};
+
+# let tag = Id3Tag { version: Id3Version::V2_4, frames: vec![] };
+let restrictions = Restrictions {
+    tag_size: TagSizeRestriction::Max64Frames128Kb,
+    text_encoding: TextEncodingRestriction::Iso8859OrUtf8,
+    text_fields: TextFieldsRestriction::Max128Chars,
+    image_encoding: ImageEncodingRestriction::PngOrJpeg,
+    image_size: ImageSizeRestriction::Max256x256,
+};
+let opts = WriteOptions::new()
+    .with_crc(true)
+    .with_update(true)
+    .with_restrictions(Some(restrictions));
+let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts)?;
+
+let (tag, ext, _consumed) = parse_tag_with_extended_header(&bytes)?;
+assert!(ext.is_update);
+assert_eq!(ext.crc.is_some(), true);
+assert_eq!(ext.restrictions, Some(restrictions));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`parse_tag` is unchanged; the new `parse_tag_with_extended_header`
+returns the same `(Id3Tag, usize)` plus an `ExtendedHeader` carrying
+`is_update`, the verified `crc`, and the typed `Restrictions`. Per
+spec the restrictions byte is advisory ("does not affect how the
+tag is decoded, merely how it was restricted before encoding"); the
+parser preserves it losslessly without enforcing the limits and the
+writer emits whatever the caller supplied. Both `with_update` and
+`with_restrictions(Some(_))` are v2.4-only — a v2.3 target returns
+`Error::unsupported` rather than silently dropping the request.
+
 ## What is supported
 
 - **ID3v1 / ID3v1.1** — parse + write 128-byte trailers, Winamp's
@@ -200,8 +246,11 @@ peek still sizes the right number of bytes to read.
   read; the extended-header CRC-32 is verified against the spec-defined
   region (frames-only in v2.3, frames + padding in v2.4) and parse
   fails on mismatch. The writer can emit a CRC-bearing extended header
-  via `WriteOptions::with_crc(true)`. Footer-bearing tags are sized
-  correctly.
+  via `WriteOptions::with_crc(true)`, the v2.4 "Tag is an update"
+  flag via `with_update(true)`, and the v2.4 restrictions byte via
+  `with_restrictions(Some(_))`. All three sub-fields surface through
+  `parse_tag_with_extended_header` as a typed `ExtendedHeader`
+  struct. Footer-bearing tags are sized correctly.
 - Common frames: `T***` text, `TXXX` user-defined text, `W***` URL,
   `WXXX` user-defined URL, `COMM` comment, `USLT` lyrics, `APIC` /
   `PIC` attached picture.

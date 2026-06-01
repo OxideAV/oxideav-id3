@@ -5,9 +5,11 @@
 
 use oxideav_core::{AttachedPicture, PictureType};
 use oxideav_id3::{
-    attached_pictures, parse_id3v1, parse_tag, to_key_value_pairs, write_id3v1, write_tag,
-    write_tag_with_options, EquaBand, Id3Frame, Id3Tag, Id3Version, Rva2Channel, RvadBackChannels,
-    RvadChannel, RvadFrontChannels, TimestampUnit, UnsyncMode, WriteOptions,
+    attached_pictures, parse_id3v1, parse_tag, parse_tag_with_extended_header, to_key_value_pairs,
+    write_id3v1, write_tag, write_tag_with_options, EquaBand, Id3Frame, Id3Tag, Id3Version,
+    ImageEncodingRestriction, ImageSizeRestriction, Restrictions, Rva2Channel, RvadBackChannels,
+    RvadChannel, RvadFrontChannels, TagSizeRestriction, TextEncodingRestriction,
+    TextFieldsRestriction, TimestampUnit, UnsyncMode, WriteOptions,
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
@@ -2415,4 +2417,334 @@ fn roundtrip_ipls_writer_rejects_v24() {
     };
     let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();
     assert!(format!("{err}").to_lowercase().contains("v2.3"));
+}
+
+// ---------------------------------------------------------------------------
+// v2.3 / v2.4 extended-header sub-fields: `is_update` + restrictions byte
+// ---------------------------------------------------------------------------
+
+/// `parse_tag_with_extended_header` returns the default `ExtendedHeader`
+/// when no extended header is present (the tag-header flag bit 0x40 is
+/// clear). All sub-fields are `false` / `None`.
+#[test]
+fn ext_header_default_when_no_ext_header() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Text {
+            id: "TIT2".into(),
+            values: vec!["Plain".into()],
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (_parsed, ext, _) = parse_tag_with_extended_header(&bytes).unwrap();
+    assert!(!ext.is_update);
+    assert_eq!(ext.crc, None);
+    assert_eq!(ext.restrictions, None);
+}
+
+/// `parse_tag` still works after the extended-header refactor.
+/// `parse_tag_with_extended_header` and `parse_tag` must agree on the
+/// frames they recover from the same bytes.
+#[test]
+fn ext_header_parse_tag_still_agrees() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Text {
+            id: "TIT2".into(),
+            values: vec!["Agree".into()],
+        }],
+    };
+    let bytes = write_tag_with_options(
+        &tag,
+        Id3Version::V2_4,
+        &WriteOptions::new().with_crc(true).with_update(true),
+    )
+    .unwrap();
+    let (a, _) = parse_tag(&bytes).unwrap();
+    let (b, ext, _) = parse_tag_with_extended_header(&bytes).unwrap();
+    assert_eq!(a.version, b.version);
+    assert_eq!(a.frames.len(), b.frames.len());
+    assert!(ext.is_update);
+    assert!(ext.crc.is_some());
+}
+
+/// Round-trip the v2.4 "Tag is an update" flag: written via
+/// [`WriteOptions::with_update`] and recovered via
+/// [`parse_tag_with_extended_header`].
+#[test]
+fn ext_header_is_update_v24_roundtrip() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Text {
+            id: "TPE1".into(),
+            values: vec!["Updater".into()],
+        }],
+    };
+    let bytes = write_tag_with_options(
+        &tag,
+        Id3Version::V2_4,
+        &WriteOptions::new().with_update(true),
+    )
+    .unwrap();
+    // The tag-header flag bit 0x40 must be set since we emitted an
+    // extended header (the parser-side gate keys off this bit).
+    assert_eq!(bytes[5] & 0x40, 0x40);
+    let (_, ext, _) = parse_tag_with_extended_header(&bytes).unwrap();
+    assert!(ext.is_update);
+    assert_eq!(ext.crc, None);
+    assert_eq!(ext.restrictions, None);
+}
+
+/// `is_update` is a v2.4-only extended-header sub-field; v2.3 has no
+/// slot for it. Requesting it under a v2.3 target must fail loudly
+/// rather than silently dropping the flag.
+#[test]
+fn ext_header_is_update_v23_rejected() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![Id3Frame::Text {
+            id: "TIT2".into(),
+            values: vec!["Nope".into()],
+        }],
+    };
+    let err = write_tag_with_options(
+        &tag,
+        Id3Version::V2_3,
+        &WriteOptions::new().with_update(true),
+    )
+    .unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("v2.4-only"));
+}
+
+/// Round-trip every value of every restrictions sub-field. Writing a
+/// fully-saturated restrictions byte (`%11111111`) and re-parsing must
+/// recover the exact same typed sub-fields. The wire byte uses every
+/// reserved bit position so any sub-field decode bug surfaces here.
+#[test]
+fn ext_header_restrictions_saturated_v24_roundtrip() {
+    let restrictions = Restrictions {
+        tag_size: TagSizeRestriction::Max32Frames4Kb,
+        text_encoding: TextEncodingRestriction::Iso8859OrUtf8,
+        text_fields: TextFieldsRestriction::Max30Chars,
+        image_encoding: ImageEncodingRestriction::PngOrJpeg,
+        image_size: ImageSizeRestriction::Exactly64x64,
+    };
+    assert_eq!(restrictions.to_wire(), 0xFF);
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Text {
+            id: "TIT2".into(),
+            values: vec!["Restricted".into()],
+        }],
+    };
+    let bytes = write_tag_with_options(
+        &tag,
+        Id3Version::V2_4,
+        &WriteOptions::new().with_restrictions(Some(restrictions)),
+    )
+    .unwrap();
+    let (_, ext, _) = parse_tag_with_extended_header(&bytes).unwrap();
+    assert_eq!(ext.restrictions, Some(restrictions));
+}
+
+/// The default restrictions byte is `0x00` — all sub-fields at their
+/// "no restriction" / "unrestricted" zero values. Round-trip the
+/// zero byte explicitly so a regression in the bit layout surfaces.
+#[test]
+fn ext_header_restrictions_zero_byte_roundtrips() {
+    let restrictions = Restrictions::default();
+    assert_eq!(restrictions.to_wire(), 0x00);
+    let recovered = Restrictions::from_wire(0x00);
+    assert_eq!(recovered, restrictions);
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Text {
+            id: "TIT2".into(),
+            values: vec!["Zero".into()],
+        }],
+    };
+    let bytes = write_tag_with_options(
+        &tag,
+        Id3Version::V2_4,
+        &WriteOptions::new().with_restrictions(Some(restrictions)),
+    )
+    .unwrap();
+    let (_, ext, _) = parse_tag_with_extended_header(&bytes).unwrap();
+    assert_eq!(ext.restrictions, Some(Restrictions::default()));
+}
+
+/// `Restrictions::from_wire` must individually decode each
+/// non-default sub-field. Walk through one set bit at a time and
+/// confirm the right sub-field decodes to the right enum variant
+/// while the others stay at their default.
+#[test]
+fn ext_header_restrictions_per_subfield_isolation() {
+    // p (tag size, bits 7..=6) = %01
+    let r = Restrictions::from_wire(0b0100_0000);
+    assert_eq!(r.tag_size, TagSizeRestriction::Max64Frames128Kb);
+    assert_eq!(r.text_encoding, TextEncodingRestriction::default());
+    assert_eq!(r.text_fields, TextFieldsRestriction::default());
+    assert_eq!(r.image_encoding, ImageEncodingRestriction::default());
+    assert_eq!(r.image_size, ImageSizeRestriction::default());
+
+    // q (text encoding, bit 5)
+    let r = Restrictions::from_wire(0b0010_0000);
+    assert_eq!(r.tag_size, TagSizeRestriction::default());
+    assert_eq!(r.text_encoding, TextEncodingRestriction::Iso8859OrUtf8);
+
+    // r (text fields, bits 4..=3) = %10
+    let r = Restrictions::from_wire(0b0001_0000);
+    assert_eq!(r.text_fields, TextFieldsRestriction::Max128Chars);
+
+    // s (image encoding, bit 2)
+    let r = Restrictions::from_wire(0b0000_0100);
+    assert_eq!(r.image_encoding, ImageEncodingRestriction::PngOrJpeg);
+
+    // t (image size, bits 1..=0) = %01
+    let r = Restrictions::from_wire(0b0000_0001);
+    assert_eq!(r.image_size, ImageSizeRestriction::Max256x256);
+}
+
+/// `Restrictions::to_wire` is the exact inverse of
+/// `Restrictions::from_wire`. Verify the round-trip across all 256
+/// possible bytes — the typed sub-fields cover every bit position
+/// without overlap or gap.
+#[test]
+fn ext_header_restrictions_byte_bijection() {
+    for b in 0u8..=255 {
+        let r = Restrictions::from_wire(b);
+        assert_eq!(r.to_wire(), b, "byte {b:#04x} did not round-trip");
+    }
+}
+
+/// Restrictions is v2.4-only. v2.3 must reject the option loudly
+/// rather than silently dropping it, matching the `is_update` and
+/// `with_footer` rejection pattern.
+#[test]
+fn ext_header_restrictions_v23_rejected() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![Id3Frame::Text {
+            id: "TIT2".into(),
+            values: vec!["Nope".into()],
+        }],
+    };
+    let err = write_tag_with_options(
+        &tag,
+        Id3Version::V2_3,
+        &WriteOptions::new().with_restrictions(Some(Restrictions::default())),
+    )
+    .unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("v2.4-only"));
+}
+
+/// Compose every v2.4 extended-header sub-field at once: CRC,
+/// is_update, restrictions, footer, and per-frame unsync. The
+/// resulting tag must round-trip both the frames and every
+/// extended-header sub-field.
+#[test]
+fn ext_header_all_subfields_compose_v24() {
+    let restrictions = Restrictions {
+        tag_size: TagSizeRestriction::Max32Frames40Kb,
+        text_encoding: TextEncodingRestriction::Iso8859OrUtf8,
+        text_fields: TextFieldsRestriction::Max1024Chars,
+        image_encoding: ImageEncodingRestriction::PngOrJpeg,
+        image_size: ImageSizeRestriction::Max256x256,
+    };
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![
+            Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["Composed".into()],
+            },
+            Id3Frame::Text {
+                id: "TPE1".into(),
+                values: vec!["All Flags".into()],
+            },
+        ],
+    };
+    let bytes = write_tag_with_options(
+        &tag,
+        Id3Version::V2_4,
+        &WriteOptions::new()
+            .with_crc(true)
+            .with_update(true)
+            .with_restrictions(Some(restrictions))
+            .with_footer(true)
+            .with_unsync(UnsyncMode::PerFrame),
+    )
+    .unwrap();
+    let (parsed, ext, _) = parse_tag_with_extended_header(&bytes).unwrap();
+    assert_eq!(parsed.frames.len(), 2);
+    assert!(ext.is_update);
+    assert!(ext.crc.is_some());
+    assert_eq!(ext.restrictions, Some(restrictions));
+    // Footer present + identifier
+    assert_eq!(&bytes[bytes.len() - 10..bytes.len() - 7], b"3DI");
+}
+
+/// The crc-only extended header (no `is_update`, no restrictions)
+/// remains unchanged from the previous wire layout: 12-byte
+/// extended-header for v2.4 (4-byte size = 12, 1-byte flag-count,
+/// 1-byte flags = 0x20, 1-byte CRC data-length = 5, 5-byte
+/// synchsafe CRC). Regression guard so the new options don't
+/// accidentally bloat the crc-only emission.
+#[test]
+fn ext_header_crc_only_v24_size_unchanged() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![],
+    };
+    let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &WriteOptions::new().with_crc(true))
+        .unwrap();
+    // tag header (10) + ext header (12) = 22 bytes total when
+    // there are no frames.
+    assert_eq!(bytes.len(), 22);
+    // ext flags = 0x20 (CRC only)
+    assert_eq!(bytes[10 + 5], 0x20);
+}
+
+/// Regression guard for the v2.4 extended-header CRC synchsafe-encoding
+/// of values whose bit 31 is set. The synchsafe encoder used to mask
+/// the top synchsafe byte with `0x07` instead of `0x0F`, which
+/// silently truncated bit 31 of the CRC; the parser would then
+/// compute a CRC with bit 31 set and reject the round-trip with a
+/// "CRC mismatch" error. This test asserts the writer and the parser
+/// agree even when the frame-bytes' CRC happens to have bit 31 set.
+#[test]
+fn ext_header_crc_top_bit_survives_synchsafe_encoding() {
+    // Build tags one frame at a time until we land on a body whose
+    // CRC has bit 31 set. The CRC depends on the frame bytes, so a
+    // distinct title string is enough to flip across many values
+    // quickly. Bound the search at 256 attempts so a regression in
+    // crc32_iso3309 cannot hang the test.
+    let mut found = false;
+    for n in 0u32..256 {
+        let title = format!("ext-header-crc-top-bit-{n:08x}");
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec![title.clone()],
+            }],
+        };
+        let bytes =
+            write_tag_with_options(&tag, Id3Version::V2_4, &WriteOptions::new().with_crc(true))
+                .unwrap();
+        let parsed = parse_tag_with_extended_header(&bytes).unwrap();
+        let crc = parsed.1.crc.expect("CRC must be present after write");
+        if crc & 0x8000_0000 != 0 {
+            // CRC top bit was set on the wire; the synchsafe encoder
+            // must have preserved it or the round-trip above would
+            // have failed with a CRC mismatch.
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "did not find a body with a top-bit-set CRC in 256 attempts; \
+         either the search bound is too tight or crc32_iso3309 is broken"
+    );
 }

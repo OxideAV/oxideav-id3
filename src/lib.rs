@@ -682,11 +682,279 @@ impl Id3Frame {
     }
 }
 
+/// Tag-size restriction sub-field of the v2.4 extended-header
+/// restrictions byte (spec §3.2 sub-field `p`). Spec §3.2: "presence
+/// of these restrictions does not affect how the tag is decoded,
+/// merely how it was restricted before encoding."
+///
+/// Wire encoding lives in bits `7..=6` (`%pp______`) of the
+/// restrictions byte.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TagSizeRestriction {
+    /// `%00` — no more than 128 frames and 1 MB total tag size.
+    #[default]
+    Max128Frames1Mb,
+    /// `%01` — no more than 64 frames and 128 KB total tag size.
+    Max64Frames128Kb,
+    /// `%10` — no more than 32 frames and 40 KB total tag size.
+    Max32Frames40Kb,
+    /// `%11` — no more than 32 frames and 4 KB total tag size.
+    Max32Frames4Kb,
+}
+
+impl TagSizeRestriction {
+    fn from_bits(b: u8) -> Self {
+        match b & 0b11 {
+            0 => TagSizeRestriction::Max128Frames1Mb,
+            1 => TagSizeRestriction::Max64Frames128Kb,
+            2 => TagSizeRestriction::Max32Frames40Kb,
+            _ => TagSizeRestriction::Max32Frames4Kb,
+        }
+    }
+
+    fn to_bits(self) -> u8 {
+        match self {
+            TagSizeRestriction::Max128Frames1Mb => 0,
+            TagSizeRestriction::Max64Frames128Kb => 1,
+            TagSizeRestriction::Max32Frames40Kb => 2,
+            TagSizeRestriction::Max32Frames4Kb => 3,
+        }
+    }
+}
+
+/// Text-encoding restriction sub-field of the v2.4 extended-header
+/// restrictions byte (spec §3.2 sub-field `q`). Lives in bit `5`
+/// (`%__q_____`) of the restrictions byte.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextEncodingRestriction {
+    /// `%0` — no restrictions on string encoding.
+    #[default]
+    Unrestricted,
+    /// `%1` — strings are only encoded with ISO-8859-1 or UTF-8.
+    Iso8859OrUtf8,
+}
+
+impl TextEncodingRestriction {
+    fn from_bit(b: u8) -> Self {
+        if b & 1 != 0 {
+            TextEncodingRestriction::Iso8859OrUtf8
+        } else {
+            TextEncodingRestriction::Unrestricted
+        }
+    }
+
+    fn to_bit(self) -> u8 {
+        match self {
+            TextEncodingRestriction::Unrestricted => 0,
+            TextEncodingRestriction::Iso8859OrUtf8 => 1,
+        }
+    }
+}
+
+/// Text-fields size restriction sub-field of the v2.4 extended-header
+/// restrictions byte (spec §3.2 sub-field `r`). Lives in bits
+/// `4..=3` (`%___rr___`) of the restrictions byte. Per spec the limit
+/// counts characters, not bytes — multi-byte encodings are not
+/// renormalised before measuring. A multi-string text frame totals
+/// its strings before the limit applies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextFieldsRestriction {
+    /// `%00` — no restrictions on text-field length.
+    #[default]
+    Unrestricted,
+    /// `%01` — no string longer than 1024 characters.
+    Max1024Chars,
+    /// `%10` — no string longer than 128 characters.
+    Max128Chars,
+    /// `%11` — no string longer than 30 characters.
+    Max30Chars,
+}
+
+impl TextFieldsRestriction {
+    fn from_bits(b: u8) -> Self {
+        match b & 0b11 {
+            0 => TextFieldsRestriction::Unrestricted,
+            1 => TextFieldsRestriction::Max1024Chars,
+            2 => TextFieldsRestriction::Max128Chars,
+            _ => TextFieldsRestriction::Max30Chars,
+        }
+    }
+
+    fn to_bits(self) -> u8 {
+        match self {
+            TextFieldsRestriction::Unrestricted => 0,
+            TextFieldsRestriction::Max1024Chars => 1,
+            TextFieldsRestriction::Max128Chars => 2,
+            TextFieldsRestriction::Max30Chars => 3,
+        }
+    }
+}
+
+/// Image-encoding restriction sub-field of the v2.4 extended-header
+/// restrictions byte (spec §3.2 sub-field `s`). Lives in bit `2`
+/// (`%_____s__`) of the restrictions byte.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImageEncodingRestriction {
+    /// `%0` — no restrictions on attached-picture encoding.
+    #[default]
+    Unrestricted,
+    /// `%1` — images are encoded only with PNG or JPEG.
+    PngOrJpeg,
+}
+
+impl ImageEncodingRestriction {
+    fn from_bit(b: u8) -> Self {
+        if b & 1 != 0 {
+            ImageEncodingRestriction::PngOrJpeg
+        } else {
+            ImageEncodingRestriction::Unrestricted
+        }
+    }
+
+    fn to_bit(self) -> u8 {
+        match self {
+            ImageEncodingRestriction::Unrestricted => 0,
+            ImageEncodingRestriction::PngOrJpeg => 1,
+        }
+    }
+}
+
+/// Image-size restriction sub-field of the v2.4 extended-header
+/// restrictions byte (spec §3.2 sub-field `t`). Lives in bits
+/// `1..=0` (`%______tt`) of the restrictions byte.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImageSizeRestriction {
+    /// `%00` — no restrictions on attached-picture pixel size.
+    #[default]
+    Unrestricted,
+    /// `%01` — all images are 256x256 pixels or smaller.
+    Max256x256,
+    /// `%10` — all images are 64x64 pixels or smaller.
+    Max64x64,
+    /// `%11` — all images are exactly 64x64 pixels, unless
+    /// required otherwise.
+    Exactly64x64,
+}
+
+impl ImageSizeRestriction {
+    fn from_bits(b: u8) -> Self {
+        match b & 0b11 {
+            0 => ImageSizeRestriction::Unrestricted,
+            1 => ImageSizeRestriction::Max256x256,
+            2 => ImageSizeRestriction::Max64x64,
+            _ => ImageSizeRestriction::Exactly64x64,
+        }
+    }
+
+    fn to_bits(self) -> u8 {
+        match self {
+            ImageSizeRestriction::Unrestricted => 0,
+            ImageSizeRestriction::Max256x256 => 1,
+            ImageSizeRestriction::Max64x64 => 2,
+            ImageSizeRestriction::Exactly64x64 => 3,
+        }
+    }
+}
+
+/// Decoded form of the v2.4 extended-header restrictions byte (spec
+/// §3.2 sub-field `d`). The wire byte is laid out as `%ppqrrstt`
+/// across the five typed sub-fields. The restrictions are advisory:
+/// the spec says they describe how the tag was *restricted before
+/// encoding*, not how to decode it, so this crate's parser preserves
+/// them losslessly without enforcing them, and the writer emits them
+/// verbatim when supplied via [`WriteOptions::with_restrictions`].
+///
+/// Restrictions are a v2.4-only construct (v2.3 has no
+/// equivalent extended-header sub-field). The writer rejects
+/// [`WriteOptions::with_restrictions`] under a v2.3 target with
+/// [`Error::unsupported`], matching the v2.3-only / v2.4-only
+/// rejection pattern used for `with_footer` and the `RVAD` / `EQUA`
+/// frames.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Restrictions {
+    /// Bits `7..=6` — tag-size restriction sub-field `p`.
+    pub tag_size: TagSizeRestriction,
+    /// Bit `5` — text-encoding restriction sub-field `q`.
+    pub text_encoding: TextEncodingRestriction,
+    /// Bits `4..=3` — text-fields-size restriction sub-field `r`.
+    pub text_fields: TextFieldsRestriction,
+    /// Bit `2` — image-encoding restriction sub-field `s`.
+    pub image_encoding: ImageEncodingRestriction,
+    /// Bits `1..=0` — image-size restriction sub-field `t`.
+    pub image_size: ImageSizeRestriction,
+}
+
+impl Restrictions {
+    /// Decode the wire restrictions byte into typed sub-fields.
+    pub fn from_wire(byte: u8) -> Self {
+        Self {
+            tag_size: TagSizeRestriction::from_bits(byte >> 6),
+            text_encoding: TextEncodingRestriction::from_bit(byte >> 5),
+            text_fields: TextFieldsRestriction::from_bits(byte >> 3),
+            image_encoding: ImageEncodingRestriction::from_bit(byte >> 2),
+            image_size: ImageSizeRestriction::from_bits(byte),
+        }
+    }
+
+    /// Encode the typed sub-fields back to the wire byte (`%ppqrrstt`).
+    pub fn to_wire(self) -> u8 {
+        (self.tag_size.to_bits() << 6)
+            | (self.text_encoding.to_bit() << 5)
+            | (self.text_fields.to_bits() << 3)
+            | (self.image_encoding.to_bit() << 2)
+            | self.image_size.to_bits()
+    }
+}
+
+/// Decoded form of the v2.3 / v2.4 extended header (spec §3.2).
+///
+/// The extended header is optional in both v2.3 and v2.4 (and only
+/// present when the tag-header flag bit `0x40` is set). When absent
+/// the tag carries no extended metadata and this struct's
+/// [`Default`] (all `false` / `None`) is the parsed result.
+///
+/// * `is_update` — v2.4-only "Tag is an update" flag (spec §3.2
+///   sub-field `b`). v2.3 has no equivalent; it always parses as
+///   `false` for a v2.3 tag.
+/// * `crc` — the verified CRC-32 stored in the extended header, when
+///   present. v2.3 stores 4 raw bytes; v2.4 stores a 5-byte
+///   synchsafe-encoded 35-bit value (upper 4 bits zero). Both decode
+///   to the same `u32`. The CRC is verified during parse, so a
+///   mismatch is a parse error; this field carries the verified
+///   value only.
+/// * `restrictions` — v2.4-only restrictions byte decoded into typed
+///   sub-fields (`%ppqrrstt`). v2.3 has no equivalent; always `None`
+///   for a v2.3 tag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExtendedHeader {
+    /// `true` when the v2.4 extended-header `b` flag bit is set:
+    /// "Tag is an update. If this flag is set, the present tag is an
+    /// update of a tag found earlier in the present file or stream."
+    /// Per spec, "if frames defined as unique are found in the present
+    /// tag, they are to override any corresponding ones found in the
+    /// earlier tag."
+    pub is_update: bool,
+    /// `Some(crc)` when an extended-header CRC was present and
+    /// verified during parse, `None` otherwise. v2.3 stores 4 raw
+    /// bytes; v2.4 stores a 5-byte synchsafe 35-bit value (upper 4
+    /// bits are zero by spec, so it fits in a `u32`).
+    pub crc: Option<u32>,
+    /// `Some(restrictions)` when the v2.4 extended-header `d` flag
+    /// bit is set, `None` otherwise (always `None` for v2.3 — the
+    /// restrictions sub-field is v2.4-only).
+    pub restrictions: Option<Restrictions>,
+}
+
 /// Parse an ID3v2 tag from a buffer that starts with the 10-byte
 /// header. On success, returns the [`Id3Tag`] and the total number of
 /// bytes consumed from `buf` (header + body + optional footer) —
 /// callers can seek by that many bytes to reach the next byte after
 /// the tag.
+///
+/// Use [`parse_tag_with_extended_header`] instead when you need to
+/// inspect the decoded extended-header (CRC, `is_update`,
+/// restrictions byte). This entry point discards the extended header
+/// after verifying its CRC.
 pub fn parse_tag(buf: &[u8]) -> Result<(Id3Tag, usize)> {
     if buf.len() < ID3V2_HEADER_SIZE {
         return Err(Error::NeedMore);
@@ -782,11 +1050,105 @@ pub fn parse_tag(buf: &[u8]) -> Result<(Id3Tag, usize)> {
     // CRC is a hard parse error: a parser that accepted broken CRCs
     // would defeat the point of the field.
     if flags & 0x40 != 0 {
-        body = parse_extended_header(version, body)?;
+        let (after, _decoded) = parse_extended_header(version, body)?;
+        body = after;
     }
 
     let frames = parse_frames(version, body);
     Ok((Id3Tag { version, frames }, total))
+}
+
+/// Parse an ID3v2 tag from a buffer that starts with the 10-byte
+/// header, returning the decoded extended-header structure alongside
+/// the tag.
+///
+/// This is the richer sibling of [`parse_tag`]: it returns the same
+/// `(Id3Tag, usize)` plus an [`ExtendedHeader`] carrying the
+/// `is_update` flag, the verified CRC-32 (when an extended-header
+/// CRC was present), and the typed [`Restrictions`] sub-fields
+/// (when the v2.4 restrictions flag was set). For a tag with no
+/// extended header (header flag bit `0x40` clear) the returned
+/// `ExtendedHeader` is [`ExtendedHeader::default`] — all `false` /
+/// `None`. For v2.3 tags the `is_update` and `restrictions` fields
+/// are always `false` / `None` since those flag bits are v2.4-only.
+pub fn parse_tag_with_extended_header(buf: &[u8]) -> Result<(Id3Tag, ExtendedHeader, usize)> {
+    if buf.len() < ID3V2_HEADER_SIZE {
+        return Err(Error::NeedMore);
+    }
+    if &buf[0..3] != b"ID3" {
+        return Err(Error::invalid("not an ID3v2 tag"));
+    }
+    let major = buf[3];
+    let revision = buf[4];
+    let flags = buf[5];
+    let size = synchsafe_u32(buf[6], buf[7], buf[8], buf[9]) as usize;
+    let footer_present = flags & 0x10 != 0;
+    let total = ID3V2_HEADER_SIZE + size + if footer_present { 10 } else { 0 };
+    if buf.len() < ID3V2_HEADER_SIZE + size {
+        return Err(Error::NeedMore);
+    }
+    let body = &buf[ID3V2_HEADER_SIZE..ID3V2_HEADER_SIZE + size];
+    let version = match major {
+        2 => Id3Version::V2_2,
+        3 => Id3Version::V2_3,
+        4 => Id3Version::V2_4,
+        other => {
+            return Err(Error::unsupported(format!(
+                "unknown ID3v2 major version {other}"
+            )));
+        }
+    };
+
+    if footer_present && !matches!(version, Id3Version::V2_4) {
+        return Err(Error::invalid(
+            "ID3v2 footer flag (0x10) is v2.4-only; rejected on v2.2/v2.3",
+        ));
+    }
+    if footer_present && buf.len() < total {
+        return Err(Error::NeedMore);
+    }
+    if footer_present {
+        let footer = &buf[ID3V2_HEADER_SIZE + size..total];
+        if &footer[0..3] != b"3DI" {
+            return Err(Error::invalid(
+                "ID3v2 footer magic missing: expected b\"3DI\"",
+            ));
+        }
+        if footer[3] != major || footer[4] != revision {
+            return Err(Error::invalid(
+                "ID3v2 footer version/revision does not match header",
+            ));
+        }
+        if footer[5] != flags {
+            return Err(Error::invalid("ID3v2 footer flags do not match header"));
+        }
+        let footer_size = synchsafe_u32(footer[6], footer[7], footer[8], footer[9]) as usize;
+        if footer_size != size {
+            return Err(Error::invalid("ID3v2 footer size does not match header"));
+        }
+    }
+
+    let unsync_whole_tag =
+        (flags & 0x80) != 0 && matches!(version, Id3Version::V2_2 | Id3Version::V2_3);
+    let unsync_v24_body = (flags & 0x80) != 0 && matches!(version, Id3Version::V2_4);
+
+    let body_owned;
+    let mut body: &[u8] = if unsync_whole_tag || unsync_v24_body {
+        body_owned = reverse_unsync(body);
+        &body_owned
+    } else {
+        body
+    };
+
+    let mut ext_header = ExtendedHeader::default();
+    if flags & 0x40 != 0 {
+        let (after, decoded) = parse_extended_header(version, body)?;
+        body = after;
+        ext_header = decoded;
+    }
+
+    let frames = parse_frames(version, body);
+    Ok((Id3Tag { version, frames }, ext_header, total))
 }
 
 /// Peek at the first 10 bytes of a file. Returns `Some(total_size)` —
@@ -1130,7 +1492,7 @@ fn apply_unsync(buf: &[u8]) -> Vec<u8> {
 /// The v2.4 restrictions flag (`d` = 0x10) is consumed but does not
 /// influence parsing — it describes how the tag was *encoded*, not how
 /// to decode it.
-fn parse_extended_header(version: Id3Version, body: &[u8]) -> Result<&[u8]> {
+fn parse_extended_header(version: Id3Version, body: &[u8]) -> Result<(&[u8], ExtendedHeader)> {
     match version {
         Id3Version::V2_3 => {
             if body.len() < 4 {
@@ -1156,6 +1518,7 @@ fn parse_extended_header(version: Id3Version, body: &[u8]) -> Result<&[u8]> {
                     "ID3v2.3 extended header padding size exceeds body",
                 ));
             }
+            let mut decoded = ExtendedHeader::default();
             if crc_present {
                 if ext_size != 10 {
                     return Err(Error::invalid(
@@ -1172,8 +1535,9 @@ fn parse_extended_header(version: Id3Version, body: &[u8]) -> Result<&[u8]> {
                         "ID3v2.3 extended header CRC mismatch: stored={stored:#010x} computed={computed:#010x}"
                     )));
                 }
+                decoded.crc = Some(stored);
             }
-            Ok(after)
+            Ok((after, decoded))
         }
         Id3Version::V2_4 => {
             if body.len() < 4 {
@@ -1215,6 +1579,7 @@ fn parse_extended_header(version: Id3Version, body: &[u8]) -> Result<&[u8]> {
             let mut cursor = 6usize;
             let after = &body[ext_size..];
             let mut stored_crc: Option<u32> = None;
+            let mut stored_restrictions: Option<Restrictions> = None;
             for (flag_present, expected_len, name) in [
                 (update, 0u8, "update"),
                 (crc, 5u8, "crc"),
@@ -1252,6 +1617,11 @@ fn parse_extended_header(version: Id3Version, body: &[u8]) -> Result<&[u8]> {
                         ext[cursor + 4],
                     ));
                 }
+                if name == "restrictions" && data_len == 1 {
+                    // Spec §3.2 sub-field `d`: 1-byte payload `%ppqrrstt`
+                    // decoded into typed sub-fields.
+                    stored_restrictions = Some(Restrictions::from_wire(ext[cursor]));
+                }
                 cursor += data_len;
             }
             if let Some(stored) = stored_crc {
@@ -1266,9 +1636,14 @@ fn parse_extended_header(version: Id3Version, body: &[u8]) -> Result<&[u8]> {
                     )));
                 }
             }
-            Ok(after)
+            let decoded = ExtendedHeader {
+                is_update: update,
+                crc: stored_crc,
+                restrictions: stored_restrictions,
+            };
+            Ok((after, decoded))
         }
-        _ => Ok(body),
+        _ => Ok((body, ExtendedHeader::default())),
     }
 }
 
@@ -1306,8 +1681,14 @@ fn crc32_from_synchsafe5(a: u8, b: u8, c: u8, d: u8, e: u8) -> u32 {
 /// CRC fits in 32 bits).
 fn crc32_to_synchsafe5(crc: u32) -> [u8; 5] {
     let v = crc as u64;
+    // 5 synchsafe bytes carry 35 bits (5 * 7). A u32 CRC uses 32
+    // bits, so the top three of the 35 are always zero. The
+    // top synchsafe byte carries bits 31..=28 of the CRC plus three
+    // padding zero bits above them — mask is `0x0F`, not `0x07`,
+    // since bit 31 is part of the CRC payload and must survive a
+    // large CRC value (top bit set).
     [
-        ((v >> 28) & 0x07) as u8, // top 4 bits ride here; remaining 3 unused
+        ((v >> 28) & 0x0F) as u8,
         ((v >> 21) & 0x7F) as u8,
         ((v >> 14) & 0x7F) as u8,
         ((v >> 7) & 0x7F) as u8,
@@ -3274,6 +3655,27 @@ pub struct WriteOptions {
     /// reversed bytes, so the round-trip is exact for any combination
     /// of `crc` and `with_unsync`.
     pub crc: bool,
+    /// Set the v2.4 extended-header "Tag is an update" flag (spec
+    /// §3.2 sub-field `b`). Default `false`. v2.4-only — the writer
+    /// returns [`Error::unsupported`] if requested under a v2.3
+    /// target, matching the `with_footer` / `with_restrictions`
+    /// v2.4-only rejection pattern.
+    ///
+    /// Setting `is_update = true` (or `restrictions = Some(...)`)
+    /// causes the writer to emit an extended header even when
+    /// `crc = false`, so flags can be carried independently of the
+    /// CRC.
+    pub is_update: bool,
+    /// Emit the v2.4 extended-header restrictions byte (spec §3.2
+    /// sub-field `d`). Default `None` (no restrictions byte
+    /// emitted). v2.4-only — the writer returns
+    /// [`Error::unsupported`] if requested under a v2.3 target.
+    ///
+    /// Per spec the restrictions are advisory: they describe how
+    /// the tag was restricted before encoding, not how the parser
+    /// should decode it. This crate's parser preserves them
+    /// losslessly without enforcing them.
+    pub restrictions: Option<Restrictions>,
     /// Emit an ID3v2.4 footer (spec §3.4). Default `false`.
     ///
     /// When set, the tag-header bit 0x10 is set and a 10-byte trailer
@@ -3318,6 +3720,23 @@ impl WriteOptions {
         self.footer = enabled;
         self
     }
+
+    /// Builder-style setter for the v2.4 extended-header "Tag is an
+    /// update" flag (spec §3.2 sub-field `b`). v2.4-only — see
+    /// [`WriteOptions::is_update`].
+    pub fn with_update(mut self, enabled: bool) -> Self {
+        self.is_update = enabled;
+        self
+    }
+
+    /// Builder-style setter for the v2.4 extended-header restrictions
+    /// byte (spec §3.2 sub-field `d`). Pass `Some(r)` to emit the
+    /// 1-byte `%ppqrrstt` restrictions advisory, `None` to omit it.
+    /// v2.4-only — see [`WriteOptions::restrictions`].
+    pub fn with_restrictions(mut self, restrictions: Option<Restrictions>) -> Self {
+        self.restrictions = restrictions;
+        self
+    }
 }
 
 /// Serialise an [`Id3Tag`] to the ID3v2 wire format with caller-supplied
@@ -3359,6 +3778,22 @@ pub fn write_tag_with_options(
         ));
     }
 
+    // The "Tag is an update" flag and the restrictions byte are
+    // both v2.4-only extended-header sub-fields (spec §3.2 sub-fields
+    // `b` and `d`); v2.3 has no slot for them. Reject loudly so a
+    // caller asking for either gets a clear error rather than a
+    // silent drop.
+    if options.is_update && !matches!(target_version, Id3Version::V2_4) {
+        return Err(Error::unsupported(
+            "ID3v2 extended-header `is_update` flag is v2.4-only; set target_version = V2_4 or clear is_update",
+        ));
+    }
+    if options.restrictions.is_some() && !matches!(target_version, Id3Version::V2_4) {
+        return Err(Error::unsupported(
+            "ID3v2 extended-header restrictions byte is v2.4-only; set target_version = V2_4 or clear restrictions",
+        ));
+    }
+
     // PerFrame is v2.4-only (v2.3 lacks the per-frame format-flag
     // byte the spec defines the bit in). Downgrade silently to
     // WholeTag rather than erroring — callers asked for "unsync"
@@ -3381,8 +3816,19 @@ pub fn write_tag_with_options(
     // ("calculated before unsynchronisation"), and for v2.4 it is the
     // natural interpretation since the parser always reverses unsync
     // before walking the extended header.
-    let ext_header = if options.crc {
-        Some(build_extended_header_crc(target_version, &frame_bytes)?)
+    // Emit an extended header when any of the optional sub-fields
+    // (`crc`, `is_update`, `restrictions`) is requested. v2.3 only
+    // recognises the CRC sub-field; the parser-side gate above
+    // ensures `is_update` / `restrictions` never reach here under
+    // v2.3, so a `crc=false` request alone never produces an ext
+    // header.
+    let want_ext_header = options.crc || options.is_update || options.restrictions.is_some();
+    let ext_header = if want_ext_header {
+        Some(build_extended_header(
+            target_version,
+            &frame_bytes,
+            options,
+        )?)
     } else {
         None
     };
@@ -3559,10 +4005,27 @@ fn write_v1_field(dst: &mut [u8], s: &str) {
 /// 05               — CRC attached-data length
 /// xx xx xx xx xx   — CRC-32 as 5 * %0xxxxxxx (35-bit synchsafe)
 /// ```
-fn build_extended_header_crc(target_version: Id3Version, frame_bytes: &[u8]) -> Result<Vec<u8>> {
-    let crc = crc32_iso3309(frame_bytes);
+fn build_extended_header(
+    target_version: Id3Version,
+    frame_bytes: &[u8],
+    options: &WriteOptions,
+) -> Result<Vec<u8>> {
     match target_version {
         Id3Version::V2_3 => {
+            // v2.3 spec §3.2 defines a single optional extended-header
+            // sub-field: a 4-byte CRC. There is no "is_update" / no
+            // restrictions byte in v2.3; the caller-facing options
+            // for those are gated to v2.4 upstream of this call so
+            // they cannot reach here under v2.3.
+            if !options.crc {
+                // The upstream gate keeps us here only when at least
+                // one ext-header sub-field is requested, and under
+                // v2.3 the only one available is `crc`.
+                return Err(Error::invalid(
+                    "ID3v2.3 extended header requires at least the CRC sub-field",
+                ));
+            }
+            let crc = crc32_iso3309(frame_bytes);
             let mut out = Vec::with_capacity(14);
             // size = 10 (excludes itself), so total ext-area = 4 + 10 = 14
             out.extend_from_slice(&10u32.to_be_bytes());
@@ -3576,24 +4039,68 @@ fn build_extended_header_crc(target_version: Id3Version, frame_bytes: &[u8]) -> 
             Ok(out)
         }
         Id3Version::V2_4 => {
-            let mut out = Vec::with_capacity(12);
-            // size = 12 (INCLUDES itself), synchsafe
-            let s: u32 = 12;
+            // v2.4 spec §3.2: the extended header carries an optional
+            // mix of three flag sub-fields, in this fixed order on the
+            // wire: `b` (update, 0-byte attached data), `c` (CRC,
+            // 5-byte attached data), `d` (restrictions, 1-byte
+            // attached data). The `is_update` flag has no attached
+            // data and its flag bit alone carries the signal.
+            let mut ext_flags: u8 = 0;
+            // %0bcd0000
+            if options.is_update {
+                ext_flags |= 0x40;
+            }
+            if options.crc {
+                ext_flags |= 0x20;
+            }
+            if options.restrictions.is_some() {
+                ext_flags |= 0x10;
+            }
+            // Body bytes that follow the (size, num_flag_bytes,
+            // flags) trio. Per spec the attached data is laid out in
+            // flag-bit order — b, c, d — each prefixed by a 1-byte
+            // data-length.
+            let mut attached: Vec<u8> = Vec::new();
+            if options.is_update {
+                // Spec §3.2 sub-field `b`: "Flag data length $00".
+                attached.push(0x00);
+            }
+            if options.crc {
+                attached.push(0x05);
+                let crc = crc32_iso3309(frame_bytes);
+                attached.extend_from_slice(&crc32_to_synchsafe5(crc));
+            }
+            if let Some(restrictions) = options.restrictions {
+                attached.push(0x01);
+                attached.push(restrictions.to_wire());
+            }
+            // Total ext-header size INCLUDES the 4 synchsafe size
+            // bytes plus the (num_flag_bytes, flags) pair plus the
+            // attached data.
+            let total = 4 + 2 + attached.len();
+            // Synchsafe 28-bit fits any practical ext-header size
+            // (the largest legal here is 4 + 2 + 1 + 1 + 6 + 2 = 16
+            // bytes), but assert the spec's lower bound anyway.
+            if total < 6 {
+                return Err(Error::invalid(
+                    "ID3v2.4 extended header size underflowed the 6-byte minimum",
+                ));
+            }
+            let s = total as u32;
+            let mut out = Vec::with_capacity(total);
             out.push(((s >> 21) & 0x7F) as u8);
             out.push(((s >> 14) & 0x7F) as u8);
             out.push(((s >> 7) & 0x7F) as u8);
             out.push((s & 0x7F) as u8);
-            // number of flag bytes
+            // number of flag bytes — spec says "$01" for the current
+            // single-byte flags layout.
             out.push(0x01);
-            // extended flags: %00100000 (c = CRC present)
-            out.push(0x20);
-            // CRC attached data: length byte $05, then 5 synchsafe bytes
-            out.push(0x05);
-            out.extend_from_slice(&crc32_to_synchsafe5(crc));
+            out.push(ext_flags);
+            out.extend_from_slice(&attached);
             Ok(out)
         }
         _ => Err(Error::invalid(
-            "extended-header CRC emission requires v2.3 or v2.4",
+            "extended-header emission requires v2.3 or v2.4",
         )),
     }
 }
