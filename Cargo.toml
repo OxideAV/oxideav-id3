@@ -15,3 +15,21 @@ categories = ["multimedia::audio", "parser-implementations"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[dev-dependencies]
+# Round 209 (depth-mode benchmarks): Criterion drives the `id3` bench
+# harness in `benches/id3.rs` that future rounds use to A/B parser /
+# writer tweaks (extended-header walk, frame-size accounting, picture
+# payload copy, key/value flattening). Pinned to the same 0.5 line the
+# other OxideAV crates with benches (flac, cinepak, tta, magicyuv,
+# h264, pixfmt) already track.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# Round 209 bench. Self-contained: every byte fixture is hand-built in
+# the bench from a deterministic xorshift seed using the wire layout
+# described in `docs/container/id3/id3v2.4.0-structure.html`. No
+# committed fixture files. Run with:
+#     cargo bench -p oxideav-id3 --bench id3
+[[bench]]
+name = "id3"
+harness = false

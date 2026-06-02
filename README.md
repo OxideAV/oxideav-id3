@@ -362,6 +362,34 @@ CI workflow (`.github/workflows/fuzz.yml`) runs the target for a
 cd fuzz && cargo +nightly fuzz run parse
 ```
 
+## Benchmarks
+
+A Criterion harness lives at `benches/id3.rs` and covers the three
+public surfaces a typical caller exercises on an MP3-resident tag:
+`parse_tag` (under both structural-overhead and picture-copy
+shapes), `write_tag`, and `parse_id3v1`. Every input fixture is
+hand-built in the bench from the wire layout described in spec §3
+and §4, and the 60 KiB APIC payload is seeded by a fixed-seed
+xorshift so the compiler cannot constant-fold the per-iteration copy.
+
+Host: `aarch64-darwin`, release profile, Criterion default sampling
+(100 samples × 3 s measurement window). Numbers below are the
+median of one local run; deltas vs this baseline are what later
+rounds will quote.
+
+| Bench                       | Drives                                                | Median time | Throughput |
+| --------------------------- | ----------------------------------------------------- | ----------: | ---------: |
+| `parse_minimal_v24/parse`   | `tag_size_at_head` → `parse_tag` → `to_key_value_pairs` (~135 B tag) |   966 ns | 139 MiB/s |
+| `parse_apic_heavy_v24/parse`| `parse_tag` over a ~60 KiB APIC frame (memcpy-bound) |    1.58 µs |  36 GiB/s |
+| `write_text_v24/write`      | `write_tag` round-trip of the minimal-v24 fixture    |     486 ns | 277 MiB/s |
+| `parse_id3v1/parse`         | `parse_id3v1` over the 128-byte trailer              |     512 ns | 238 MiB/s |
+
+Run with:
+
+```sh
+cargo bench -p oxideav-id3 --bench id3
+```
+
 ## License
 
 MIT - see [LICENSE](LICENSE).

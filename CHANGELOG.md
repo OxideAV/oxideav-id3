@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Criterion bench harness at `benches/id3.rs` covering the three
+  public surfaces a typical caller exercises on an MP3-resident tag:
+  `bench_parse_minimal_v24` drives `tag_size_at_head` → `parse_tag` →
+  `to_key_value_pairs` over a hand-built ~135-byte v2.4 tag (TIT2 /
+  TPE1 / TALB text frames + one short COMM, exercising spec §3.1
+  header walk, §4.1 frame walk, §4.2 text-frame decode, and §4.10
+  comment-frame decode); `bench_parse_apic_heavy_v24` drives
+  `parse_tag` over a ~64 KiB v2.4 tag whose dominant cost is the
+  inner 60 KiB APIC picture copy (spec §4.14 — encoding byte +
+  NUL-terminated MIME + picture-type byte + description + picture
+  bytes) so MiB/s reflects the picture-copy bandwidth ceiling rather
+  than structural overhead; `bench_write_text_v24` round-trips the
+  minimal-v24 fixture through `write_tag` with the default
+  `WriteOptions`, isolating the write surface from the parse cost
+  (the parse step lives outside the timed region) and reporting
+  throughput against the produced output length; `bench_parse_id3v1`
+  parses the 128-byte trailer (spec layout: `TAG` + 30 title + 30
+  artist + 30 album + 4 year + 28 comment + 1 zero + 1 track + 1
+  genre) as the baseline-floor measurement. Every fixture is
+  hand-built in the bench from the wire layout described in
+  `docs/container/id3/id3v2.4.0-structure.html` and
+  `docs/container/id3/id3v2.4.0-frames.html`; the 60 KiB picture
+  payload is seeded by a fixed-seed xorshift32 so the compiler
+  cannot constant-fold the per-iteration copy out of the timed
+  region. Criterion drives all four scenarios via a single
+  `criterion_group!` in `benches/id3.rs`; `[[bench]]` table with
+  `harness = false` in `Cargo.toml` and Criterion is added as a
+  `[dev-dependencies]` pin to `0.5` matching the other OxideAV crates
+  with benches. Run with `cargo bench -p oxideav-id3 --bench id3`.
+  README now carries a `## Benchmarks` section publishing the
+  baseline numbers from this machine so future rounds can quote
+  deltas against a fixed reference point.
+
 - v2.4 extended-header sub-fields surfaced via the new
   `parse_tag_with_extended_header` entry point and emitted via two
   new `WriteOptions` builders (`with_update`, `with_restrictions`).
