@@ -381,6 +381,28 @@ never silently drops data.
   union via `involved_people()` from `IPLS`, splits roles vs
   instruments by inspection, then writes back as separate `TIPL` and
   `TMCL` text frames.
+- `Id3Frame::sylt_content_type()` returns a typed `SyltContentType`
+  (`Other` / `Lyrics` / `TextTranscription` / `MovementPartName` /
+  `Events` / `Chord` / `Trivia` / `UrlsToWebpages` / `UrlsToImages`)
+  for the `SYLT` content-type byte (spec v2.3 §4.10 / v2.4 §4.9). The
+  byte sits between the time-stamp format and the content descriptor
+  and categorises what kind of synchronised text the frame carries
+  (song lyrics, chord names, movement labels, …); the typed accessor
+  lets callers route on the categorical meaning without re-decoding
+  the raw `u8`. `from_wire` / `to_wire` form a bijection over the
+  spec range `$00..=$08` — any reserved byte surfaces structurally as
+  `None` rather than mapping to a guessed variant, matching the
+  cross-version posture of [`Id3Frame::timestamp_unit`].
+- `Id3Frame::commercial_delivery()` returns a typed
+  `CommercialDelivery` (`Other` / `StandardCdAlbum` /
+  `CompressedAudioOnCd` / `FileOverInternet` / `StreamOverInternet` /
+  `NoteSheets` / `NoteSheetsInBook` / `MusicOnOtherMedia` /
+  `NonMusicalMerchandise`) for the `COMR` "received as" byte (spec
+  v2.3 §4.25 / v2.4 §4.24). The byte describes how the audio is
+  delivered when bought; the wire mapping is identical between v2.3
+  and v2.4 so the accessor is version-independent. As with the SYLT
+  accessor, `from_wire` / `to_wire` are a bijection over the spec
+  range `$00..=$08` and any reserved byte surfaces as `None`.
 
 ## Fuzzing
 

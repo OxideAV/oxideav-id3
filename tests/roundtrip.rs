@@ -6,10 +6,10 @@
 use oxideav_core::{AttachedPicture, PictureType};
 use oxideav_id3::{
     attached_pictures, parse_id3v1, parse_tag, parse_tag_with_extended_header, to_key_value_pairs,
-    write_id3v1, write_tag, write_tag_with_options, EquaBand, Id3Frame, Id3Tag, Id3Version,
-    ImageEncodingRestriction, ImageSizeRestriction, Restrictions, Rva2Channel, RvadBackChannels,
-    RvadChannel, RvadFrontChannels, TagSizeRestriction, TextEncodingRestriction,
-    TextFieldsRestriction, TimestampUnit, UnsyncMode, WriteOptions,
+    write_id3v1, write_tag, write_tag_with_options, CommercialDelivery, EquaBand, Id3Frame, Id3Tag,
+    Id3Version, ImageEncodingRestriction, ImageSizeRestriction, Restrictions, Rva2Channel,
+    RvadBackChannels, RvadChannel, RvadFrontChannels, SyltContentType, TagSizeRestriction,
+    TextEncodingRestriction, TextFieldsRestriction, TimestampUnit, UnsyncMode, WriteOptions,
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
@@ -2912,4 +2912,185 @@ fn tipl_empty_distinguishes_from_absent() {
         values: vec!["Song".into()],
     };
     assert!(absent.involved_people().is_none());
+}
+
+/// `SyltContentType::from_wire` covers every spec value `$00..=$08`
+/// and refuses any reserved byte by returning `None`. Round-trips
+/// through `to_wire` recover the original byte for every variant —
+/// the bijection over the spec range matches the contract on
+/// [`TimestampUnit`] and [`Restrictions`].
+#[test]
+fn sylt_content_type_wire_bijection() {
+    let spec_pairs = [
+        (0u8, SyltContentType::Other),
+        (1, SyltContentType::Lyrics),
+        (2, SyltContentType::TextTranscription),
+        (3, SyltContentType::MovementPartName),
+        (4, SyltContentType::Events),
+        (5, SyltContentType::Chord),
+        (6, SyltContentType::Trivia),
+        (7, SyltContentType::UrlsToWebpages),
+        (8, SyltContentType::UrlsToImages),
+    ];
+    for (wire, typed) in spec_pairs {
+        assert_eq!(SyltContentType::from_wire(wire), Some(typed));
+        assert_eq!(typed.to_wire(), wire);
+    }
+    // Anything outside the spec range surfaces structurally as None.
+    for reserved in 9u8..=255 {
+        assert!(
+            SyltContentType::from_wire(reserved).is_none(),
+            "reserved SYLT content_type ${reserved:02x} unexpectedly decoded"
+        );
+    }
+}
+
+/// `Id3Frame::sylt_content_type` decodes the content-type byte of a
+/// `SyncedLyrics` frame and returns `None` for any other variant or
+/// any reserved wire byte. The accessor mirrors the cross-variant
+/// posture of [`Id3Frame::timestamp_unit`].
+#[test]
+fn sylt_content_type_accessor_decodes_lyrics() {
+    let frame = Id3Frame::SyncedLyrics {
+        lang: *b"eng",
+        time_format: 2,
+        content_type: 1,
+        description: "lyrics".into(),
+        syncs: vec![("Hello".into(), 0)],
+    };
+    assert_eq!(frame.sylt_content_type(), Some(SyltContentType::Lyrics));
+
+    let chord = Id3Frame::SyncedLyrics {
+        lang: *b"eng",
+        time_format: 2,
+        content_type: 5,
+        description: "chords".into(),
+        syncs: vec![("Bb".into(), 0)],
+    };
+    assert_eq!(chord.sylt_content_type(), Some(SyltContentType::Chord));
+
+    let reserved = Id3Frame::SyncedLyrics {
+        lang: *b"eng",
+        time_format: 2,
+        content_type: 9,
+        description: "future".into(),
+        syncs: vec![],
+    };
+    assert_eq!(reserved.sylt_content_type(), None);
+
+    let other = Id3Frame::Text {
+        id: "TIT2".into(),
+        values: vec!["Song".into()],
+    };
+    assert_eq!(other.sylt_content_type(), None);
+}
+
+/// A round-trip writer→parser preserves the SYLT content_type byte so
+/// the typed accessor sees the same variant after re-parsing.
+#[test]
+fn sylt_content_type_roundtrips_v23_and_v24() {
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        let tag = Id3Tag {
+            version,
+            frames: vec![Id3Frame::SyncedLyrics {
+                lang: *b"eng",
+                time_format: 2,
+                content_type: SyltContentType::MovementPartName.to_wire(),
+                description: "movement".into(),
+                syncs: vec![("Adagio".into(), 0), ("Allegro".into(), 4_000)],
+            }],
+        };
+        let bytes = write_tag(&tag, version).expect("write");
+        let (parsed, _) = parse_tag(&bytes).expect("parse");
+        let kind = parsed
+            .frames
+            .iter()
+            .find_map(Id3Frame::sylt_content_type)
+            .expect("SYLT content type surfaces after round-trip");
+        assert_eq!(kind, SyltContentType::MovementPartName);
+    }
+}
+
+/// `CommercialDelivery::from_wire` covers every spec value
+/// `$00..=$08` and rejects any reserved byte. The `to_wire`
+/// counterpart recovers the original byte for every variant.
+#[test]
+fn commercial_delivery_wire_bijection() {
+    let spec_pairs = [
+        (0u8, CommercialDelivery::Other),
+        (1, CommercialDelivery::StandardCdAlbum),
+        (2, CommercialDelivery::CompressedAudioOnCd),
+        (3, CommercialDelivery::FileOverInternet),
+        (4, CommercialDelivery::StreamOverInternet),
+        (5, CommercialDelivery::NoteSheets),
+        (6, CommercialDelivery::NoteSheetsInBook),
+        (7, CommercialDelivery::MusicOnOtherMedia),
+        (8, CommercialDelivery::NonMusicalMerchandise),
+    ];
+    for (wire, typed) in spec_pairs {
+        assert_eq!(CommercialDelivery::from_wire(wire), Some(typed));
+        assert_eq!(typed.to_wire(), wire);
+    }
+    for reserved in 9u8..=255 {
+        assert!(
+            CommercialDelivery::from_wire(reserved).is_none(),
+            "reserved COMR received_as ${reserved:02x} unexpectedly decoded"
+        );
+    }
+}
+
+/// `Id3Frame::commercial_delivery` returns `Some(mode)` for a COMR
+/// frame whose `received_as` is in the spec range and `None` for any
+/// other variant or any reserved byte. Round-tripping a COMR through
+/// the writer/parser preserves the byte so the accessor sees the same
+/// variant after parsing.
+#[test]
+fn commercial_delivery_accessor_and_roundtrip() {
+    let comr = Id3Frame::Commercial {
+        price: "USD9.99".into(),
+        valid_until: "20300101".into(),
+        contact_url: "https://shop.example/contact".into(),
+        received_as: CommercialDelivery::FileOverInternet.to_wire(),
+        seller: "Example Music Shop".into(),
+        description: "Single-track download".into(),
+        logo_mime: String::new(),
+        logo_data: Vec::new(),
+    };
+    assert_eq!(
+        comr.commercial_delivery(),
+        Some(CommercialDelivery::FileOverInternet)
+    );
+
+    let reserved = Id3Frame::Commercial {
+        price: "USD0".into(),
+        valid_until: "20300101".into(),
+        contact_url: "https://shop.example".into(),
+        received_as: 200,
+        seller: "Shop".into(),
+        description: "Desc".into(),
+        logo_mime: String::new(),
+        logo_data: Vec::new(),
+    };
+    assert_eq!(reserved.commercial_delivery(), None);
+
+    let other = Id3Frame::Text {
+        id: "TIT2".into(),
+        values: vec!["Song".into()],
+    };
+    assert_eq!(other.commercial_delivery(), None);
+
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        let tag = Id3Tag {
+            version,
+            frames: vec![comr.clone()],
+        };
+        let bytes = write_tag(&tag, version).expect("write");
+        let (parsed, _) = parse_tag(&bytes).expect("parse");
+        let mode = parsed
+            .frames
+            .iter()
+            .find_map(Id3Frame::commercial_delivery)
+            .expect("COMR commercial_delivery surfaces after round-trip");
+        assert_eq!(mode, CommercialDelivery::FileOverInternet);
+    }
 }

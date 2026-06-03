@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed accessors `Id3Frame::sylt_content_type()` and
+  `Id3Frame::commercial_delivery()` for the enumerated bytes carried
+  by `SYLT` (spec v2.3 §4.10 / v2.4 §4.9, "Content type") and `COMR`
+  (spec v2.3 §4.25 / v2.4 §4.24, "Received as"). Both decode to
+  spec-shaped enums (`SyltContentType` with the nine §4.9 values:
+  `Other` / `Lyrics` / `TextTranscription` / `MovementPartName` /
+  `Events` / `Chord` / `Trivia` / `UrlsToWebpages` / `UrlsToImages`;
+  `CommercialDelivery` with the nine §4.24 values: `Other` /
+  `StandardCdAlbum` / `CompressedAudioOnCd` / `FileOverInternet` /
+  `StreamOverInternet` / `NoteSheets` / `NoteSheetsInBook` /
+  `MusicOnOtherMedia` / `NonMusicalMerchandise`); both enums expose
+  `from_wire` / `to_wire` forming a bijection over the spec range
+  `$00..=$08` and returning `None` for any reserved byte so a
+  non-conforming source surfaces structurally rather than mapping to
+  a guessed variant — matching the contract `TimestampUnit` and
+  `Restrictions` already publish. Both accessors return `None` for
+  any other `Id3Frame` variant, matching the cross-variant posture of
+  `Id3Frame::timestamp_unit`. The COMR mapping is identical between
+  v2.3 and v2.4 so the accessor is version-independent; the SYLT
+  byte's spec range extended from `$06` (v2.3 §4.10) to `$08` in
+  v2.4 §4.9, but the wire byte is unambiguous so the accessor
+  ignores the cross-version section-number rename. Round-trip tests
+  cover both accessors under both v2.3 and v2.4 envelopes plus
+  exhaustive wire-bijection coverage over the `$00..=$08` spec range
+  and the reserved-byte rejection over `$09..=$FF`.
 - `to_key_value_pairs` now maps the v2.4 spec §4.2 text frames the
   prior table dropped to Vorbis-style keys: §4.2.5 timestamp class
   (`TDEN` → `encodingtime`, `TDTG` → `taggingtime`); §4.2.3

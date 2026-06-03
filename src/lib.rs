@@ -663,6 +663,141 @@ impl TimestampUnit {
     }
 }
 
+/// Typed view of the `SYLT` "content type" byte (spec v2.3 §4.10 /
+/// v2.4 §4.9). The byte sits between the `time_stamp_format` and the
+/// content descriptor; its nine spec-defined values describe what
+/// kind of text the synchronised payload carries (lyrics, chord
+/// names, event labels, …). Returned by [`Id3Frame::sylt_content_type`];
+/// see [`SyltContentType::from_wire`] for the wire mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyltContentType {
+    /// `$00` per spec — "other" (catch-all when none of the more
+    /// specific labels fits).
+    Other,
+    /// `$01` per spec — "lyrics" (song lyrics, the typical SYLT use).
+    Lyrics,
+    /// `$02` per spec — "text transcription" (e.g. dialogue
+    /// transcribed for an audiobook).
+    TextTranscription,
+    /// `$03` per spec — "movement/part name" (e.g. `"Adagio"`).
+    MovementPartName,
+    /// `$04` per spec — "events" (e.g. `"Don Quijote enters the
+    /// stage"`).
+    Events,
+    /// `$05` per spec — "chord" (e.g. `"Bb F Fsus"`).
+    Chord,
+    /// `$06` per spec — "trivia/'pop up' information".
+    Trivia,
+    /// `$07` per spec — "URLs to webpages". V2.4-only per the v2.4
+    /// frames doc's nine-value list; v2.3's spec §4.10 stops at `$06`.
+    UrlsToWebpages,
+    /// `$08` per spec — "URLs to images". V2.4-only per the v2.4
+    /// frames doc's nine-value list; v2.3's spec §4.10 stops at `$06`.
+    UrlsToImages,
+}
+
+impl SyltContentType {
+    /// Decode a raw SYLT `content_type` byte. Returns `None` for any
+    /// value outside the `$00..=$08` range — a non-conforming source
+    /// (reserved byte) surfaces structurally rather than mapping to a
+    /// guessed variant.
+    pub fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(SyltContentType::Other),
+            1 => Some(SyltContentType::Lyrics),
+            2 => Some(SyltContentType::TextTranscription),
+            3 => Some(SyltContentType::MovementPartName),
+            4 => Some(SyltContentType::Events),
+            5 => Some(SyltContentType::Chord),
+            6 => Some(SyltContentType::Trivia),
+            7 => Some(SyltContentType::UrlsToWebpages),
+            8 => Some(SyltContentType::UrlsToImages),
+            _ => None,
+        }
+    }
+
+    /// Encode this content type back to the raw wire byte (`$00..=$08`).
+    pub fn to_wire(self) -> u8 {
+        match self {
+            SyltContentType::Other => 0,
+            SyltContentType::Lyrics => 1,
+            SyltContentType::TextTranscription => 2,
+            SyltContentType::MovementPartName => 3,
+            SyltContentType::Events => 4,
+            SyltContentType::Chord => 5,
+            SyltContentType::Trivia => 6,
+            SyltContentType::UrlsToWebpages => 7,
+            SyltContentType::UrlsToImages => 8,
+        }
+    }
+}
+
+/// Typed view of the `COMR` "received as" byte (spec v2.3 §4.25 /
+/// v2.4 §4.24). The byte sits between the contact URL and the seller
+/// name; its nine spec-defined values describe the delivery mode of
+/// the purchase. The enum mirrors the spec list verbatim and is
+/// surfaced via [`Id3Frame::commercial_delivery`]; see
+/// [`CommercialDelivery::from_wire`] for the wire mapping. The
+/// mapping is identical between v2.3 and v2.4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommercialDelivery {
+    /// `$00` per spec — "Other" (catch-all for delivery modes the
+    /// enumeration doesn't cover).
+    Other,
+    /// `$01` per spec — "Standard CD album with other songs".
+    StandardCdAlbum,
+    /// `$02` per spec — "Compressed audio on CD".
+    CompressedAudioOnCd,
+    /// `$03` per spec — "File over the Internet".
+    FileOverInternet,
+    /// `$04` per spec — "Stream over the Internet".
+    StreamOverInternet,
+    /// `$05` per spec — "As note sheets".
+    NoteSheets,
+    /// `$06` per spec — "As note sheets in a book with other sheets".
+    NoteSheetsInBook,
+    /// `$07` per spec — "Music on other media".
+    MusicOnOtherMedia,
+    /// `$08` per spec — "Non-musical merchandise".
+    NonMusicalMerchandise,
+}
+
+impl CommercialDelivery {
+    /// Decode a raw COMR `received_as` byte. Returns `None` for any
+    /// value outside the `$00..=$08` range so a reserved byte surfaces
+    /// structurally rather than mapping to a guessed variant.
+    pub fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(CommercialDelivery::Other),
+            1 => Some(CommercialDelivery::StandardCdAlbum),
+            2 => Some(CommercialDelivery::CompressedAudioOnCd),
+            3 => Some(CommercialDelivery::FileOverInternet),
+            4 => Some(CommercialDelivery::StreamOverInternet),
+            5 => Some(CommercialDelivery::NoteSheets),
+            6 => Some(CommercialDelivery::NoteSheetsInBook),
+            7 => Some(CommercialDelivery::MusicOnOtherMedia),
+            8 => Some(CommercialDelivery::NonMusicalMerchandise),
+            _ => None,
+        }
+    }
+
+    /// Encode this delivery mode back to the raw wire byte
+    /// (`$00..=$08`).
+    pub fn to_wire(self) -> u8 {
+        match self {
+            CommercialDelivery::Other => 0,
+            CommercialDelivery::StandardCdAlbum => 1,
+            CommercialDelivery::CompressedAudioOnCd => 2,
+            CommercialDelivery::FileOverInternet => 3,
+            CommercialDelivery::StreamOverInternet => 4,
+            CommercialDelivery::NoteSheets => 5,
+            CommercialDelivery::NoteSheetsInBook => 6,
+            CommercialDelivery::MusicOnOtherMedia => 7,
+            CommercialDelivery::NonMusicalMerchandise => 8,
+        }
+    }
+}
+
 impl Id3Frame {
     /// Typed accessor for the `time_stamp_format` byte carried by the
     /// frames whose spec layout opens with one (`ETCO`, `SYTC`, `SYLT`,
@@ -739,6 +874,45 @@ impl Id3Frame {
     pub fn musician_credits(&self) -> Option<Vec<(String, String)>> {
         match self {
             Id3Frame::Text { id, values } if id == "TMCL" => Some(pair_alternating(values)),
+            _ => None,
+        }
+    }
+
+    /// Typed accessor for the `SYLT` "content type" byte (spec v2.3
+    /// §4.10 / v2.4 §4.9). Returns `Some(kind)` when the wire byte is
+    /// one of the spec-defined `$00..=$08` values, `None` for any
+    /// other variant or any reserved wire byte. Lets callers route on
+    /// the categorical meaning (lyrics vs. chord vs. event labels,
+    /// …) without re-decoding the raw `u8`.
+    ///
+    /// Mirrors the cross-version posture of [`Id3Frame::timestamp_unit`]:
+    /// the wire byte is shared between v2.3 and v2.4 except that v2.3
+    /// stops at `$06` (Trivia) while v2.4 adds `$07` (URLs to webpages)
+    /// and `$08` (URLs to images). A v2.3 source carrying `$07` or
+    /// `$08` is rare and not strictly conformant — the accessor still
+    /// surfaces the typed variant since the wire byte is unambiguous,
+    /// matching how `timestamp_unit` ignores the cross-version
+    /// section-number rename.
+    pub fn sylt_content_type(&self) -> Option<SyltContentType> {
+        match self {
+            Id3Frame::SyncedLyrics { content_type, .. } => {
+                SyltContentType::from_wire(*content_type)
+            }
+            _ => None,
+        }
+    }
+
+    /// Typed accessor for the `COMR` "received as" byte (spec v2.3
+    /// §4.25 / v2.4 §4.24). Returns `Some(mode)` when the wire byte
+    /// is one of the spec-defined `$00..=$08` delivery modes (Other,
+    /// CD album, file over Internet, stream, note sheets, …),
+    /// `None` for any other variant or any reserved wire byte. Lets
+    /// callers route on the categorical delivery mode without
+    /// re-decoding the raw `u8`. The wire byte is identical between
+    /// v2.3 and v2.4 so the accessor is version-independent.
+    pub fn commercial_delivery(&self) -> Option<CommercialDelivery> {
+        match self {
+            Id3Frame::Commercial { received_as, .. } => CommercialDelivery::from_wire(*received_as),
             _ => None,
         }
     }
