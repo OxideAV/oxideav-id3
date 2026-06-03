@@ -680,6 +680,89 @@ impl Id3Frame {
         };
         TimestampUnit::from_wire(wire)
     }
+
+    /// Typed accessor for the spec §4.2.2 "involved persons" pairs
+    /// carried by the v2.4 `TIPL` text frame (involved-people list,
+    /// role-to-name mapping) and the v2.3 `IPLS` structural frame.
+    /// Returns `Some(pairs)` for both, `None` for any other variant.
+    ///
+    /// Spec wording (v2.4 §4.2.2, `TIPL`):
+    /// "The 'Involved people list' is very similar to the musician
+    /// credits list, but maps between functions, like producer, and
+    /// names." The on-wire layout is the text-frame encoding byte
+    /// followed by alternating NUL-terminated strings —
+    /// `role_0\0 name_0\0 role_1\0 name_1\0 …`. The existing text-frame
+    /// parser already splits on NUL into `values`; this accessor folds
+    /// adjacent entries back into `(role, name)` pairs. A non-conforming
+    /// odd-count source (trailing role with no name) folds into a pair
+    /// with an empty name, matching how [`Id3Frame::Ipls`] surfaces the
+    /// same truncation on the parser side.
+    ///
+    /// The v2.3 → v2.4 evolution drops `IPLS` in favour of `TIPL` (and
+    /// adds `TMCL`, see [`Id3Frame::musician_credits`]); presenting both
+    /// through one accessor lets callers handle either source version
+    /// without matching on the underlying variant, matching the
+    /// cross-version posture of [`Id3Frame::timestamp_unit`]. For a
+    /// `TIPL` text frame whose `values` is empty, returns
+    /// `Some(Vec::new())` so the caller can still distinguish "frame
+    /// present but empty" from "frame absent".
+    pub fn involved_people(&self) -> Option<Vec<(String, String)>> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TIPL" => Some(pair_alternating(values)),
+            Id3Frame::Ipls { pairs } => Some(pairs.clone()),
+            _ => None,
+        }
+    }
+
+    /// Typed accessor for the spec §4.2.2 "musician credits" pairs
+    /// carried by the v2.4 `TMCL` text frame. Returns `Some(pairs)` of
+    /// `(instrument, performer)` for `TMCL`, and `None` for any other
+    /// variant — including `TIPL` / `IPLS`, which encode a *different*
+    /// mapping (function-to-name rather than instrument-to-musician)
+    /// and surface via [`Id3Frame::involved_people`] instead.
+    ///
+    /// Spec wording (v2.4 §4.2.2, `TMCL`):
+    /// "The 'Musician credits list' is intended as a mapping between
+    /// instruments and the musician that played it. Every odd field is
+    /// an instrument and every even is an artist or a comma delimited
+    /// list of artists." The wire layout matches `TIPL`: an encoding
+    /// byte followed by alternating NUL-terminated strings. As with
+    /// `involved_people`, a non-conforming odd-count source folds into
+    /// a pair with an empty performer rather than crashing.
+    ///
+    /// `TMCL` is v2.4-only — v2.3's `IPLS` mixes both kinds of pair into
+    /// a single frame, so there is no v2.3-side variant to surface here.
+    /// A caller migrating a v2.3 tag to v2.4 reads the union via
+    /// `involved_people` from `IPLS`, splits roles vs instruments by
+    /// inspection, then writes back as separate `TIPL` and `TMCL` text
+    /// frames.
+    pub fn musician_credits(&self) -> Option<Vec<(String, String)>> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TMCL" => Some(pair_alternating(values)),
+            _ => None,
+        }
+    }
+}
+
+/// Fold a flat list of NUL-delimited text-frame entries into
+/// `(odd, even)` pairs per spec §4.2.2. A trailing odd entry (a
+/// non-conforming source whose final role / instrument carries no
+/// partner) is folded into a pair with an empty second component so
+/// callers see the truncation structurally rather than losing it.
+fn pair_alternating(values: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(values.len() / 2 + values.len() % 2);
+    let mut i = 0;
+    while i < values.len() {
+        let role = values[i].clone();
+        let name = if i + 1 < values.len() {
+            values[i + 1].clone()
+        } else {
+            String::new()
+        };
+        out.push((role, name));
+        i += 2;
+    }
+    out
 }
 
 /// Tag-size restriction sub-field of the v2.4 extended-header

@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed accessors `Id3Frame::involved_people()` and
+  `Id3Frame::musician_credits()` for the spec §4.2.2 pair-list text
+  frames (`TIPL`, `TMCL`) and the v2.3 `IPLS` structural frame.
+  Folds the parser's flat NUL-split `values` back into
+  `(role, name)` / `(instrument, performer)` pairs; surfaces both
+  `TIPL` and `IPLS` via the same `involved_people()` entry point so
+  callers handle either source version without matching on the
+  underlying variant (matching the cross-version posture of
+  `timestamp_unit()`); keeps `TMCL` separate via `musician_credits()`
+  since the logical mapping is distinct (instrument-to-musician
+  vs function-to-name) even though the wire layout is identical;
+  surfaces non-conforming odd-count sources as a pair with an empty
+  second component rather than dropping the trailing entry; returns
+  `Some(Vec::new())` for a present-but-empty frame so callers can
+  distinguish from a frame-absent `None`.
 - Criterion bench harness at `benches/id3.rs` covering the three
   public surfaces a typical caller exercises on an MP3-resident tag:
   `bench_parse_minimal_v24` drives `tag_size_at_head` → `parse_tag` →

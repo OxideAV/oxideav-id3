@@ -2748,3 +2748,168 @@ fn ext_header_crc_top_bit_survives_synchsafe_encoding() {
          either the search bound is too tight or crc32_iso3309 is broken"
     );
 }
+
+/// `TIPL` (v2.4 §4.2.2 involved-people list) carries `(role, name)`
+/// pairs in a single text frame: encoding byte + alternating
+/// NUL-terminated strings (`role_0\0 name_0\0 role_1\0 name_1\0 …`).
+/// The typed accessor folds the parser's flat `values` back into pairs
+/// so callers don't have to repeat the `chunks_exact(2)` boilerplate.
+#[test]
+fn tipl_involved_people_pairs_v24() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Text {
+            id: "TIPL".into(),
+            values: vec![
+                "producer".into(),
+                "Alice".into(),
+                "mixing engineer".into(),
+                "Bob".into(),
+            ],
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let frame = parsed
+        .frames
+        .iter()
+        .find(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TIPL"))
+        .expect("TIPL survived round-trip");
+    let pairs = frame
+        .involved_people()
+        .expect("TIPL surfaces via involved_people");
+    assert_eq!(
+        pairs,
+        vec![
+            ("producer".to_string(), "Alice".to_string()),
+            ("mixing engineer".to_string(), "Bob".to_string()),
+        ]
+    );
+    // Non-TIPL/IPLS frames must return None.
+    let other = Id3Frame::Text {
+        id: "TIT2".into(),
+        values: vec!["Song".into()],
+    };
+    assert!(other.involved_people().is_none());
+    assert!(other.musician_credits().is_none());
+}
+
+/// `TMCL` (v2.4 §4.2.2 musician-credits list) carries
+/// `(instrument, performer)` pairs in the same wire layout as `TIPL`.
+/// Spec §4.2.2: "Every odd field is an instrument and every even is an
+/// artist or a comma delimited list of artists."
+#[test]
+fn tmcl_musician_credits_pairs_v24() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Text {
+            id: "TMCL".into(),
+            values: vec![
+                "guitar".into(),
+                "Alice, Bob".into(),
+                "drums".into(),
+                "Carol".into(),
+            ],
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let frame = parsed
+        .frames
+        .iter()
+        .find(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TMCL"))
+        .expect("TMCL survived round-trip");
+    let pairs = frame
+        .musician_credits()
+        .expect("TMCL surfaces via musician_credits");
+    assert_eq!(
+        pairs,
+        vec![
+            ("guitar".to_string(), "Alice, Bob".to_string()),
+            ("drums".to_string(), "Carol".to_string()),
+        ]
+    );
+    // TMCL is *not* TIPL: involved_people should NOT surface it.
+    assert!(frame.involved_people().is_none());
+    // And TIPL should not surface via musician_credits even though the
+    // wire layout is identical — the two carry different logical maps
+    // per spec §4.2.2.
+    let tipl = Id3Frame::Text {
+        id: "TIPL".into(),
+        values: vec!["producer".into(), "Alice".into()],
+    };
+    assert!(tipl.musician_credits().is_none());
+}
+
+/// `IPLS` (v2.3 §4.4) carries the same role-to-name mapping as v2.4's
+/// `TIPL`; surfacing both through one accessor lets a caller handle
+/// either source version without matching on the underlying variant.
+#[test]
+fn ipls_involved_people_pairs_v23() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![Id3Frame::Ipls {
+            pairs: vec![
+                ("producer".to_string(), "Alice".to_string()),
+                ("mixing engineer".to_string(), "Bob".to_string()),
+            ],
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let frame = parsed
+        .frames
+        .iter()
+        .find(|f| matches!(f, Id3Frame::Ipls { .. }))
+        .expect("IPLS survived round-trip");
+    let pairs = frame
+        .involved_people()
+        .expect("IPLS surfaces via involved_people");
+    assert_eq!(
+        pairs,
+        vec![
+            ("producer".to_string(), "Alice".to_string()),
+            ("mixing engineer".to_string(), "Bob".to_string()),
+        ]
+    );
+}
+
+/// A non-conforming `TIPL` with an odd count (final role carries no
+/// name) folds the trailing entry into a pair with an empty name,
+/// matching how `IPLS` already surfaces the same truncation on the
+/// parser side. Information is preserved structurally rather than
+/// dropped or made to panic.
+#[test]
+fn tipl_odd_count_folds_trailing_role() {
+    let tipl = Id3Frame::Text {
+        id: "TIPL".into(),
+        values: vec!["producer".into(), "Alice".into(), "mixing engineer".into()],
+    };
+    let pairs = tipl.involved_people().expect("TIPL pairs");
+    assert_eq!(
+        pairs,
+        vec![
+            ("producer".to_string(), "Alice".to_string()),
+            ("mixing engineer".to_string(), String::new()),
+        ]
+    );
+}
+
+/// An empty `TIPL` (frame present, no entries) returns
+/// `Some(Vec::new())` so the caller can still distinguish "frame
+/// present but empty" from "frame absent" (`None`).
+#[test]
+fn tipl_empty_distinguishes_from_absent() {
+    let empty = Id3Frame::Text {
+        id: "TIPL".into(),
+        values: vec![],
+    };
+    let pairs = empty.involved_people().expect("present but empty");
+    assert!(pairs.is_empty());
+
+    let absent = Id3Frame::Text {
+        id: "TIT2".into(),
+        values: vec!["Song".into()],
+    };
+    assert!(absent.involved_people().is_none());
+}

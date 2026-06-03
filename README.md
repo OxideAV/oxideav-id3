@@ -337,6 +337,30 @@ writer emits whatever the caller supplied. Both `with_update` and
   the matching sections for the other three), so the logical unit
   round-trips losslessly when a tag is re-serialised under the other
   version.
+- `Id3Frame::involved_people()` returns the spec §4.2.2
+  `(role, name)` pairs carried by the v2.4 `TIPL` text frame
+  (involved-people list) and the v2.3 `IPLS` structural frame as a
+  single `Vec<(String, String)>`. The on-wire layout for `TIPL` is the
+  text-frame encoding byte followed by alternating NUL-terminated
+  strings (`role_0\0 name_0\0 …`); the existing text-frame parser
+  already splits on NUL into `values`, and the accessor folds adjacent
+  entries back into pairs. A non-conforming odd-count source (trailing
+  role with no name) folds into a pair with an empty name, matching
+  how the parser surfaces the same truncation on the `IPLS` side.
+  Surfacing both variants through one accessor lets a caller handle
+  either source version without matching on the underlying variant,
+  matching the cross-version posture of `timestamp_unit()`.
+- `Id3Frame::musician_credits()` returns the spec §4.2.2
+  `(instrument, performer)` pairs carried by the v2.4 `TMCL` text
+  frame. The wire layout matches `TIPL` but the logical mapping is
+  distinct (instrument-to-musician rather than function-to-name) so
+  the two accessors stay separate; `musician_credits()` returns `None`
+  on `TIPL` / `IPLS` and `involved_people()` returns `None` on `TMCL`.
+  `TMCL` is v2.4-only — v2.3's `IPLS` mixes both kinds of pair into a
+  single frame, so a caller migrating a v2.3 tag to v2.4 reads the
+  union via `involved_people()` from `IPLS`, splits roles vs
+  instruments by inspection, then writes back as separate `TIPL` and
+  `TMCL` text frames.
 
 ## Fuzzing
 
