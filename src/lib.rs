@@ -3464,6 +3464,47 @@ fn text_frame_to_key(id: &str) -> String {
         "TOLY" => "originallyricist",
         "TORY" => "originalyear",
         "TSRC" => "isrc",
+        // v2.4 §4.2.5 timestamp-class frames the prior table omitted.
+        // The wire payload is a free-form timestamp string per the
+        // spec; surfacing them as Vorbis-style keys lets a consumer
+        // read them without enum-matching on `Id3Frame::Text`.
+        "TDEN" => "encodingtime",
+        "TDTG" => "taggingtime",
+        // v2.4 §4.2.3 informational frames new in v2.4 or previously
+        // not mapped — TMOO mood, TFLT file-type (`MPG`, `PCM`, …),
+        // TLEN length-in-ms (numeric per v2.3 §TLEN / v2.4 §4.2.3).
+        "TMOO" => "mood",
+        "TFLT" => "filetype",
+        "TLEN" => "length",
+        // v2.4 §4.2.4 rights/owner frames.
+        "TOWN" => "owner",
+        "TPRO" => "producednotice",
+        // v2.4 §4.2.4 internet-radio frames (also valid in v2.3).
+        "TRSN" => "radiostation",
+        "TRSO" => "radiostationowner",
+        // v2.4 §4.2.5 sort-order frames (also valid in v2.3 informally;
+        // Vorbis convention is `*sort`).
+        "TSOA" => "albumsort",
+        "TSOP" => "artistsort",
+        "TSOT" => "titlesort",
+        // v2.4 §4.2.1 set-subtitle.
+        "TSST" => "setsubtitle",
+        // v2.4 §4.2.5 / v2.3 §TDLY playlist delay (ms between songs).
+        "TDLY" => "playlistdelay",
+        // v2.4 §4.2.5 / v2.3 §TOFN original filename.
+        "TOFN" => "originalfilename",
+        // v2.3-only date/time/recording-date/size frames. v2.4 folded
+        // TYER/TDAT/TIME into TDRC and removed TRDA/TSIZ; on a v2.3
+        // tag these still carry data and would otherwise drop to the
+        // generic lowercased-id fallback.
+        //
+        // TDAT is "DDMM" (4 chars, spec §TDAT) — not the same shape as
+        // TYER's "date"=year, so a distinct key avoids collision when
+        // both frames are present in the same tag.
+        "TDAT" => "date_ddmm",
+        "TIME" => "time_hhmm",
+        "TRDA" => "recordingdates",
+        "TSIZ" => "size",
         _ => {
             // Unknown T-frame: expose the raw id lowercased so callers
             // don't drop data silently.
@@ -7493,5 +7534,212 @@ mod tests {
             Id3Frame::Ipls { pairs } => assert!(pairs.is_empty()),
             other => panic!("expected empty Ipls, got {other:?}"),
         }
+    }
+
+    /// `to_key_value_pairs` surfaces the v2.4 §4.2.5 timestamp-class
+    /// text frames the prior table dropped (TDEN encoding time, TDTG
+    /// tagging time). Without an explicit mapping these would fall
+    /// through the generic-id branch and land as `tden` / `tdtg`,
+    /// which a Vorbis-style consumer cannot interpret.
+    #[test]
+    fn to_key_value_pairs_surfaces_v24_timestamp_frames() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![
+                Id3Frame::Text {
+                    id: "TDEN".into(),
+                    values: vec!["2026-06-03T10:15:00".into()],
+                },
+                Id3Frame::Text {
+                    id: "TDTG".into(),
+                    values: vec!["2026-06-03T11:00:00".into()],
+                },
+            ],
+        };
+        let kv = to_key_value_pairs(&tag);
+        assert!(kv
+            .iter()
+            .any(|(k, v)| k == "encodingtime" && v == "2026-06-03T10:15:00"));
+        assert!(kv
+            .iter()
+            .any(|(k, v)| k == "taggingtime" && v == "2026-06-03T11:00:00"));
+    }
+
+    /// §4.2.3 informational frames new (TMOO) and previously unmapped
+    /// (TFLT file-type, TLEN length-in-ms) round-trip to readable keys.
+    #[test]
+    fn to_key_value_pairs_surfaces_v24_informational_frames() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![
+                Id3Frame::Text {
+                    id: "TMOO".into(),
+                    values: vec!["Mellow".into()],
+                },
+                Id3Frame::Text {
+                    id: "TFLT".into(),
+                    values: vec!["MPG/3".into()],
+                },
+                Id3Frame::Text {
+                    id: "TLEN".into(),
+                    values: vec!["240000".into()],
+                },
+            ],
+        };
+        let kv = to_key_value_pairs(&tag);
+        assert!(kv.iter().any(|(k, v)| k == "mood" && v == "Mellow"));
+        assert!(kv.iter().any(|(k, v)| k == "filetype" && v == "MPG/3"));
+        assert!(kv.iter().any(|(k, v)| k == "length" && v == "240000"));
+    }
+
+    /// §4.2.4 rights / owner / internet-radio frames map to descriptive
+    /// keys — `owner`, `producednotice`, `radiostation`,
+    /// `radiostationowner`.
+    #[test]
+    fn to_key_value_pairs_surfaces_v24_rights_and_radio_frames() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![
+                Id3Frame::Text {
+                    id: "TOWN".into(),
+                    values: vec!["Some Licensee".into()],
+                },
+                Id3Frame::Text {
+                    id: "TPRO".into(),
+                    values: vec!["2026 Producer Inc.".into()],
+                },
+                Id3Frame::Text {
+                    id: "TRSN".into(),
+                    values: vec!["Echelle Radio".into()],
+                },
+                Id3Frame::Text {
+                    id: "TRSO".into(),
+                    values: vec!["Echelle Inc.".into()],
+                },
+            ],
+        };
+        let kv = to_key_value_pairs(&tag);
+        assert!(kv.iter().any(|(k, v)| k == "owner" && v == "Some Licensee"));
+        assert!(kv
+            .iter()
+            .any(|(k, v)| k == "producednotice" && v == "2026 Producer Inc."));
+        assert!(kv
+            .iter()
+            .any(|(k, v)| k == "radiostation" && v == "Echelle Radio"));
+        assert!(kv
+            .iter()
+            .any(|(k, v)| k == "radiostationowner" && v == "Echelle Inc."));
+    }
+
+    /// §4.2.5 sort-order frames (TSOA / TSOP / TSOT) and §4.2.1 set
+    /// subtitle (TSST), plus the previously-unmapped §4.2.5 TDLY
+    /// playlist delay and TOFN original filename.
+    #[test]
+    fn to_key_value_pairs_surfaces_v24_sort_and_aux_frames() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![
+                Id3Frame::Text {
+                    id: "TSOA".into(),
+                    values: vec!["Album Sort".into()],
+                },
+                Id3Frame::Text {
+                    id: "TSOP".into(),
+                    values: vec!["Artist Sort".into()],
+                },
+                Id3Frame::Text {
+                    id: "TSOT".into(),
+                    values: vec!["Title Sort".into()],
+                },
+                Id3Frame::Text {
+                    id: "TSST".into(),
+                    values: vec!["Disc One".into()],
+                },
+                Id3Frame::Text {
+                    id: "TDLY".into(),
+                    values: vec!["500".into()],
+                },
+                Id3Frame::Text {
+                    id: "TOFN".into(),
+                    values: vec!["song.mp3".into()],
+                },
+            ],
+        };
+        let kv = to_key_value_pairs(&tag);
+        assert!(kv
+            .iter()
+            .any(|(k, v)| k == "albumsort" && v == "Album Sort"));
+        assert!(kv
+            .iter()
+            .any(|(k, v)| k == "artistsort" && v == "Artist Sort"));
+        assert!(kv
+            .iter()
+            .any(|(k, v)| k == "titlesort" && v == "Title Sort"));
+        assert!(kv
+            .iter()
+            .any(|(k, v)| k == "setsubtitle" && v == "Disc One"));
+        assert!(kv.iter().any(|(k, v)| k == "playlistdelay" && v == "500"));
+        assert!(kv
+            .iter()
+            .any(|(k, v)| k == "originalfilename" && v == "song.mp3"));
+    }
+
+    /// v2.3-only date / time / recording-dates / size text frames that
+    /// v2.4 dropped (TYER/TDAT/TIME folded into TDRC; TRDA/TSIZ
+    /// removed). On a v2.3 tag these still carry data; the mapping
+    /// keeps them addressable without colliding with TYER's `date`
+    /// (TDAT uses a distinct `date_ddmm` key per spec §TDAT).
+    #[test]
+    fn to_key_value_pairs_surfaces_v23_only_date_and_size_frames() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![
+                Id3Frame::Text {
+                    id: "TYER".into(),
+                    values: vec!["1999".into()],
+                },
+                Id3Frame::Text {
+                    id: "TDAT".into(),
+                    values: vec!["3112".into()], // DDMM = 31-Dec
+                },
+                Id3Frame::Text {
+                    id: "TIME".into(),
+                    values: vec!["2359".into()], // HHMM
+                },
+                Id3Frame::Text {
+                    id: "TRDA".into(),
+                    values: vec!["4th-7th June".into()],
+                },
+                Id3Frame::Text {
+                    id: "TSIZ".into(),
+                    values: vec!["123456".into()],
+                },
+            ],
+        };
+        let kv = to_key_value_pairs(&tag);
+        // TYER and TDAT must NOT collide on the same key.
+        assert!(kv.iter().any(|(k, v)| k == "date" && v == "1999"));
+        assert!(kv.iter().any(|(k, v)| k == "date_ddmm" && v == "3112"));
+        assert!(kv.iter().any(|(k, v)| k == "time_hhmm" && v == "2359"));
+        assert!(kv
+            .iter()
+            .any(|(k, v)| k == "recordingdates" && v == "4th-7th June"));
+        assert!(kv.iter().any(|(k, v)| k == "size" && v == "123456"));
+    }
+
+    /// A `T???` frame outside the known table still falls through to
+    /// the generic lowercased-id branch — the mapping table additions
+    /// don't suppress the catch-all behaviour.
+    #[test]
+    fn to_key_value_pairs_unknown_t_frame_still_lowercases() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TZZZ".into(),
+                values: vec!["custom".into()],
+            }],
+        };
+        let kv = to_key_value_pairs(&tag);
+        assert!(kv.iter().any(|(k, v)| k == "tzzz" && v == "custom"));
     }
 }

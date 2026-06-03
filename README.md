@@ -235,6 +235,26 @@ writer emits whatever the caller supplied. Both `with_update` and
 `with_restrictions(Some(_))` are v2.4-only — a v2.3 target returns
 `Error::unsupported` rather than silently dropping the request.
 
+## Vorbis-style flat-pair view
+
+`to_key_value_pairs(&tag)` projects an `Id3Tag` onto a
+`Vec<(String, String)>` keyed in the Vorbis-comment convention the
+rest of the workspace uses (`title`, `artist`, `album`, `date`,
+`genre`, `track`, `composer`, …). The mapping covers the v2.4
+spec §4.2.1 / §4.2.2 / §4.2.3 / §4.2.4 / §4.2.5 text frames —
+including the timestamp-class frames (`TDEN` → `encodingtime`,
+`TDTG` → `taggingtime`), the §4.2.4 rights / radio frames (`TOWN` →
+`owner`, `TPRO` → `producednotice`, `TRSN` → `radiostation`,
+`TRSO` → `radiostationowner`), the §4.2.5 sort-order frames
+(`TSOA` → `albumsort`, `TSOP` → `artistsort`, `TSOT` → `titlesort`),
+`TSST` → `setsubtitle`, `TMOO` → `mood`, `TFLT` → `filetype`,
+`TLEN` → `length`, `TDLY` → `playlistdelay`, `TOFN` →
+`originalfilename` — plus the v2.3-only `TDAT` → `date_ddmm`,
+`TIME` → `time_hhmm`, `TRDA` → `recordingdates`, `TSIZ` → `size`
+that v2.4 folded into `TDRC` or removed. Unknown `T???` frames
+still fall through to the lowercased frame id so a Vorbis consumer
+never silently drops data.
+
 ## What is supported
 
 - **ID3v1 / ID3v1.1** — parse + write 128-byte trailers, Winamp's

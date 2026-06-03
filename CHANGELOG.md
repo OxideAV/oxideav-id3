@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `to_key_value_pairs` now maps the v2.4 spec §4.2 text frames the
+  prior table dropped to Vorbis-style keys: §4.2.5 timestamp class
+  (`TDEN` → `encodingtime`, `TDTG` → `taggingtime`); §4.2.3
+  informational (`TMOO` → `mood`, `TFLT` → `filetype`, `TLEN` →
+  `length`); §4.2.4 rights/radio (`TOWN` → `owner`, `TPRO` →
+  `producednotice`, `TRSN` → `radiostation`, `TRSO` →
+  `radiostationowner`); §4.2.5 sort-order (`TSOA` → `albumsort`,
+  `TSOP` → `artistsort`, `TSOT` → `titlesort`); §4.2.1 set-subtitle
+  (`TSST` → `setsubtitle`); §4.2.5 misc (`TDLY` → `playlistdelay`,
+  `TOFN` → `originalfilename`); plus the v2.3-only date/size frames
+  v2.4 folded into `TDRC` or removed (`TDAT` → `date_ddmm` per spec
+  §TDAT DDMM shape — distinct from `TYER`'s `date` so the two don't
+  collide; `TIME` → `time_hhmm`; `TRDA` → `recordingdates`; `TSIZ`
+  → `size`). Unknown `T???` frames still fall through to the
+  lowercased frame id (catch-all unchanged).
 - Typed accessors `Id3Frame::involved_people()` and
   `Id3Frame::musician_credits()` for the spec §4.2.2 pair-list text
   frames (`TIPL`, `TMCL`) and the v2.3 `IPLS` structural frame.
