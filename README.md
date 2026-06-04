@@ -403,6 +403,20 @@ never silently drops data.
   and v2.4 so the accessor is version-independent. As with the SYLT
   accessor, `from_wire` / `to_wire` are a bijection over the spec
   range `$00..=$08` and any reserved byte surfaces as `None`.
+- `Rva2Channel::channel_type_typed()` returns a typed
+  `Rva2ChannelType` (`Other` / `MasterVolume` / `FrontRight` /
+  `FrontLeft` / `BackRight` / `BackLeft` / `FrontCentre` /
+  `BackCentre` / `Subwoofer`) for the channel-type byte that opens
+  each per-channel record inside an `RVA2` payload (spec v2.4 §4.11).
+  The byte names the channel the volume adjustment applies to; the
+  wire layout is byte-aligned and version-independent so the accessor
+  is shared between v2.3 and v2.4. As with the SYLT and COMR
+  accessors, `from_wire` / `to_wire` are a bijection over the spec
+  range `$00..=$08` and any reserved byte surfaces as `None`. The
+  raw `Rva2Channel::channel_type: u8` field is unchanged and
+  round-trips losslessly through the writer, so a non-conforming
+  source can still preserve a forward-compatible payload while the
+  typed view collapses to `None`.
 
 ## Fuzzing
 

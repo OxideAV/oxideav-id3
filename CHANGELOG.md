@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed accessor `Rva2Channel::channel_type_typed()` for the
+  `type_of_channel` byte that opens each per-channel record inside an
+  `RVA2` payload (spec v2.4 §4.11). Decodes to a spec-shaped
+  `Rva2ChannelType` enum with the nine §4.11 values: `Other` /
+  `MasterVolume` / `FrontRight` / `FrontLeft` / `BackRight` /
+  `BackLeft` / `FrontCentre` / `BackCentre` / `Subwoofer`; `from_wire`
+  / `to_wire` form a bijection over the spec range `$00..=$08` and
+  return `None` for any reserved byte so a non-conforming source
+  surfaces structurally rather than mapping to a guessed variant —
+  matching the contract already published by `SyltContentType`,
+  `CommercialDelivery`, `TimestampUnit`, and `Restrictions`. The
+  underlying `Rva2Channel::channel_type: u8` field is unchanged and
+  round-trips losslessly through `write_tag` for both spec-named and
+  reserved bytes, so the typed view never costs callers the ability
+  to preserve forward-compatible payloads. The wire byte is identical
+  between v2.3 and v2.4 (v2.3 carries the v2.4-introduced `RVA2`
+  frame on tags that have been upgraded; the spec layout is
+  byte-aligned and version-independent), so the accessor is
+  version-independent and mirrors the cross-version posture of
+  `Id3Frame::timestamp_unit`, `Id3Frame::sylt_content_type`, and
+  `Id3Frame::commercial_delivery`. Round-trip tests cover writer →
+  parser under both v2.3 and v2.4 envelopes across master / front /
+  back / centre / subwoofer / reserved channels plus exhaustive
+  wire-bijection coverage over the `$00..=$08` spec range and
+  reserved-byte rejection over `$09..=$FF`.
 - Typed accessors `Id3Frame::sylt_content_type()` and
   `Id3Frame::commercial_delivery()` for the enumerated bytes carried
   by `SYLT` (spec v2.3 §4.10 / v2.4 §4.9, "Content type") and `COMR`

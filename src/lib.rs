@@ -798,6 +798,93 @@ impl CommercialDelivery {
     }
 }
 
+/// Typed view of the `RVA2` "type of channel" byte (spec v2.4 §4.11).
+/// The byte opens each per-channel record inside an `RVA2` payload and
+/// names the channel the volume adjustment applies to. The enum
+/// mirrors the spec's nine-value table verbatim and is surfaced via
+/// [`Rva2Channel::channel_type_typed`]; see [`Rva2ChannelType::from_wire`]
+/// for the wire mapping. Mirrors the contract on [`SyltContentType`]
+/// and [`CommercialDelivery`]: `from_wire` / `to_wire` form a
+/// bijection over the spec range `$00..=$08` and any reserved byte
+/// returns `None` so a non-conforming source surfaces structurally
+/// rather than mapping to a guessed variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rva2ChannelType {
+    /// `$00` per spec — "Other" (catch-all when none of the named
+    /// channels fits).
+    Other,
+    /// `$01` per spec — "Master volume" (single global adjustment
+    /// rather than a per-channel one).
+    MasterVolume,
+    /// `$02` per spec — "Front right".
+    FrontRight,
+    /// `$03` per spec — "Front left".
+    FrontLeft,
+    /// `$04` per spec — "Back right".
+    BackRight,
+    /// `$05` per spec — "Back left".
+    BackLeft,
+    /// `$06` per spec — "Front centre".
+    FrontCentre,
+    /// `$07` per spec — "Back centre".
+    BackCentre,
+    /// `$08` per spec — "Subwoofer".
+    Subwoofer,
+}
+
+impl Rva2ChannelType {
+    /// Decode a raw RVA2 `type_of_channel` byte. Returns `None` for
+    /// any value outside the spec range `$00..=$08` so a reserved
+    /// byte surfaces structurally rather than mapping to a guessed
+    /// variant.
+    pub fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Rva2ChannelType::Other),
+            1 => Some(Rva2ChannelType::MasterVolume),
+            2 => Some(Rva2ChannelType::FrontRight),
+            3 => Some(Rva2ChannelType::FrontLeft),
+            4 => Some(Rva2ChannelType::BackRight),
+            5 => Some(Rva2ChannelType::BackLeft),
+            6 => Some(Rva2ChannelType::FrontCentre),
+            7 => Some(Rva2ChannelType::BackCentre),
+            8 => Some(Rva2ChannelType::Subwoofer),
+            _ => None,
+        }
+    }
+
+    /// Encode this channel type back to the raw wire byte
+    /// (`$00..=$08`).
+    pub fn to_wire(self) -> u8 {
+        match self {
+            Rva2ChannelType::Other => 0,
+            Rva2ChannelType::MasterVolume => 1,
+            Rva2ChannelType::FrontRight => 2,
+            Rva2ChannelType::FrontLeft => 3,
+            Rva2ChannelType::BackRight => 4,
+            Rva2ChannelType::BackLeft => 5,
+            Rva2ChannelType::FrontCentre => 6,
+            Rva2ChannelType::BackCentre => 7,
+            Rva2ChannelType::Subwoofer => 8,
+        }
+    }
+}
+
+impl Rva2Channel {
+    /// Typed accessor for the channel-type byte (spec v2.4 §4.11).
+    /// Returns `Some(kind)` when the wire byte is one of the
+    /// spec-defined `$00..=$08` values (Other, Master volume, Front
+    /// right, Front left, Back right, Back left, Front centre, Back
+    /// centre, Subwoofer), and `None` for any reserved byte. The raw
+    /// `channel_type: u8` field still round-trips losslessly, so a
+    /// non-conforming source preserves its byte through write — only
+    /// the typed view collapses to `None`. Mirrors the contract on
+    /// [`Id3Frame::sylt_content_type`] and
+    /// [`Id3Frame::commercial_delivery`].
+    pub fn channel_type_typed(&self) -> Option<Rva2ChannelType> {
+        Rva2ChannelType::from_wire(self.channel_type)
+    }
+}
+
 impl Id3Frame {
     /// Typed accessor for the `time_stamp_format` byte carried by the
     /// frames whose spec layout opens with one (`ETCO`, `SYTC`, `SYLT`,

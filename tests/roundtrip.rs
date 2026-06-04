@@ -8,8 +8,9 @@ use oxideav_id3::{
     attached_pictures, parse_id3v1, parse_tag, parse_tag_with_extended_header, to_key_value_pairs,
     write_id3v1, write_tag, write_tag_with_options, CommercialDelivery, EquaBand, Id3Frame, Id3Tag,
     Id3Version, ImageEncodingRestriction, ImageSizeRestriction, Restrictions, Rva2Channel,
-    RvadBackChannels, RvadChannel, RvadFrontChannels, SyltContentType, TagSizeRestriction,
-    TextEncodingRestriction, TextFieldsRestriction, TimestampUnit, UnsyncMode, WriteOptions,
+    Rva2ChannelType, RvadBackChannels, RvadChannel, RvadFrontChannels, SyltContentType,
+    TagSizeRestriction, TextEncodingRestriction, TextFieldsRestriction, TimestampUnit, UnsyncMode,
+    WriteOptions,
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
@@ -3092,5 +3093,144 @@ fn commercial_delivery_accessor_and_roundtrip() {
             .find_map(Id3Frame::commercial_delivery)
             .expect("COMR commercial_delivery surfaces after round-trip");
         assert_eq!(mode, CommercialDelivery::FileOverInternet);
+    }
+}
+
+/// `Rva2ChannelType::from_wire` covers every spec value `$00..=$08`
+/// and refuses any reserved byte by returning `None`. Round-trips
+/// through `to_wire` recover the original byte for every variant —
+/// the bijection over the spec range matches the contract on
+/// [`SyltContentType`] and [`CommercialDelivery`].
+#[test]
+fn rva2_channel_type_wire_bijection() {
+    let spec_pairs = [
+        (0u8, Rva2ChannelType::Other),
+        (1, Rva2ChannelType::MasterVolume),
+        (2, Rva2ChannelType::FrontRight),
+        (3, Rva2ChannelType::FrontLeft),
+        (4, Rva2ChannelType::BackRight),
+        (5, Rva2ChannelType::BackLeft),
+        (6, Rva2ChannelType::FrontCentre),
+        (7, Rva2ChannelType::BackCentre),
+        (8, Rva2ChannelType::Subwoofer),
+    ];
+    for (wire, typed) in spec_pairs {
+        assert_eq!(Rva2ChannelType::from_wire(wire), Some(typed));
+        assert_eq!(typed.to_wire(), wire);
+    }
+    // Anything outside the spec range surfaces structurally as None.
+    for reserved in 9u8..=255 {
+        assert!(
+            Rva2ChannelType::from_wire(reserved).is_none(),
+            "reserved RVA2 channel_type ${reserved:02x} unexpectedly decoded"
+        );
+    }
+}
+
+/// `Rva2Channel::channel_type_typed` decodes the channel-type byte of
+/// an `RVA2` channel entry and returns `None` for any reserved wire
+/// byte. The raw `channel_type: u8` field is preserved verbatim so a
+/// non-conforming source still round-trips through the writer.
+#[test]
+fn rva2_channel_type_accessor_decodes_named_channels() {
+    let master = Rva2Channel {
+        channel_type: Rva2ChannelType::MasterVolume.to_wire(),
+        volume_adjustment: 1024,
+        bits_peak: 8,
+        peak: vec![0x80],
+    };
+    assert_eq!(
+        master.channel_type_typed(),
+        Some(Rva2ChannelType::MasterVolume)
+    );
+
+    let sub = Rva2Channel {
+        channel_type: Rva2ChannelType::Subwoofer.to_wire(),
+        volume_adjustment: -512,
+        bits_peak: 0,
+        peak: Vec::new(),
+    };
+    assert_eq!(sub.channel_type_typed(), Some(Rva2ChannelType::Subwoofer));
+
+    // Reserved byte preserves losslessly but the typed view collapses
+    // to None per spec.
+    let reserved = Rva2Channel {
+        channel_type: 0x42,
+        volume_adjustment: 0,
+        bits_peak: 0,
+        peak: Vec::new(),
+    };
+    assert_eq!(reserved.channel_type_typed(), None);
+    assert_eq!(reserved.channel_type, 0x42);
+}
+
+/// A round-trip writer→parser preserves every RVA2 channel-type byte
+/// — both the spec-named variants and reserved bytes — so the typed
+/// accessor sees the same variant after re-parsing under both v2.3
+/// and v2.4 envelopes (the wire layout is byte-aligned and identical
+/// between versions per the v2.4 §4.11 frame definition).
+#[test]
+fn rva2_channel_type_roundtrips_v23_and_v24() {
+    let channels = vec![
+        Rva2Channel {
+            channel_type: Rva2ChannelType::MasterVolume.to_wire(),
+            volume_adjustment: 1024,
+            bits_peak: 8,
+            peak: vec![0x80],
+        },
+        Rva2Channel {
+            channel_type: Rva2ChannelType::FrontLeft.to_wire(),
+            volume_adjustment: -512,
+            bits_peak: 0,
+            peak: Vec::new(),
+        },
+        Rva2Channel {
+            channel_type: Rva2ChannelType::Subwoofer.to_wire(),
+            volume_adjustment: 0,
+            bits_peak: 8,
+            peak: vec![0xC0],
+        },
+        // Reserved byte: round-trips losslessly even though the
+        // typed view is None.
+        Rva2Channel {
+            channel_type: 0x42,
+            volume_adjustment: 256,
+            bits_peak: 0,
+            peak: Vec::new(),
+        },
+    ];
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        let tag = Id3Tag {
+            version,
+            frames: vec![Id3Frame::Rva2 {
+                identification: "mix".into(),
+                channels: channels.clone(),
+            }],
+        };
+        let bytes = write_tag(&tag, version).expect("write");
+        let (parsed, _) = parse_tag(&bytes).expect("parse");
+        let parsed_channels = parsed
+            .frames
+            .iter()
+            .find_map(|f| match f {
+                Id3Frame::Rva2 { channels, .. } => Some(channels.clone()),
+                _ => None,
+            })
+            .expect("RVA2 frame surfaces after round-trip");
+        assert_eq!(parsed_channels, channels);
+        assert_eq!(
+            parsed_channels[0].channel_type_typed(),
+            Some(Rva2ChannelType::MasterVolume)
+        );
+        assert_eq!(
+            parsed_channels[1].channel_type_typed(),
+            Some(Rva2ChannelType::FrontLeft)
+        );
+        assert_eq!(
+            parsed_channels[2].channel_type_typed(),
+            Some(Rva2ChannelType::Subwoofer)
+        );
+        assert_eq!(parsed_channels[3].channel_type_typed(), None);
+        assert_eq!(parsed_channels[3].channel_type, 0x42);
     }
 }
