@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed accessor `Id3Frame::equ2_interpolation()` for the
+  interpolation-method byte that opens an `EQU2` payload (spec v2.4
+  §4.12). Decodes to a spec-shaped `Equ2Interpolation` enum with the
+  two §4.12 values: `Band` (`$00`, no interpolation between adjustment
+  points — a renderer jumps from one adjustment level to the next in
+  the middle between two adjustment points) and `Linear` (`$01`, a
+  renderer interpolates linearly between adjacent adjustment points).
+  `from_wire` / `to_wire` form a bijection over the spec range
+  `$00..=$01` and return `None` for any reserved byte so a
+  non-conforming source surfaces structurally rather than mapping to a
+  guessed variant — matching the contract already published by
+  `Rva2ChannelType`, `SyltContentType`, `CommercialDelivery`,
+  `TimestampUnit`, and `Restrictions`. The underlying
+  `Id3Frame::Equ2::interpolation: u8` field is unchanged and
+  round-trips losslessly through `write_tag` for both spec-named and
+  reserved bytes, so the typed view never costs callers the ability to
+  preserve forward-compatible payloads. EQU2 is v2.4-only per spec
+  (the v2.4 frames doc lists `EQU2` and v2.3 carried `EQUA` instead
+  with an unrelated per-band inc/dec bitfield rather than a
+  curve-level interpolation choice), so the accessor is version-locked
+  to v2.4 by virtue of its source variant. Four new round-trip tests
+  (wire bijection over `$00..=$01` plus reserved-byte rejection
+  `$02..=$FF`; accessor decoding both spec values + reserved-byte
+  collapse to `None` + cross-variant `None` on a `Text` frame; v2.4
+  writer→parser preserves both `Band` and `Linear` so the typed
+  accessor surfaces the same variant after round-trip; reserved-byte
+  raw field round-trips through `write_tag` while the typed view
+  collapses to `None`) cover the matrix.
 - Typed accessor `Rva2Channel::channel_type_typed()` for the
   `type_of_channel` byte that opens each per-channel record inside an
   `RVA2` payload (spec v2.4 §4.11). Decodes to a spec-shaped

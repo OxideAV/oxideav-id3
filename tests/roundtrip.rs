@@ -6,11 +6,11 @@
 use oxideav_core::{AttachedPicture, PictureType};
 use oxideav_id3::{
     attached_pictures, parse_id3v1, parse_tag, parse_tag_with_extended_header, to_key_value_pairs,
-    write_id3v1, write_tag, write_tag_with_options, CommercialDelivery, EquaBand, Id3Frame, Id3Tag,
-    Id3Version, ImageEncodingRestriction, ImageSizeRestriction, Restrictions, Rva2Channel,
-    Rva2ChannelType, RvadBackChannels, RvadChannel, RvadFrontChannels, SyltContentType,
-    TagSizeRestriction, TextEncodingRestriction, TextFieldsRestriction, TimestampUnit, UnsyncMode,
-    WriteOptions,
+    write_id3v1, write_tag, write_tag_with_options, CommercialDelivery, Equ2Interpolation,
+    EquaBand, Id3Frame, Id3Tag, Id3Version, ImageEncodingRestriction, ImageSizeRestriction,
+    Restrictions, Rva2Channel, Rva2ChannelType, RvadBackChannels, RvadChannel, RvadFrontChannels,
+    SyltContentType, TagSizeRestriction, TextEncodingRestriction, TextFieldsRestriction,
+    TimestampUnit, UnsyncMode, WriteOptions,
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
@@ -3233,4 +3233,125 @@ fn rva2_channel_type_roundtrips_v23_and_v24() {
         assert_eq!(parsed_channels[3].channel_type_typed(), None);
         assert_eq!(parsed_channels[3].channel_type, 0x42);
     }
+}
+
+/// `Equ2Interpolation::from_wire` covers every spec value `$00..=$01`
+/// and rejects any reserved byte. The `to_wire` counterpart recovers
+/// the original byte for every variant — `(from_wire, to_wire)` is a
+/// bijection over the spec range, matching the contract published by
+/// `SyltContentType`, `CommercialDelivery`, `Rva2ChannelType`, and
+/// `Restrictions`.
+#[test]
+fn equ2_interpolation_wire_bijection() {
+    let spec_pairs = [
+        (0u8, Equ2Interpolation::Band),
+        (1, Equ2Interpolation::Linear),
+    ];
+    for (wire, typed) in spec_pairs {
+        assert_eq!(Equ2Interpolation::from_wire(wire), Some(typed));
+        assert_eq!(typed.to_wire(), wire);
+    }
+    // Anything outside the spec range surfaces structurally as None.
+    for reserved in 2u8..=255 {
+        assert!(
+            Equ2Interpolation::from_wire(reserved).is_none(),
+            "reserved EQU2 interpolation method ${reserved:02x} unexpectedly decoded"
+        );
+    }
+}
+
+/// `Id3Frame::equ2_interpolation` decodes the interpolation-method
+/// byte of an `Equ2` frame and returns `None` for any other variant or
+/// any reserved wire byte. Mirrors the cross-variant posture of
+/// [`Id3Frame::sylt_content_type`] and
+/// [`Id3Frame::commercial_delivery`].
+#[test]
+fn equ2_interpolation_accessor_decodes_band_and_linear() {
+    let band = Id3Frame::Equ2 {
+        interpolation: 0,
+        identification: "stage".into(),
+        points: vec![(2_000, 256), (10_000, -512)],
+    };
+    assert_eq!(band.equ2_interpolation(), Some(Equ2Interpolation::Band));
+
+    let linear = Id3Frame::Equ2 {
+        interpolation: 1,
+        identification: "studio".into(),
+        points: vec![(440 * 2, 1024)],
+    };
+    assert_eq!(linear.equ2_interpolation(), Some(Equ2Interpolation::Linear));
+
+    // Reserved (out-of-spec) interpolation byte surfaces as None — the
+    // raw `interpolation: u8` field still round-trips losslessly, so a
+    // non-conforming source preserves its byte through write.
+    let reserved = Id3Frame::Equ2 {
+        interpolation: 0x42,
+        identification: "future".into(),
+        points: vec![],
+    };
+    assert_eq!(reserved.equ2_interpolation(), None);
+
+    // Any other frame variant returns None too.
+    let other = Id3Frame::Text {
+        id: "TIT2".into(),
+        values: vec!["Song".into()],
+    };
+    assert_eq!(other.equ2_interpolation(), None);
+}
+
+/// A round-trip writer→parser preserves the EQU2 interpolation byte so
+/// the typed accessor sees the same variant after re-parsing. EQU2 is
+/// v2.4-only per spec; the writer accepts it under a v2.4 envelope.
+#[test]
+fn equ2_interpolation_roundtrips_v24() {
+    for typed in [Equ2Interpolation::Band, Equ2Interpolation::Linear] {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Equ2 {
+                interpolation: typed.to_wire(),
+                identification: "spec-§4.12-roundtrip".into(),
+                points: vec![(880, 256), (4_400, -256), (12_000, 0)],
+            }],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_4).expect("write");
+        let (parsed, _) = parse_tag(&bytes).expect("parse");
+        let kind = parsed
+            .frames
+            .iter()
+            .find_map(Id3Frame::equ2_interpolation)
+            .expect("EQU2 interpolation surfaces after round-trip");
+        assert_eq!(kind, typed);
+    }
+}
+
+/// The raw `interpolation: u8` field round-trips losslessly through
+/// `write_tag` for both spec-named and reserved bytes, so the typed
+/// view never costs callers the ability to preserve forward-compatible
+/// payloads — mirrors the contract pinned for `Rva2Channel::channel_type`.
+#[test]
+fn equ2_interpolation_preserves_reserved_byte_through_roundtrip() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Equ2 {
+            interpolation: 0x77,
+            identification: "reserved".into(),
+            points: vec![(2_000, 100)],
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).expect("write");
+    let (parsed, _) = parse_tag(&bytes).expect("parse");
+    let raw = parsed
+        .frames
+        .iter()
+        .find_map(|f| match f {
+            Id3Frame::Equ2 { interpolation, .. } => Some(*interpolation),
+            _ => None,
+        })
+        .expect("EQU2 round-trips");
+    assert_eq!(raw, 0x77);
+    // And the typed view collapses to None.
+    assert_eq!(
+        parsed.frames.iter().find_map(Id3Frame::equ2_interpolation),
+        None
+    );
 }

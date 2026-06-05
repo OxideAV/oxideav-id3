@@ -417,6 +417,22 @@ never silently drops data.
   round-trips losslessly through the writer, so a non-conforming
   source can still preserve a forward-compatible payload while the
   typed view collapses to `None`.
+- `Id3Frame::equ2_interpolation()` returns a typed
+  `Equ2Interpolation` (`Band` / `Linear`) for the 1-byte interpolation
+  method that opens the `EQU2` payload (spec v2.4 §4.12). The byte
+  describes which curve a renderer should draw between two adjacent
+  `(frequency, adjustment)` points (`$00` Band = no interpolation,
+  jump in the middle between two adjustment points; `$01` Linear =
+  interpolate linearly). EQU2 is v2.4-only per spec — v2.3 carried
+  `EQUA` instead with an unrelated per-band inc/dec bitfield — so the
+  accessor is version-locked to v2.4 by virtue of its source variant.
+  As with the SYLT, COMR, and RVA2 channel-type accessors,
+  `from_wire` / `to_wire` form a bijection over the spec range
+  `$00..=$01` and any reserved byte surfaces as `None`. The raw
+  `Id3Frame::Equ2::interpolation: u8` field is unchanged and
+  round-trips losslessly through the writer, so a non-conforming
+  source can still preserve a forward-compatible payload while the
+  typed view collapses to `None`.
 
 ## Fuzzing
 

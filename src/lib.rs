@@ -885,6 +885,55 @@ impl Rva2Channel {
     }
 }
 
+/// Typed view of the `EQU2` "interpolation method" byte (spec v2.4
+/// §4.12). The byte sits at the very start of the EQU2 payload, just
+/// before the identification string, and names the curve a renderer
+/// should draw between two adjacent `(frequency, adjustment)` points.
+/// The spec defines exactly two values; the enum mirrors them verbatim
+/// and is surfaced via [`Id3Frame::equ2_interpolation`]; see
+/// [`Equ2Interpolation::from_wire`] for the wire mapping. Mirrors the
+/// contract on [`SyltContentType`], [`CommercialDelivery`], and
+/// [`Rva2ChannelType`]: `from_wire` / `to_wire` form a bijection over
+/// the spec range `$00..=$01` and any reserved byte returns `None` so a
+/// non-conforming source surfaces structurally rather than mapping to a
+/// guessed variant. EQU2 is v2.4-only per spec — v2.3 carried the
+/// `EQUA` frame instead, which uses an unrelated per-band inc/dec
+/// bitfield rather than a curve-level interpolation choice — so the
+/// accessor is version-locked to v2.4 by virtue of its source variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Equ2Interpolation {
+    /// `$00` per spec — "Band": no interpolation between adjustment
+    /// points; a renderer jumps from one adjustment level to the next
+    /// in the middle between two adjustment points.
+    Band,
+    /// `$01` per spec — "Linear": a renderer interpolates linearly
+    /// between adjacent adjustment points.
+    Linear,
+}
+
+impl Equ2Interpolation {
+    /// Decode a raw EQU2 `interpolation method` byte. Returns `None`
+    /// for any value outside the spec range `$00..=$01` so a reserved
+    /// byte surfaces structurally rather than mapping to a guessed
+    /// variant.
+    pub fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Equ2Interpolation::Band),
+            1 => Some(Equ2Interpolation::Linear),
+            _ => None,
+        }
+    }
+
+    /// Encode this interpolation method back to the raw wire byte
+    /// (`$00..=$01`).
+    pub fn to_wire(self) -> u8 {
+        match self {
+            Equ2Interpolation::Band => 0,
+            Equ2Interpolation::Linear => 1,
+        }
+    }
+}
+
 impl Id3Frame {
     /// Typed accessor for the `time_stamp_format` byte carried by the
     /// frames whose spec layout opens with one (`ETCO`, `SYTC`, `SYLT`,
@@ -1000,6 +1049,25 @@ impl Id3Frame {
     pub fn commercial_delivery(&self) -> Option<CommercialDelivery> {
         match self {
             Id3Frame::Commercial { received_as, .. } => CommercialDelivery::from_wire(*received_as),
+            _ => None,
+        }
+    }
+
+    /// Typed accessor for the `EQU2` "interpolation method" byte (spec
+    /// v2.4 §4.12). Returns `Some(method)` when the wire byte is one of
+    /// the spec-defined `$00` (Band) / `$01` (Linear) values, and
+    /// `None` for any other variant or any reserved wire byte. Lets
+    /// callers route on the categorical interpolation choice without
+    /// re-decoding the raw `u8`. EQU2 is v2.4-only per spec (the v2.4
+    /// frames doc lists `EQU2` and v2.3 carried `EQUA` instead, which
+    /// uses a per-band inc/dec bitfield rather than a curve-level
+    /// interpolation choice), so the accessor is version-locked to v2.4
+    /// by virtue of its source variant. Mirrors the contract on
+    /// [`Id3Frame::sylt_content_type`] and
+    /// [`Id3Frame::commercial_delivery`].
+    pub fn equ2_interpolation(&self) -> Option<Equ2Interpolation> {
+        match self {
+            Id3Frame::Equ2 { interpolation, .. } => Equ2Interpolation::from_wire(*interpolation),
             _ => None,
         }
     }
