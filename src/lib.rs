@@ -934,6 +934,187 @@ impl Equ2Interpolation {
     }
 }
 
+/// Typed view of the `ETCO` "type of event" byte (spec v2.3 §4.6 /
+/// v2.4 §4.5). The byte sits at the start of each per-event record in
+/// an `ETCO` payload — one event-type byte followed by a 32-bit
+/// big-endian timestamp — and names the audio milestone the timestamp
+/// marks (intro start, verse end, audio file ends, …). The enum mirrors
+/// the spec's value table verbatim and is surfaced via
+/// [`Id3Frame::etco_event_types`]; see [`EtcoEventType::from_wire`]
+/// for the wire mapping. The mapping is identical between v2.3 and
+/// v2.4 — the event-type table is reproduced bit-for-bit in both
+/// version docs — so the accessor is version-independent.
+///
+/// Wire ranges per spec:
+///
+/// * `$00..=$16` — 23 spec-named events from "padding (has no
+///   meaning)" through "profanity end".
+/// * `$17..=$DF` — reserved for future use; surfaces as `None`.
+/// * `$E0..=$EF` — "not predefined synch 0-F", carried as
+///   [`EtcoEventType::NotPredefinedSync`] with the low nibble of the
+///   wire byte (`0..=15`) so a caller can route on the specific user
+///   slot without losing the byte.
+/// * `$F0..=$FC` — reserved for future use; surfaces as `None`.
+/// * `$FD` — "audio end (start of silence)".
+/// * `$FE` — "audio file ends".
+/// * `$FF` — "one more byte of events follows" (continuation marker:
+///   the spec notes "all the following bytes with the value `$FF` have
+///   the same function"). A `$FF` byte surfaces as
+///   [`EtcoEventType::Continuation`] — its meaning is documented in
+///   the spec, distinct from a reserved byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EtcoEventType {
+    /// `$00` per spec — "padding (has no meaning)".
+    Padding,
+    /// `$01` per spec — "end of initial silence".
+    EndOfInitialSilence,
+    /// `$02` per spec — "intro start".
+    IntroStart,
+    /// `$03` per spec — "main part start".
+    MainPartStart,
+    /// `$04` per spec — "outro start".
+    OutroStart,
+    /// `$05` per spec — "outro end".
+    OutroEnd,
+    /// `$06` per spec — "verse start".
+    VerseStart,
+    /// `$07` per spec — "refrain start".
+    RefrainStart,
+    /// `$08` per spec — "interlude start".
+    InterludeStart,
+    /// `$09` per spec — "theme start".
+    ThemeStart,
+    /// `$0A` per spec — "variation start".
+    VariationStart,
+    /// `$0B` per spec — "key change".
+    KeyChange,
+    /// `$0C` per spec — "time change".
+    TimeChange,
+    /// `$0D` per spec — "momentary unwanted noise (Snap, Crackle &
+    /// Pop)".
+    MomentaryUnwantedNoise,
+    /// `$0E` per spec — "sustained noise".
+    SustainedNoise,
+    /// `$0F` per spec — "sustained noise end".
+    SustainedNoiseEnd,
+    /// `$10` per spec — "intro end".
+    IntroEnd,
+    /// `$11` per spec — "main part end".
+    MainPartEnd,
+    /// `$12` per spec — "verse end".
+    VerseEnd,
+    /// `$13` per spec — "refrain end".
+    RefrainEnd,
+    /// `$14` per spec — "theme end".
+    ThemeEnd,
+    /// `$15` per spec — "profanity".
+    Profanity,
+    /// `$16` per spec — "profanity end".
+    ProfanityEnd,
+    /// `$E0..=$EF` per spec — "not predefined synch 0-F", a
+    /// user-defined synchronisation event whose slot index is the low
+    /// nibble of the wire byte (`0..=15`). The spec example: "you
+    /// might want to synchronise your music to something, like setting
+    /// off an explosion on-stage, activating a screensaver etc.". The
+    /// nibble is preserved here so a caller can route on the specific
+    /// user slot without re-decoding the raw `u8`.
+    NotPredefinedSync(u8),
+    /// `$FD` per spec — "audio end (start of silence)".
+    AudioEnd,
+    /// `$FE` per spec — "audio file ends".
+    AudioFileEnds,
+    /// `$FF` per spec — "one more byte of events follows" (the
+    /// continuation marker; the spec adds "all the following bytes
+    /// with the value `$FF` have the same function"). Surfaces as a
+    /// dedicated variant rather than `None` because the byte has a
+    /// documented meaning even though it does not itself name an
+    /// audio milestone.
+    Continuation,
+}
+
+impl EtcoEventType {
+    /// Decode a raw ETCO `type of event` byte. Returns `None` for any
+    /// value in the spec's reserved ranges (`$17..=$DF`, `$F0..=$FC`)
+    /// so a non-conforming or future byte surfaces structurally rather
+    /// than mapping to a guessed variant. User-defined synchronisation
+    /// bytes (`$E0..=$EF`) decode to [`EtcoEventType::NotPredefinedSync`]
+    /// carrying the low nibble as the slot index (`0..=15`), and the
+    /// continuation marker `$FF` decodes to
+    /// [`EtcoEventType::Continuation`].
+    pub fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            0x00 => Some(EtcoEventType::Padding),
+            0x01 => Some(EtcoEventType::EndOfInitialSilence),
+            0x02 => Some(EtcoEventType::IntroStart),
+            0x03 => Some(EtcoEventType::MainPartStart),
+            0x04 => Some(EtcoEventType::OutroStart),
+            0x05 => Some(EtcoEventType::OutroEnd),
+            0x06 => Some(EtcoEventType::VerseStart),
+            0x07 => Some(EtcoEventType::RefrainStart),
+            0x08 => Some(EtcoEventType::InterludeStart),
+            0x09 => Some(EtcoEventType::ThemeStart),
+            0x0A => Some(EtcoEventType::VariationStart),
+            0x0B => Some(EtcoEventType::KeyChange),
+            0x0C => Some(EtcoEventType::TimeChange),
+            0x0D => Some(EtcoEventType::MomentaryUnwantedNoise),
+            0x0E => Some(EtcoEventType::SustainedNoise),
+            0x0F => Some(EtcoEventType::SustainedNoiseEnd),
+            0x10 => Some(EtcoEventType::IntroEnd),
+            0x11 => Some(EtcoEventType::MainPartEnd),
+            0x12 => Some(EtcoEventType::VerseEnd),
+            0x13 => Some(EtcoEventType::RefrainEnd),
+            0x14 => Some(EtcoEventType::ThemeEnd),
+            0x15 => Some(EtcoEventType::Profanity),
+            0x16 => Some(EtcoEventType::ProfanityEnd),
+            0xE0..=0xEF => Some(EtcoEventType::NotPredefinedSync(value & 0x0F)),
+            0xFD => Some(EtcoEventType::AudioEnd),
+            0xFE => Some(EtcoEventType::AudioFileEnds),
+            0xFF => Some(EtcoEventType::Continuation),
+            _ => None,
+        }
+    }
+
+    /// Encode this event type back to the raw wire byte. Spec-named
+    /// events serialise to their `$00..=$16` byte; the user-defined
+    /// synchronisation slot serialises to `$E0 | (slot & 0x0F)` (the
+    /// `slot` value is masked to its low nibble so an out-of-range
+    /// slot wraps to the spec's `0..=15` rather than colliding with
+    /// the surrounding spec-named events). `AudioEnd` /
+    /// `AudioFileEnds` / `Continuation` round-trip to `$FD` / `$FE` /
+    /// `$FF` respectively.
+    pub fn to_wire(self) -> u8 {
+        match self {
+            EtcoEventType::Padding => 0x00,
+            EtcoEventType::EndOfInitialSilence => 0x01,
+            EtcoEventType::IntroStart => 0x02,
+            EtcoEventType::MainPartStart => 0x03,
+            EtcoEventType::OutroStart => 0x04,
+            EtcoEventType::OutroEnd => 0x05,
+            EtcoEventType::VerseStart => 0x06,
+            EtcoEventType::RefrainStart => 0x07,
+            EtcoEventType::InterludeStart => 0x08,
+            EtcoEventType::ThemeStart => 0x09,
+            EtcoEventType::VariationStart => 0x0A,
+            EtcoEventType::KeyChange => 0x0B,
+            EtcoEventType::TimeChange => 0x0C,
+            EtcoEventType::MomentaryUnwantedNoise => 0x0D,
+            EtcoEventType::SustainedNoise => 0x0E,
+            EtcoEventType::SustainedNoiseEnd => 0x0F,
+            EtcoEventType::IntroEnd => 0x10,
+            EtcoEventType::MainPartEnd => 0x11,
+            EtcoEventType::VerseEnd => 0x12,
+            EtcoEventType::RefrainEnd => 0x13,
+            EtcoEventType::ThemeEnd => 0x14,
+            EtcoEventType::Profanity => 0x15,
+            EtcoEventType::ProfanityEnd => 0x16,
+            EtcoEventType::NotPredefinedSync(slot) => 0xE0 | (slot & 0x0F),
+            EtcoEventType::AudioEnd => 0xFD,
+            EtcoEventType::AudioFileEnds => 0xFE,
+            EtcoEventType::Continuation => 0xFF,
+        }
+    }
+}
+
 impl Id3Frame {
     /// Typed accessor for the `time_stamp_format` byte carried by the
     /// frames whose spec layout opens with one (`ETCO`, `SYTC`, `SYLT`,
@@ -1068,6 +1249,42 @@ impl Id3Frame {
     pub fn equ2_interpolation(&self) -> Option<Equ2Interpolation> {
         match self {
             Id3Frame::Equ2 { interpolation, .. } => Equ2Interpolation::from_wire(*interpolation),
+            _ => None,
+        }
+    }
+
+    /// Typed accessor for the `ETCO` per-event "type of event" bytes
+    /// (spec v2.3 §4.6 / v2.4 §4.5). Returns `Some(types)` for an
+    /// `EventTimingCodes` frame and `None` for any other variant; each
+    /// element of the inner `Vec` is the typed decoding of that event's
+    /// wire byte — `Some(EtcoEventType)` for a spec-defined byte
+    /// (including the user-defined `$E0..=$EF` synchronisation slots,
+    /// the `$FD` / `$FE` audio-end markers, and the `$FF` continuation
+    /// marker) and `None` for a byte in either reserved range
+    /// (`$17..=$DF`, `$F0..=$FC`). The wire byte is identical between
+    /// v2.3 and v2.4 (the event-type table is reproduced bit-for-bit
+    /// in both version docs) so the accessor is version-independent,
+    /// matching the cross-version posture of
+    /// [`Id3Frame::timestamp_unit`] and
+    /// [`Id3Frame::commercial_delivery`].
+    ///
+    /// The raw `events: Vec<(u8, u32)>` field is unchanged and
+    /// round-trips losslessly through [`write_tag`] for every byte
+    /// value — including reserved bytes — so the typed view never
+    /// costs callers the ability to preserve a forward-compatible
+    /// payload. The 32-bit timestamp is left untouched here: a caller
+    /// that wants the categorical event plus its time can `.zip` the
+    /// returned vector against the raw `events.iter().map(|(_, ts)| ts)`.
+    /// `Vec` length equals the source `events` length so positional
+    /// indexing stays stable across the two views.
+    pub fn etco_event_types(&self) -> Option<Vec<Option<EtcoEventType>>> {
+        match self {
+            Id3Frame::EventTimingCodes { events, .. } => Some(
+                events
+                    .iter()
+                    .map(|(byte, _)| EtcoEventType::from_wire(*byte))
+                    .collect(),
+            ),
             _ => None,
         }
     }

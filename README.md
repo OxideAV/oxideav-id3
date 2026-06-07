@@ -433,6 +433,34 @@ never silently drops data.
   round-trips losslessly through the writer, so a non-conforming
   source can still preserve a forward-compatible payload while the
   typed view collapses to `None`.
+- `Id3Frame::etco_event_types()` returns a typed
+  `Vec<Option<EtcoEventType>>` for the per-event "type of event" bytes
+  carried by an `ETCO` payload (spec v2.3 §4.6 / v2.4 §4.5). The
+  returned vector matches the source `events` vector positionally so a
+  caller can `.zip` it against the raw timestamps without losing the
+  per-event ordering. `EtcoEventType` mirrors the spec's value table
+  verbatim — 23 named events `$00..=$16` (`Padding` /
+  `EndOfInitialSilence` / `IntroStart` / `MainPartStart` /
+  `OutroStart` / `OutroEnd` / `VerseStart` / `RefrainStart` /
+  `InterludeStart` / `ThemeStart` / `VariationStart` / `KeyChange` /
+  `TimeChange` / `MomentaryUnwantedNoise` / `SustainedNoise` /
+  `SustainedNoiseEnd` / `IntroEnd` / `MainPartEnd` / `VerseEnd` /
+  `RefrainEnd` / `ThemeEnd` / `Profanity` / `ProfanityEnd`), a
+  `NotPredefinedSync(u8)` variant for the `$E0..=$EF` user-defined
+  synchronisation range (the inner `u8` carries the low nibble as the
+  slot index `0..=15`), the `$FD` / `$FE` audio-end markers
+  (`AudioEnd` / `AudioFileEnds`), and the `$FF` continuation marker
+  (`Continuation`) the spec describes as "one more byte of events
+  follows". The wire byte is identical between v2.3 and v2.4 — the
+  event-type table is reproduced bit-for-bit in both version docs —
+  so the accessor is version-independent. As with the SYLT, COMR,
+  RVA2 channel-type, and EQU2 interpolation accessors, `from_wire` /
+  `to_wire` form a bijection over the spec range; bytes in the two
+  reserved ranges (`$17..=$DF`, `$F0..=$FC`) surface as `None`. The
+  raw `Id3Frame::EventTimingCodes::events: Vec<(u8, u32)>` field is
+  unchanged and round-trips losslessly through the writer for every
+  byte value — including reserved bytes — so the typed view never
+  costs callers the ability to preserve forward-compatible payloads.
 
 ## Fuzzing
 

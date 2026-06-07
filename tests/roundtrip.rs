@@ -7,10 +7,10 @@ use oxideav_core::{AttachedPicture, PictureType};
 use oxideav_id3::{
     attached_pictures, parse_id3v1, parse_tag, parse_tag_with_extended_header, to_key_value_pairs,
     write_id3v1, write_tag, write_tag_with_options, CommercialDelivery, Equ2Interpolation,
-    EquaBand, Id3Frame, Id3Tag, Id3Version, ImageEncodingRestriction, ImageSizeRestriction,
-    Restrictions, Rva2Channel, Rva2ChannelType, RvadBackChannels, RvadChannel, RvadFrontChannels,
-    SyltContentType, TagSizeRestriction, TextEncodingRestriction, TextFieldsRestriction,
-    TimestampUnit, UnsyncMode, WriteOptions,
+    EquaBand, EtcoEventType, Id3Frame, Id3Tag, Id3Version, ImageEncodingRestriction,
+    ImageSizeRestriction, Restrictions, Rva2Channel, Rva2ChannelType, RvadBackChannels,
+    RvadChannel, RvadFrontChannels, SyltContentType, TagSizeRestriction, TextEncodingRestriction,
+    TextFieldsRestriction, TimestampUnit, UnsyncMode, WriteOptions,
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
@@ -3354,4 +3354,189 @@ fn equ2_interpolation_preserves_reserved_byte_through_roundtrip() {
         parsed.frames.iter().find_map(Id3Frame::equ2_interpolation),
         None
     );
+}
+
+/// `EtcoEventType::from_wire` covers every spec-named value
+/// `$00..=$16` and round-trips back through `to_wire`. The continuation
+/// marker `$FF` and the two audio-end markers `$FD` / `$FE` also
+/// round-trip, and the user-defined synchronisation range `$E0..=$EF`
+/// decodes to `NotPredefinedSync(slot)` where the slot is the low
+/// nibble of the wire byte. The two reserved ranges (`$17..=$DF` and
+/// `$F0..=$FC`) surface as `None` so a non-conforming or future byte
+/// surfaces structurally rather than mapping to a guessed variant —
+/// matching the contract published by `SyltContentType`,
+/// `CommercialDelivery`, `Rva2ChannelType`, `Equ2Interpolation`, and
+/// `Restrictions`.
+#[test]
+fn etco_event_type_wire_bijection() {
+    let spec_named = [
+        (0x00u8, EtcoEventType::Padding),
+        (0x01, EtcoEventType::EndOfInitialSilence),
+        (0x02, EtcoEventType::IntroStart),
+        (0x03, EtcoEventType::MainPartStart),
+        (0x04, EtcoEventType::OutroStart),
+        (0x05, EtcoEventType::OutroEnd),
+        (0x06, EtcoEventType::VerseStart),
+        (0x07, EtcoEventType::RefrainStart),
+        (0x08, EtcoEventType::InterludeStart),
+        (0x09, EtcoEventType::ThemeStart),
+        (0x0A, EtcoEventType::VariationStart),
+        (0x0B, EtcoEventType::KeyChange),
+        (0x0C, EtcoEventType::TimeChange),
+        (0x0D, EtcoEventType::MomentaryUnwantedNoise),
+        (0x0E, EtcoEventType::SustainedNoise),
+        (0x0F, EtcoEventType::SustainedNoiseEnd),
+        (0x10, EtcoEventType::IntroEnd),
+        (0x11, EtcoEventType::MainPartEnd),
+        (0x12, EtcoEventType::VerseEnd),
+        (0x13, EtcoEventType::RefrainEnd),
+        (0x14, EtcoEventType::ThemeEnd),
+        (0x15, EtcoEventType::Profanity),
+        (0x16, EtcoEventType::ProfanityEnd),
+        (0xFD, EtcoEventType::AudioEnd),
+        (0xFE, EtcoEventType::AudioFileEnds),
+        (0xFF, EtcoEventType::Continuation),
+    ];
+    for (wire, typed) in spec_named {
+        assert_eq!(EtcoEventType::from_wire(wire), Some(typed));
+        assert_eq!(typed.to_wire(), wire);
+    }
+
+    // User-defined synchronisation range carries the low nibble as the
+    // slot index and round-trips to the matching $E0..=$EF byte.
+    for slot in 0u8..=15 {
+        let wire = 0xE0 | slot;
+        let typed = EtcoEventType::NotPredefinedSync(slot);
+        assert_eq!(EtcoEventType::from_wire(wire), Some(typed));
+        assert_eq!(typed.to_wire(), wire);
+    }
+
+    // Reserved ranges $17..=$DF and $F0..=$FC surface as None.
+    for reserved in 0x17u8..=0xDF {
+        assert!(
+            EtcoEventType::from_wire(reserved).is_none(),
+            "reserved ETCO event type ${reserved:02x} unexpectedly decoded"
+        );
+    }
+    for reserved in 0xF0u8..=0xFC {
+        assert!(
+            EtcoEventType::from_wire(reserved).is_none(),
+            "reserved ETCO event type ${reserved:02x} unexpectedly decoded"
+        );
+    }
+}
+
+/// `Id3Frame::etco_event_types` decodes the per-event type bytes of an
+/// `EventTimingCodes` frame: one positional `Option<EtcoEventType>` per
+/// source event, `Some(_)` for spec-defined bytes and `None` for the
+/// reserved ranges. Returns `None` for any other frame variant.
+#[test]
+fn etco_event_types_accessor_decodes_mixed_payload() {
+    let frame = Id3Frame::EventTimingCodes {
+        time_format: 2, // milliseconds
+        events: vec![
+            (0x02, 1_000),    // intro start
+            (0x06, 5_000),    // verse start
+            (0xE3, 12_500),   // user sync slot 3
+            (0x42, 18_000),   // reserved → None
+            (0xFD, 180_000),  // audio end
+            (0xFE, 180_500),  // audio file ends
+            (0xFF, u32::MAX), // continuation marker
+        ],
+    };
+    let decoded = frame.etco_event_types().expect("ETCO accessor surfaces");
+    assert_eq!(
+        decoded,
+        vec![
+            Some(EtcoEventType::IntroStart),
+            Some(EtcoEventType::VerseStart),
+            Some(EtcoEventType::NotPredefinedSync(3)),
+            None,
+            Some(EtcoEventType::AudioEnd),
+            Some(EtcoEventType::AudioFileEnds),
+            Some(EtcoEventType::Continuation),
+        ],
+    );
+
+    // Length matches the source `events` length so positional indexing
+    // stays stable when zipped against the raw timestamps.
+    let raw_events = match &frame {
+        Id3Frame::EventTimingCodes { events, .. } => events,
+        _ => unreachable!(),
+    };
+    assert_eq!(decoded.len(), raw_events.len());
+
+    // A non-ETCO variant returns None outright.
+    let other = Id3Frame::Text {
+        id: "TIT2".into(),
+        values: vec!["Song".into()],
+    };
+    assert_eq!(other.etco_event_types(), None);
+}
+
+/// A round-trip writer→parser preserves every ETCO event-type byte —
+/// spec-named, user-defined, end markers, and reserved — so the typed
+/// accessor surfaces the same decoded vector after re-parsing. The
+/// event-type table is identical in v2.3 and v2.4 (the table is
+/// reproduced bit-for-bit in both version docs); this test covers both
+/// envelopes.
+#[test]
+fn etco_event_types_roundtrip_v23_and_v24() {
+    let events = vec![
+        (0x00u8, 0u32),  // padding
+        (0x02, 750),     // intro start
+        (0x08, 1_200),   // interlude start
+        (0x0B, 1_500),   // key change
+        (0xE0, 1_800),   // user sync slot 0
+        (0xEF, 1_900),   // user sync slot 15
+        (0x55, 2_000),   // reserved-range round-trip
+        (0xF5, 2_100),   // reserved-range round-trip
+        (0xFD, 178_000), // audio end
+        (0xFE, 178_500), // audio file ends
+        (0xFF, 178_500), // continuation marker
+    ];
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        let tag = Id3Tag {
+            version,
+            frames: vec![Id3Frame::EventTimingCodes {
+                time_format: 2,
+                events: events.clone(),
+            }],
+        };
+        let bytes = write_tag(&tag, version).expect("write");
+        let (parsed, _) = parse_tag(&bytes).expect("parse");
+        let decoded = parsed
+            .frames
+            .iter()
+            .find_map(Id3Frame::etco_event_types)
+            .expect("ETCO surfaces after round-trip");
+        assert_eq!(
+            decoded,
+            vec![
+                Some(EtcoEventType::Padding),
+                Some(EtcoEventType::IntroStart),
+                Some(EtcoEventType::InterludeStart),
+                Some(EtcoEventType::KeyChange),
+                Some(EtcoEventType::NotPredefinedSync(0)),
+                Some(EtcoEventType::NotPredefinedSync(15)),
+                None,
+                None,
+                Some(EtcoEventType::AudioEnd),
+                Some(EtcoEventType::AudioFileEnds),
+                Some(EtcoEventType::Continuation),
+            ],
+            "version {version:?} did not round-trip the typed view",
+        );
+        // The raw `events` vector also round-trips losslessly for every
+        // byte (reserved bytes preserved verbatim through write).
+        let raw_events = parsed
+            .frames
+            .iter()
+            .find_map(|f| match f {
+                Id3Frame::EventTimingCodes { events, .. } => Some(events.clone()),
+                _ => None,
+            })
+            .expect("ETCO event vector surfaces");
+        assert_eq!(raw_events, events, "version {version:?} raw events lost");
+    }
 }

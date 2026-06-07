@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed accessor `Id3Frame::etco_event_types()` for the per-event
+  "type of event" bytes carried by an `ETCO` payload (spec v2.3 §4.6 /
+  v2.4 §4.5). Decodes to a `Vec<Option<EtcoEventType>>` whose length
+  equals the source `events` vector so positional indexing stays
+  stable when zipped against the raw timestamps; each element is
+  `Some(EtcoEventType)` for a spec-defined byte and `None` for a byte
+  in either reserved range (`$17..=$DF`, `$F0..=$FC`) so a
+  non-conforming source surfaces structurally rather than mapping to a
+  guessed variant. The new `EtcoEventType` enum mirrors the spec's
+  value table verbatim: 23 named events `$00..=$16` ("padding" through
+  "profanity end"), a `NotPredefinedSync(u8)` variant that carries the
+  low nibble of the `$E0..=$EF` user-defined synchronisation slot
+  (`0..=15`), the `$FD` / `$FE` audio-end markers, and the `$FF`
+  continuation marker the spec describes as "one more byte of events
+  follows". `from_wire` / `to_wire` form a bijection over the spec
+  range — matching the contract already published by
+  `Rva2ChannelType`, `Equ2Interpolation`, `SyltContentType`,
+  `CommercialDelivery`, `TimestampUnit`, and `Restrictions`. The
+  event-type table is identical between v2.3 and v2.4 (reproduced
+  bit-for-bit in both version docs) so the accessor is
+  version-independent, matching the cross-version posture of
+  `timestamp_unit()` and `commercial_delivery()`. The raw
+  `EventTimingCodes::events: Vec<(u8, u32)>` field is unchanged and
+  round-trips losslessly through `write_tag` for every byte value —
+  including bytes in the reserved ranges — so the typed view never
+  costs callers the ability to preserve forward-compatible payloads.
+  Three new round-trip tests (wire bijection over the spec range plus
+  reserved-byte rejection for both `$17..=$DF` and `$F0..=$FC`;
+  accessor decoding of a mixed payload with positional indexing
+  stability + cross-variant `None` on a `Text` frame; writer→parser
+  preserves every byte value under both v2.3 and v2.4 envelopes) cover
+  the matrix.
 - Typed accessor `Id3Frame::equ2_interpolation()` for the
   interpolation-method byte that opens an `EQU2` payload (spec v2.4
   §4.12). Decodes to a spec-shaped `Equ2Interpolation` enum with the
