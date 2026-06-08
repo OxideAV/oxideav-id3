@@ -461,6 +461,27 @@ never silently drops data.
   unchanged and round-trips losslessly through the writer for every
   byte value — including reserved bytes — so the typed view never
   costs callers the ability to preserve forward-compatible payloads.
+- `Id3Frame::sytc_tempo_codes()` returns a typed
+  `Vec<Option<SytcTempo>>` for the per-record tempo values carried by
+  a `SYTC` payload (spec v2.4 §4.7). The returned vector matches the
+  source `codes` vector positionally so a caller can `.zip` it against
+  the raw timestamps without losing per-record ordering. `SytcTempo`
+  carries the three categorical meanings the spec assigns to the
+  tempo byte: `BeatFree` (`$00`, "a beat-free time period, which is
+  not the same as a music-free time period"), `SingleStroke` (`$01`,
+  "one single beat-stroke followed by a beat-free period"), and
+  `Bpm(u16)` (the actual BPM in the spec-defined range `2..=510`).
+  The wire-level one-byte vs `$FF $xx` two-byte split is already
+  normalised in `Id3Frame::SyncedTempo::codes` so the typed view
+  stays at the logical layer. `from_wire` / `to_wire` form a
+  bijection over the spec range; any value beyond `510` (which the
+  wire format cannot represent but the raw field could carry)
+  surfaces as `None`, matching the contract on the SYLT, COMR, RVA2
+  channel-type, EQU2 interpolation, and ETCO event-type accessors.
+  The raw `Id3Frame::SyncedTempo::codes: Vec<(u16, u32)>` field is
+  unchanged and round-trips losslessly through the writer for every
+  value the wire format can represent, so the typed view never costs
+  callers the ability to preserve forward-compatible payloads.
 
 ## Fuzzing
 

@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed accessor `Id3Frame::sytc_tempo_codes()` for the per-record
+  tempo values carried by a `SYTC` payload (spec v2.4 §4.7). Decodes
+  to a `Vec<Option<SytcTempo>>` whose length equals the source
+  `codes` vector so positional indexing stays stable when zipped
+  against the raw timestamps; each element is `Some(SytcTempo)` for a
+  spec-defined value (the two reserved-meaning bytes `$00`/`$01` plus
+  the `2..=510` BPM range) and `None` for any value beyond `510` so a
+  non-conforming source surfaces structurally rather than mapping to
+  a guessed variant. The new `SytcTempo` enum mirrors the spec
+  categorical meanings: `BeatFree` (`$00`, "a beat-free time period,
+  which is not the same as a music-free time period"), `SingleStroke`
+  (`$01`, "one single beat-stroke followed by a beat-free period"),
+  and `Bpm(u16)` (the BPM verbatim in the spec range `2..=510`). The
+  wire-level one-byte vs `$FF $xx` two-byte split is already
+  normalised in `Id3Frame::SyncedTempo::codes` so the typed view stays
+  at the logical layer; `from_wire` / `to_wire` form a bijection over
+  the spec range — matching the contract already published by
+  `EtcoEventType`, `Rva2ChannelType`, `Equ2Interpolation`,
+  `SyltContentType`, `CommercialDelivery`, `TimestampUnit`, and
+  `Restrictions`. The wire layout is byte-aligned and
+  version-independent (only the v2.4 frames doc lists `SYTC`, but the
+  on-wire layout is identical between v2.3 and v2.4 envelopes and
+  this crate's parser accepts it under both) so the accessor is
+  effectively version-independent, matching the cross-version posture
+  of `timestamp_unit()` and `etco_event_types()`. The raw
+  `SyncedTempo::codes: Vec<(u16, u32)>` field is unchanged and
+  round-trips losslessly through `write_tag` for every value the wire
+  format can represent (`0..=510`), so the typed view never costs
+  callers the ability to preserve forward-compatible payloads. Three
+  new round-trip tests (wire bijection over the spec range plus
+  beyond-spec-range `None`; accessor decoding of a mixed payload with
+  positional indexing stability + cross-variant `None` on a `Text`
+  frame; writer→parser preserves every wire-representable value under
+  both v2.3 and v2.4 envelopes — single-byte and `$FF`-extension
+  forms — so the typed accessor surfaces the same vector after
+  round-trip) cover the matrix.
 - Typed accessor `Id3Frame::etco_event_types()` for the per-event
   "type of event" bytes carried by an `ETCO` payload (spec v2.3 §4.6 /
   v2.4 §4.5). Decodes to a `Vec<Option<EtcoEventType>>` whose length

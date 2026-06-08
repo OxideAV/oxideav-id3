@@ -9,8 +9,8 @@ use oxideav_id3::{
     write_id3v1, write_tag, write_tag_with_options, CommercialDelivery, Equ2Interpolation,
     EquaBand, EtcoEventType, Id3Frame, Id3Tag, Id3Version, ImageEncodingRestriction,
     ImageSizeRestriction, Restrictions, Rva2Channel, Rva2ChannelType, RvadBackChannels,
-    RvadChannel, RvadFrontChannels, SyltContentType, TagSizeRestriction, TextEncodingRestriction,
-    TextFieldsRestriction, TimestampUnit, UnsyncMode, WriteOptions,
+    RvadChannel, RvadFrontChannels, SyltContentType, SytcTempo, TagSizeRestriction,
+    TextEncodingRestriction, TextFieldsRestriction, TimestampUnit, UnsyncMode, WriteOptions,
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
@@ -3538,5 +3538,140 @@ fn etco_event_types_roundtrip_v23_and_v24() {
             })
             .expect("ETCO event vector surfaces");
         assert_eq!(raw_events, events, "version {version:?} raw events lost");
+    }
+}
+
+/// `SytcTempo::from_wire` / `to_wire` form a bijection over the spec
+/// range (`$00` BeatFree, `$01` SingleStroke, `2..=510` Bpm); values
+/// `511..=u16::MAX` are outside the spec range and surface as `None`.
+#[test]
+fn sytc_tempo_wire_bijection() {
+    assert_eq!(SytcTempo::from_wire(0), Some(SytcTempo::BeatFree));
+    assert_eq!(SytcTempo::BeatFree.to_wire(), 0);
+    assert_eq!(SytcTempo::from_wire(1), Some(SytcTempo::SingleStroke));
+    assert_eq!(SytcTempo::SingleStroke.to_wire(), 1);
+
+    // Boundary BPM values from the spec range walk through both ends
+    // of both wire-encoding forms (single-byte 2..=254 + $FF-extension
+    // 255..=510).
+    for bpm in [2u16, 3, 120, 200, 254, 255, 256, 300, 509, 510] {
+        assert_eq!(SytcTempo::from_wire(bpm), Some(SytcTempo::Bpm(bpm)));
+        assert_eq!(SytcTempo::Bpm(bpm).to_wire(), bpm);
+    }
+
+    // Values beyond the spec range surface as None (the wire format
+    // can't represent them, but the parser preserves the raw u16).
+    for reserved in [511u16, 600, 1000, 0xFFFE, u16::MAX] {
+        assert!(
+            SytcTempo::from_wire(reserved).is_none(),
+            "value {reserved} unexpectedly decoded outside spec range",
+        );
+    }
+}
+
+/// `Id3Frame::sytc_tempo_codes` decodes the per-record tempo values of
+/// a `SyncedTempo` frame: one positional `Option<SytcTempo>` per
+/// source code, `Some(_)` for spec-defined values (the reserved-meaning
+/// $00/$01 plus 2..=510 BPM) and `None` for any value outside the spec
+/// range. Returns `None` for any other frame variant.
+#[test]
+fn sytc_tempo_codes_accessor_decodes_mixed_payload() {
+    let frame = Id3Frame::SyncedTempo {
+        time_format: 2, // milliseconds
+        codes: vec![
+            (0u16, 0u32),      // beat-free at t=0
+            (1, 500),          // single-stroke
+            (120, 1_000),      // 120 BPM (single-byte wire form)
+            (300, 5_500),      // 300 BPM ($FF $2D wire form)
+            (510, 12_000_000), // upper edge of $FF extension
+            (700, 13_000_000), // outside spec range → None
+        ],
+    };
+    let decoded = frame.sytc_tempo_codes().expect("SYTC accessor surfaces");
+    assert_eq!(
+        decoded,
+        vec![
+            Some(SytcTempo::BeatFree),
+            Some(SytcTempo::SingleStroke),
+            Some(SytcTempo::Bpm(120)),
+            Some(SytcTempo::Bpm(300)),
+            Some(SytcTempo::Bpm(510)),
+            None,
+        ],
+    );
+
+    // Length matches the source `codes` length so positional indexing
+    // stays stable when zipped against the raw timestamps.
+    let raw_codes = match &frame {
+        Id3Frame::SyncedTempo { codes, .. } => codes,
+        _ => unreachable!(),
+    };
+    assert_eq!(decoded.len(), raw_codes.len());
+
+    // A non-SYTC variant returns None outright.
+    let other = Id3Frame::Text {
+        id: "TIT2".into(),
+        values: vec!["Song".into()],
+    };
+    assert_eq!(other.sytc_tempo_codes(), None);
+}
+
+/// A round-trip writer→parser preserves every SYTC tempo value the
+/// wire format can represent (`0..=510`), so the typed accessor
+/// surfaces the same decoded vector after re-parsing. The wire layout
+/// is byte-aligned and version-independent; this test covers both v2.3
+/// and v2.4 envelopes.
+#[test]
+fn sytc_tempo_codes_roundtrip_v23_and_v24() {
+    let codes = vec![
+        (0u16, 0u32),     // beat-free
+        (1, 500),         // single stroke
+        (60, 1_000),      // single-byte BPM
+        (200, 2_000),     // single-byte BPM
+        (254, 3_000),     // last single-byte BPM
+        (255, 4_000),     // first $FF-extension BPM
+        (256, 5_000),     // $FF-extension BPM
+        (510, 6_000_000), // last $FF-extension BPM
+    ];
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        let tag = Id3Tag {
+            version,
+            frames: vec![Id3Frame::SyncedTempo {
+                time_format: 2,
+                codes: codes.clone(),
+            }],
+        };
+        let bytes = write_tag(&tag, version).expect("write");
+        let (parsed, _) = parse_tag(&bytes).expect("parse");
+        let decoded = parsed
+            .frames
+            .iter()
+            .find_map(Id3Frame::sytc_tempo_codes)
+            .expect("SYTC surfaces after round-trip");
+        assert_eq!(
+            decoded,
+            vec![
+                Some(SytcTempo::BeatFree),
+                Some(SytcTempo::SingleStroke),
+                Some(SytcTempo::Bpm(60)),
+                Some(SytcTempo::Bpm(200)),
+                Some(SytcTempo::Bpm(254)),
+                Some(SytcTempo::Bpm(255)),
+                Some(SytcTempo::Bpm(256)),
+                Some(SytcTempo::Bpm(510)),
+            ],
+            "version {version:?} did not round-trip the typed view",
+        );
+        // The raw `codes` vector also round-trips losslessly for every
+        // value the wire format can represent.
+        let raw_codes = parsed
+            .frames
+            .iter()
+            .find_map(|f| match f {
+                Id3Frame::SyncedTempo { codes, .. } => Some(codes.clone()),
+                _ => None,
+            })
+            .expect("SYTC code vector surfaces");
+        assert_eq!(raw_codes, codes, "version {version:?} raw codes lost");
     }
 }

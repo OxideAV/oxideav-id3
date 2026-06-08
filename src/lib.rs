@@ -934,6 +934,82 @@ impl Equ2Interpolation {
     }
 }
 
+/// Typed view of the `SYTC` "tempo" byte (spec v2.4 §4.7). Each
+/// per-tempo record in a `SYTC` payload opens with a one- or two-byte
+/// tempo descriptor: a single byte for tempos `$00..=$FE`, or `$FF`
+/// followed by an extension byte whose value is added to `$FF` to give
+/// a tempo in the range `2 - 510` BPM. The spec reserves `$00` to
+/// describe "a beat-free time period, which is not the same as a
+/// music-free time period" and `$01` to indicate "one single
+/// beat-stroke followed by a beat-free period"; values `2..=510` are
+/// the actual BPM. This enum surfaces those three categorical meanings
+/// without losing the round-trip through the raw `u16` field — the
+/// underlying [`Id3Frame::SyncedTempo::codes`] is unchanged.
+///
+/// Wire ranges per spec:
+///
+/// * `$00` — [`SytcTempo::BeatFree`]: a beat-free time period.
+/// * `$01` — [`SytcTempo::SingleStroke`]: one beat-stroke followed by
+///   a beat-free period.
+/// * `2..=510` — [`SytcTempo::Bpm`]: the BPM verbatim. The on-wire
+///   encoding uses a single byte for `2..=254` and the two-byte
+///   `$FF $xx` extension form for `255..=510` (`$FF + $xx` summed),
+///   but both encode to the same logical BPM and the parser already
+///   normalises the extension into a single `u16` in
+///   [`Id3Frame::SyncedTempo::codes`]; this enum stays at the logical
+///   layer.
+/// * `511..=u16::MAX` — outside the spec range and reserved for the
+///   parser to surface only when a producer wrote a wider value than
+///   the on-wire encoding allows. [`SytcTempo::from_wire`] returns
+///   `None` so a non-conforming source surfaces structurally rather
+///   than mapping to a guessed variant — matching the contract on
+///   [`SyltContentType`], [`CommercialDelivery`], [`Rva2ChannelType`],
+///   [`Equ2Interpolation`], [`TimestampUnit`], and
+///   [`Restrictions`]. The accessor is surfaced via
+///   [`Id3Frame::sytc_tempo_codes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SytcTempo {
+    /// `$00` per spec — "beat-free time period, which is not the same
+    /// as a music-free time period".
+    BeatFree,
+    /// `$01` per spec — "one single beat-stroke followed by a
+    /// beat-free period".
+    SingleStroke,
+    /// `2..=510` per spec — the BPM verbatim. The on-wire encoding
+    /// uses a single byte for `2..=254` and the `$FF $xx` two-byte
+    /// extension form (summed) for `255..=510`; both encode to the
+    /// same logical BPM and this enum stays at the logical layer.
+    Bpm(u16),
+}
+
+impl SytcTempo {
+    /// Decode a raw SYTC tempo value (already normalised by the
+    /// parser from the one- or two-byte wire form into a single `u16`).
+    /// Returns `None` for any value outside the spec range `0..=510`
+    /// so a non-conforming source surfaces structurally rather than
+    /// mapping to a guessed variant.
+    pub fn from_wire(value: u16) -> Option<Self> {
+        match value {
+            0 => Some(SytcTempo::BeatFree),
+            1 => Some(SytcTempo::SingleStroke),
+            2..=510 => Some(SytcTempo::Bpm(value)),
+            _ => None,
+        }
+    }
+
+    /// Encode this typed tempo back to the raw value carried in
+    /// [`Id3Frame::SyncedTempo::codes`]. The wire-level one-byte vs
+    /// `$FF` two-byte split is the writer's responsibility — see
+    /// [`write_tag`] — so this returns the logical `u16` only.
+    pub fn to_wire(self) -> u16 {
+        match self {
+            SytcTempo::BeatFree => 0,
+            SytcTempo::SingleStroke => 1,
+            SytcTempo::Bpm(bpm) => bpm,
+        }
+    }
+}
+
 /// Typed view of the `ETCO` "type of event" byte (spec v2.3 §4.6 /
 /// v2.4 §4.5). The byte sits at the start of each per-event record in
 /// an `ETCO` payload — one event-type byte followed by a 32-bit
@@ -1283,6 +1359,46 @@ impl Id3Frame {
                 events
                     .iter()
                     .map(|(byte, _)| EtcoEventType::from_wire(*byte))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Typed accessor for the `SYTC` per-record "tempo" values (spec
+    /// v2.4 §4.7). Returns `Some(tempos)` for a [`Id3Frame::SyncedTempo`]
+    /// frame and `None` for any other variant; each element of the inner
+    /// `Vec` is the typed decoding of that record's raw `u16` —
+    /// `Some(SytcTempo)` for a spec-defined value (the two §4.7
+    /// reserved-meaning bytes `$00` / `$01` plus the `2..=510` BPM
+    /// range) and `None` for any value outside the spec range (`511..=`
+    /// `u16::MAX`) so a non-conforming source surfaces structurally
+    /// rather than mapping to a guessed variant. The accessor stays at
+    /// the logical layer — the wire-level one-byte vs `$FF` two-byte
+    /// split is already normalised in [`Id3Frame::SyncedTempo::codes`].
+    /// `SYTC` is declared once per tag and once per the spec table
+    /// (only the v2.4 frames doc lists it, but the wire layout is
+    /// byte-aligned and version-independent so a v2.3 producer could
+    /// emit the same frame; this crate's parser accepts it under both
+    /// envelopes), so the accessor is effectively version-independent —
+    /// matching the cross-version posture of
+    /// [`Id3Frame::timestamp_unit`] and [`Id3Frame::etco_event_types`].
+    ///
+    /// The raw `codes: Vec<(u16, u32)>` field is unchanged and
+    /// round-trips losslessly through [`write_tag`] for every value
+    /// the wire format can represent (`0..=510`), so the typed view
+    /// never costs callers the ability to preserve a forward-compatible
+    /// payload. The 32-bit timestamp is left untouched here: a caller
+    /// that wants the categorical tempo plus its time can `.zip` the
+    /// returned vector against the raw `codes.iter().map(|(_, ts)| ts)`.
+    /// The returned `Vec` length equals the source `codes` length so
+    /// positional indexing stays stable across the two views.
+    pub fn sytc_tempo_codes(&self) -> Option<Vec<Option<SytcTempo>>> {
+        match self {
+            Id3Frame::SyncedTempo { codes, .. } => Some(
+                codes
+                    .iter()
+                    .map(|(bpm, _)| SytcTempo::from_wire(*bpm))
                     .collect(),
             ),
             _ => None,
