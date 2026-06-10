@@ -122,24 +122,35 @@ fuzz_target!(|data: &[u8]| {
         for &ver in &versions {
             for &crc in &[false, true] {
                 for &footer in &[false, true] {
-                    // 7. Extended-header CRC × unsync × footer
-                    //    combinations. With `crc=true` the writer
-                    //    prepends a CRC-bearing extended header; with
-                    //    `footer=true` (v2.4 only — v2.3 will error
-                    //    out, which is fine) the writer appends a
-                    //    10-byte trailer and sets the tag-header's
-                    //    footer-present bit. The parser walks the
-                    //    optional extended header, verifies the CRC,
-                    //    and additionally verifies the footer's
-                    //    identifier/version/flags/size mirror the
-                    //    header. Every (mode, ver, crc, footer)
-                    //    combination must remain panic-free.
-                    let opts = WriteOptions::new()
-                        .with_unsync(mode)
-                        .with_crc(crc)
-                        .with_footer(footer);
-                    if let Ok(bytes) = write_tag_with_options(&writeable, ver, &opts) {
-                        let _ = parse_tag(&bytes);
+                    for &compress in &[false, true] {
+                        // 7. Extended-header CRC × unsync × footer ×
+                        //    compression combinations. With `crc=true`
+                        //    the writer prepends a CRC-bearing
+                        //    extended header; with `footer=true` (v2.4
+                        //    only — v2.3 will error out, which is
+                        //    fine) the writer appends a 10-byte
+                        //    trailer and sets the tag-header's
+                        //    footer-present bit; with `compress=true`
+                        //    every frame payload rides through the
+                        //    zlib deflate → (unsync) → frame-header
+                        //    layering and the re-parse drives the
+                        //    capped inflate path on whatever frame
+                        //    contents the fuzzer concocted. The parser
+                        //    walks the optional extended header,
+                        //    verifies the CRC, verifies the footer's
+                        //    identifier/version/flags/size mirror the
+                        //    header, and inflates compressed frames
+                        //    against their announced size. Every
+                        //    (mode, ver, crc, footer, compress)
+                        //    combination must remain panic-free.
+                        let opts = WriteOptions::new()
+                            .with_unsync(mode)
+                            .with_crc(crc)
+                            .with_footer(footer)
+                            .with_compression(compress);
+                        if let Ok(bytes) = write_tag_with_options(&writeable, ver, &opts) {
+                            let _ = parse_tag(&bytes);
+                        }
                     }
                 }
             }
