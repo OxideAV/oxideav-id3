@@ -16,6 +16,14 @@ categories = ["multimedia::audio", "parser-implementations"]
 [dependencies]
 oxideav-core = "0.1"
 
+# `compcol` (Karpelès Lab's compression collection, the workspace-wide
+# choice for byte-stream codecs) supplies the RFC 1950 zlib stream the
+# ID3v2 frame-level compression flag is defined over (v2.3 §3.3 flag
+# `i` / v2.4 §4.1.2 flag `k`: "compressed using zlib").
+# `default-features = false` keeps the dependency to exactly that one
+# algorithm.
+compcol = { version = "0.6", default-features = false, features = ["zlib"] }
+
 [dev-dependencies]
 # Round 209 (depth-mode benchmarks): Criterion drives the `id3` bench
 # harness in `benches/id3.rs` that future rounds use to A/B parser /

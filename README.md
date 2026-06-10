@@ -235,6 +235,53 @@ writer emits whatever the caller supplied. Both `with_update` and
 `with_restrictions(Some(_))` are v2.4-only — a v2.3 target returns
 `Error::unsupported` rather than silently dropping the request.
 
+### Frame-level compression
+
+Both ID3v2 dialects define a per-frame compression flag over the zlib
+deflate stream: v2.3 format flag `i` (spec §3.3, with 4 big-endian
+bytes of decompressed size appended to the frame header) and v2.4
+format flag `k` (spec §4.1.2, which makes the data-length-indicator
+bit mandatory and carries the decompressed size as a 32-bit synchsafe
+integer). `parse_tag` inflates flagged frames transparently in both
+versions and then dispatches the recovered payload structurally, so a
+compressed `TIT2` parses to the same `Id3Frame::Text` a plain one
+does. The announced decompressed size is authoritative: a stream that
+inflates to any other length is rejected as corruption (the frame is
+dropped, earlier frames survive), and the announce doubles as the
+allocation cap — bounded by a 64 MiB per-frame ceiling — so a zlib
+bomb can't force a huge allocation. A v2.4 compressed frame missing
+the spec-mandated data-length indicator is treated as malformed.
+
+On the writer side, `WriteOptions::with_compression(true)` deflates
+every frame's payload and emits the per-version flag + size field:
+
+```rust
+use oxideav_id3::{write_tag_with_options, Id3Tag, Id3Version, WriteOptions};
+
+# let tag = Id3Tag { version: Id3Version::V2_4, frames: vec![] };
+let opts = WriteOptions::new().with_compression(true);
+let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts)?;
+// per-frame format flags carry 0x08 (compression) | 0x01 (DLI) in
+// v2.4, or 0x80 in v2.3.
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Compression is applied to every frame unconditionally for
+deterministic output (the spec gives no size policy; a tiny text
+frame may grow by the ~11-byte zlib envelope) and composes with the
+other options: per-frame unsync runs after compression, the
+extended-header CRC covers the post-compression frame bytes, and
+whole-tag unsync wraps the finished body — `parse_tag` reverses the
+layers in the opposite order so the round-trip stays the identity.
+
+The same change wired up the rest of the v2.3 format-flags byte,
+which was previously ignored wholesale: the grouping-identity byte
+(flag `k`) is stripped per the spec's addition ordering rather than
+corrupting the payload offset, and an encrypted frame (flag `j`)
+surfaces as `Id3Frame::Unknown` with the method byte + ciphertext
+preserved — matching the v2.4 posture — instead of dispatching
+ciphertext to a structural parser.
+
 ## Vorbis-style flat-pair view
 
 `to_key_value_pairs(&tag)` projects an `Id3Tag` onto a
@@ -265,8 +312,12 @@ never silently drops data.
   unsync, data-length indicator, and extended headers are handled on
   read; the extended-header CRC-32 is verified against the spec-defined
   region (frames-only in v2.3, frames + padding in v2.4) and parse
-  fails on mismatch. The writer can emit a CRC-bearing extended header
-  via `WriteOptions::with_crc(true)`, the v2.4 "Tag is an update"
+  fails on mismatch. Frame-level zlib compression is decoded in both
+  dialects (v2.3 §3.3 flag `i` / v2.4 §4.1.2 flag `k`) and emitted via
+  `WriteOptions::with_compression(true)`; the v2.3 grouping-identity
+  and encryption header additions are stripped per spec order. The
+  writer can emit a CRC-bearing extended header via
+  `WriteOptions::with_crc(true)`, the v2.4 "Tag is an update"
   flag via `with_update(true)`, and the v2.4 restrictions byte via
   `with_restrictions(Some(_))`. All three sub-fields surface through
   `parse_tag_with_extended_header` as a typed `ExtendedHeader`

@@ -36,6 +36,15 @@
 //! the v2.4 data-length indicator is honoured so tools that set it see
 //! their real payload length.
 //!
+//! Frame-level zlib compression is decoded in both dialects — the
+//! v2.3 format flag (§3.3 flag `i`, with the 4-byte decompressed-size
+//! header addition) and the v2.4 format flag (§4.1.2 flag `k`, with
+//! the mandatory data-length indicator) — and the v2.3 encryption /
+//! grouping-identity header additions are stripped per spec order so
+//! a flagged frame's payload is never dispatched off-by-N.
+//! [`WriteOptions::with_compression`] emits compressed frames on the
+//! writer side.
+//!
 //! The extended header (spec §3.2 in both v2.3 and v2.4) is decoded
 //! rather than skipped: a stored CRC-32 [ISO-3309] is verified against
 //! the spec-defined region (frames-only for v2.3; frames + padding for
@@ -2387,6 +2396,52 @@ fn apply_unsync(buf: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Hard ceiling on a single frame's decompressed payload. Both
+/// version dialects carry an attacker-controlled "decompressed size"
+/// announce next to the zlib stream (4 regular bytes in v2.3, a
+/// 4-byte synchsafe data-length indicator in v2.4); without a cap a
+/// 100-byte tag could announce a multi-gigabyte inflate target. 64
+/// MiB is far beyond any legitimate single frame (the largest
+/// real-world payloads are embedded APIC / GEOB objects of a few
+/// MiB) while keeping the worst-case per-frame allocation bounded.
+const MAX_DECOMPRESSED_FRAME: usize = 64 << 20;
+
+/// Inflate a zlib-compressed frame payload (spec v2.3 §3.3 format
+/// flag `i` / v2.4 §4.1.2 format flag `k`: "compressed using zlib").
+///
+/// `announced` is the decompressed size the frame header carried
+/// alongside the stream. Both spec dialects make the announce
+/// authoritative — it is the only way a conformant writer can let a
+/// reader pre-size the output — so a stream that inflates to any
+/// other length is treated as corruption and rejected, matching the
+/// hard-error posture of the extended-header CRC check. The announce
+/// also serves as the allocation cap: inflation stops with an error
+/// the moment output would exceed it, so a zlib bomb costs at most
+/// `min(announced, MAX_DECOMPRESSED_FRAME)` bytes.
+fn inflate_frame(data: &[u8], announced: usize) -> Result<Vec<u8>> {
+    if announced > MAX_DECOMPRESSED_FRAME {
+        return Err(Error::invalid(
+            "compressed ID3 frame announces an implausibly large decompressed size",
+        ));
+    }
+    let out = compcol::vec::decompress_to_vec_capped::<compcol::zlib::Zlib>(data, announced as u64)
+        .map_err(|e| Error::invalid(format!("compressed ID3 frame: zlib inflate failed: {e:?}")))?;
+    if out.len() != announced {
+        return Err(Error::invalid(
+            "compressed ID3 frame: decompressed size does not match the announced size",
+        ));
+    }
+    Ok(out)
+}
+
+/// Deflate a frame payload into the RFC 1950 zlib stream the
+/// frame-level compression flag is defined over, at `compcol`'s
+/// default compression level.
+fn deflate_frame(data: &[u8]) -> Result<Vec<u8>> {
+    compcol::vec::compress_to_vec::<compcol::zlib::Zlib>(data)
+        .map_err(|e| Error::invalid(format!("ID3 frame zlib deflate failed: {e:?}")))
+}
+
 /// Walk the extended header at the start of `body` and return the
 /// remaining body (frames + padding). When the CRC flag is set, the
 /// stored CRC-32 is verified against the spec-defined region:
@@ -2665,12 +2720,63 @@ fn parse_v23_frame(buf: &[u8]) -> Result<(Id3Frame, usize)> {
         .map_err(|_| Error::invalid("v2.3 frame id not ASCII"))?
         .to_string();
     let size = regular_u32(buf[4], buf[5], buf[6], buf[7]) as usize;
-    let _flags = u16::from_be_bytes([buf[8], buf[9]]);
+    let flags = u16::from_be_bytes([buf[8], buf[9]]);
     if 10 + size > buf.len() {
         return Err(Error::invalid("v2.3 frame overflows tag body"));
     }
-    let payload = &buf[10..10 + size];
-    let frame = dispatch_v23_v24(&id, payload);
+    let mut payload = &buf[10..10 + size];
+
+    // Format flags (second flags byte, spec §3.3 `%ijk00000`):
+    // i (0x80) = compression, j (0x40) = encryption, k (0x20) =
+    // grouping identity. The first byte carries the alter-preservation
+    // / read-only status bits, which are advisory for a reader.
+    let compressed = flags & 0x0080 != 0;
+    let encrypted = flags & 0x0040 != 0;
+    let grouping = flags & 0x0020 != 0;
+
+    // Spec §3.3: the flag-indicated additions extend the frame header
+    // "in the same order as the flags that indicates them. I.e. the
+    // four bytes of decompressed size will precede the encryption
+    // method byte" — so: decompressed size, then encryption method,
+    // then group identifier. They count toward the frame size but are
+    // "not subject to encryption or compression".
+    let mut decompressed_size = 0usize;
+    if compressed {
+        if payload.len() < 4 {
+            return Err(Error::invalid(
+                "v2.3 compressed frame missing the decompressed-size field",
+            ));
+        }
+        decompressed_size = regular_u32(payload[0], payload[1], payload[2], payload[3]) as usize;
+        payload = &payload[4..];
+    }
+    if encrypted {
+        // One method byte follows (registered via ENCR). We carry no
+        // keys, so preserve the method byte + ciphertext verbatim in
+        // an Unknown frame — same posture as the v2.4 path.
+        return Ok((
+            Id3Frame::Unknown {
+                id,
+                raw: payload.to_vec(),
+            },
+            10 + size,
+        ));
+    }
+    if grouping {
+        if payload.is_empty() {
+            return Err(Error::invalid(
+                "v2.3 grouped frame missing the group-identifier byte",
+            ));
+        }
+        payload = &payload[1..];
+    }
+
+    let frame = if compressed {
+        let inflated = inflate_frame(payload, decompressed_size)?;
+        dispatch_v23_v24(&id, &inflated)
+    } else {
+        dispatch_v23_v24(&id, payload)
+    };
     Ok((frame, 10 + size))
 }
 
@@ -2700,8 +2806,10 @@ fn parse_v24_frame(buf: &[u8]) -> Result<(Id3Frame, usize)> {
     if grouping && !payload.is_empty() {
         payload = &payload[1..];
     }
-    if encrypted || compressed {
-        // We don't carry keys/zlib, so just emit an Unknown frame so
+    if encrypted {
+        // One method byte follows the group byte (spec §4.1.2 flag
+        // `m`, registered via ENCR). We carry no keys, so preserve the
+        // method byte + ciphertext verbatim in an Unknown frame so
         // callers can see it was present.
         return Ok((
             Id3Frame::Unknown {
@@ -2710,6 +2818,31 @@ fn parse_v24_frame(buf: &[u8]) -> Result<(Id3Frame, usize)> {
             },
             10 + size,
         ));
+    }
+    if compressed {
+        // Spec §4.1.2 flag `k`: "compressed using zlib deflate
+        // method. If set, this requires the 'Data Length Indicator'
+        // bit to be set as well" — the DLI carries the decompressed
+        // size that v2.3 stored in its dedicated header field.
+        if !data_length_indicator {
+            return Err(Error::invalid(
+                "v2.4 compressed frame missing the required data-length indicator",
+            ));
+        }
+        if payload.len() < 4 {
+            return Err(Error::invalid("v2.4 frame data-length indicator truncated"));
+        }
+        let announced = synchsafe_u32(payload[0], payload[1], payload[2], payload[3]) as usize;
+        let mut data = &payload[4..];
+        // Decoding inverts the write order (compress, then unsync):
+        // reverse the per-frame unsync first, then inflate.
+        let unsync_owned;
+        if frame_unsync {
+            unsync_owned = reverse_unsync(data);
+            data = &unsync_owned;
+        }
+        let inflated = inflate_frame(data, announced)?;
+        return Ok((dispatch_v23_v24(&id, &inflated), 10 + size));
     }
     // The data-length indicator is 4 synchsafe bytes giving the real
     // (post-decompression, post-unsync) size. We don't decompress so
@@ -4643,6 +4776,29 @@ pub struct WriteOptions {
     /// the flag because the caller asking for "append a footer" almost
     /// certainly wants a v2.4 file.
     pub footer: bool,
+    /// Compress every frame's payload with the zlib deflate stream the
+    /// frame-level compression flag is defined over (v2.3 §3.3 format
+    /// flag `i` / v2.4 §4.1.2 format flag `k`). Default `false`: the
+    /// payload is written verbatim.
+    ///
+    /// * v2.3 — the frame's format-flags byte gets bit 0x80 set and
+    ///   the 4-byte big-endian decompressed size is written between
+    ///   the frame header and the zlib stream, per §3.3 ("4 bytes for
+    ///   'decompressed size' appended to the frame header").
+    /// * v2.4 — format-flag bits 0x08 (compression) and 0x01
+    ///   (data-length indicator) are both set, since §4.1.2 makes the
+    ///   DLI mandatory under compression; the DLI carries the
+    ///   decompressed size as a 32-bit synchsafe integer.
+    ///
+    /// Compression is applied to every frame unconditionally for
+    /// deterministic output — the spec attaches the flag per frame but
+    /// gives no size policy, and a tiny text frame may grow by the
+    /// ~11-byte zlib envelope. Composes with the other options:
+    /// per-frame unsync runs *after* compression (the spec orders
+    /// encryption after compression and unsync over the final frame
+    /// bytes), the extended-header CRC covers the post-compression
+    /// frame bytes, and whole-tag unsync wraps the finished body.
+    pub compress: bool,
 }
 
 impl WriteOptions {
@@ -4686,6 +4842,14 @@ impl WriteOptions {
     /// v2.4-only — see [`WriteOptions::restrictions`].
     pub fn with_restrictions(mut self, restrictions: Option<Restrictions>) -> Self {
         self.restrictions = restrictions;
+        self
+    }
+
+    /// Builder-style setter for frame-level zlib compression (spec
+    /// v2.3 §3.3 format flag `i` / v2.4 §4.1.2 format flag `k`). See
+    /// [`WriteOptions::compress`] for the per-version on-wire layout.
+    pub fn with_compression(mut self, enabled: bool) -> Self {
+        self.compress = enabled;
         self
     }
 }
@@ -4757,7 +4921,13 @@ pub fn write_tag_with_options(
     let mut frame_bytes = Vec::new();
     for frame in &tag.frames {
         let frame_unsync = matches!(effective_unsync, UnsyncMode::PerFrame);
-        write_frame_with_options(target_version, frame, frame_unsync, &mut frame_bytes)?;
+        write_frame_with_options(
+            target_version,
+            frame,
+            frame_unsync,
+            options.compress,
+            &mut frame_bytes,
+        )?;
     }
 
     // Optional extended header. We always emit the minimal CRC form
@@ -5067,6 +5237,7 @@ fn write_frame_with_options(
     version: Id3Version,
     frame: &Id3Frame,
     per_frame_unsync: bool,
+    compress: bool,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let (id, mut payload) = encode_frame(version, frame)?;
@@ -5077,23 +5248,57 @@ fn write_frame_with_options(
     }
     id4.copy_from_slice(id_bytes);
 
+    let mut format_flags: u8 = 0;
+    // Frame-level compression (v2.3 §3.3 flag `i` / v2.4 §4.1.2 flag
+    // `k`): deflate the payload and stash the decompressed size for
+    // the version-specific header addition below. Compression runs
+    // before per-frame unsync, mirroring the parse path which reverses
+    // unsync before inflating.
+    let mut size_prefix: Option<[u8; 4]> = None;
+    if compress {
+        let announced = payload.len();
+        match version {
+            Id3Version::V2_4 => {
+                // The data-length indicator is a 32-bit synchsafe
+                // integer, so the *decompressed* size must fit in 28
+                // bits even if the deflated stream would be smaller.
+                if announced >= 1 << 28 {
+                    return Err(Error::invalid(
+                        "v2.4 compressed frame's decompressed size exceeds synchsafe limit",
+                    ));
+                }
+                let s = announced as u32;
+                size_prefix = Some(synchsafe_bytes_u28(s));
+                // §4.1.2: compression "requires the 'Data Length
+                // Indicator' bit to be set as well".
+                format_flags |= 0x08 | 0x01;
+            }
+            Id3Version::V2_3 => {
+                // 4 regular big-endian bytes of decompressed size
+                // "appended to the frame header" (§3.3 flag `i`). The
+                // v2.3 format-flags byte carries compression in bit 7.
+                size_prefix = Some((announced as u32).to_be_bytes());
+                format_flags |= 0x80;
+            }
+            _ => unreachable!("validated in write_tag"),
+        }
+        payload = deflate_frame(&payload)?;
+    }
+
     let apply_per_frame = per_frame_unsync && matches!(version, Id3Version::V2_4);
     if apply_per_frame {
         payload = apply_unsync(&payload);
+        format_flags |= 0x02;
     }
 
     out.extend_from_slice(&id4);
-    let size = payload.len();
+    let size = payload.len() + size_prefix.map_or(0, |p| p.len());
     match version {
         Id3Version::V2_4 => {
             if size >= 1 << 28 {
                 return Err(Error::invalid("v2.4 frame size exceeds synchsafe limit"));
             }
-            let s = size as u32;
-            out.push(((s >> 21) & 0x7F) as u8);
-            out.push(((s >> 14) & 0x7F) as u8);
-            out.push(((s >> 7) & 0x7F) as u8);
-            out.push((s & 0x7F) as u8);
+            out.extend_from_slice(&synchsafe_bytes_u28(size as u32));
         }
         Id3Version::V2_3 => {
             let s = size as u32;
@@ -5101,11 +5306,26 @@ fn write_frame_with_options(
         }
         _ => unreachable!("validated in write_tag"),
     }
-    // status flags = 0, format flags = 0x02 iff per-frame unsync was applied.
-    let format_flags: u8 = if apply_per_frame { 0x02 } else { 0 };
+    // Status flags are always 0; the format flags collect the
+    // compression / data-length / unsync bits set above.
     out.extend_from_slice(&[0, format_flags]);
+    if let Some(prefix) = size_prefix {
+        out.extend_from_slice(&prefix);
+    }
     out.extend_from_slice(&payload);
     Ok(())
+}
+
+/// Encode a 28-bit value as the 4 synchsafe bytes used by v2.4 frame
+/// sizes and data-length indicators. Caller must have range-checked
+/// `v < 1 << 28`.
+fn synchsafe_bytes_u28(v: u32) -> [u8; 4] {
+    [
+        ((v >> 21) & 0x7F) as u8,
+        ((v >> 14) & 0x7F) as u8,
+        ((v >> 7) & 0x7F) as u8,
+        (v & 0x7F) as u8,
+    ]
 }
 
 /// Produce the (id, payload) tuple for a frame. Callers wrap this with
@@ -8637,5 +8857,314 @@ mod tests {
 
         // An empty value contributes nothing.
         assert_eq!(parse(""), Vec::<ContentType>::new());
+    }
+
+    // -----------------------------------------------------------------
+    // Frame-level zlib compression (v2.3 §3.3 flag `i` / v2.4 §4.1.2
+    // flag `k`) + the rest of the v2.3 format-flags byte (encryption /
+    // grouping additions).
+    // -----------------------------------------------------------------
+
+    /// Structural frame equality for tests. `Id3Frame` deliberately
+    /// does not implement `PartialEq` (its `AttachedPicture` member
+    /// is an oxideav-core type without one), so compare the exact
+    /// Debug projections instead — every field of every variant
+    /// participates.
+    #[track_caller]
+    fn assert_frames_eq(got: &[Id3Frame], want: &[Id3Frame]) {
+        assert_eq!(format!("{got:?}"), format!("{want:?}"));
+    }
+
+    /// A tag whose frames are worth compressing (a long repetitive
+    /// PRIV payload) plus a small text frame so both shapes ride
+    /// through the same options.
+    fn compressible_tag() -> Id3Tag {
+        Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![
+                Id3Frame::Text {
+                    id: "TIT2".into(),
+                    values: vec!["Ünïcode Title".into()],
+                },
+                Id3Frame::Private {
+                    owner: "example".into(),
+                    data: b"highly compressible ".repeat(64),
+                },
+            ],
+        }
+    }
+
+    /// `with_compression(true)` round-trips through `parse_tag` for
+    /// both writable versions, sets the right per-version format-flag
+    /// bits, and stores the decompressed size in the right shape
+    /// (4 regular BE bytes in v2.3, a synchsafe DLI in v2.4).
+    #[test]
+    fn compressed_write_roundtrip_v23_and_v24() {
+        let tag = compressible_tag();
+        let opts = WriteOptions::new().with_compression(true);
+
+        for version in [Id3Version::V2_3, Id3Version::V2_4] {
+            let bytes = write_tag_with_options(&tag, version, &opts).unwrap();
+
+            // First frame header starts right after the 10-byte tag
+            // header: id(4) size(4) status(1) format(1).
+            let format_flags = bytes[ID3V2_HEADER_SIZE + 9];
+            let announce = &bytes[ID3V2_HEADER_SIZE + 10..ID3V2_HEADER_SIZE + 14];
+            // The first frame is TIT2; its decompressed payload is the
+            // encoding byte + encoded title.
+            let (_, plain) = encode_frame(version, &tag.frames[0]).unwrap();
+            match version {
+                Id3Version::V2_3 => {
+                    assert_eq!(format_flags, 0x80, "v2.3 compression bit");
+                    assert_eq!(
+                        regular_u32(announce[0], announce[1], announce[2], announce[3]) as usize,
+                        plain.len(),
+                        "v2.3 decompressed-size field"
+                    );
+                }
+                Id3Version::V2_4 => {
+                    assert_eq!(format_flags, 0x09, "v2.4 compression + DLI bits");
+                    assert_eq!(
+                        synchsafe_u32(announce[0], announce[1], announce[2], announce[3]) as usize,
+                        plain.len(),
+                        "v2.4 data-length indicator"
+                    );
+                }
+                _ => unreachable!(),
+            }
+
+            // The big PRIV frame must actually have shrunk on the wire.
+            assert!(
+                bytes.len() < write_tag(&tag, version).unwrap().len(),
+                "compressed tag should be smaller than the plain one for {version:?}"
+            );
+
+            let (parsed, consumed) = parse_tag(&bytes).unwrap();
+            assert_eq!(consumed, bytes.len());
+            assert_frames_eq(&parsed.frames, &tag.frames);
+        }
+    }
+
+    /// Compression composes with per-frame unsync (v2.4): the format
+    /// flags carry 0x08 | 0x02 | 0x01 and the parse path reverses
+    /// unsync before inflating.
+    #[test]
+    fn compressed_per_frame_unsync_composes_v24() {
+        // An incompressible payload makes the deflate stream carry
+        // plenty of high bytes, exercising the unsync escape.
+        let mut noise = Vec::with_capacity(4096);
+        let mut x: u32 = 0x2545_F491;
+        for _ in 0..4096 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            noise.push((x >> 24) as u8);
+        }
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Private {
+                owner: "noise".into(),
+                data: noise,
+            }],
+        };
+        let opts = WriteOptions::new()
+            .with_compression(true)
+            .with_unsync(UnsyncMode::PerFrame);
+        let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &opts).unwrap();
+        assert_eq!(bytes[ID3V2_HEADER_SIZE + 9], 0x0B, "compression+unsync+DLI");
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        assert_frames_eq(&parsed.frames, &tag.frames);
+    }
+
+    /// Compression composes with the extended-header CRC and
+    /// whole-tag unsync: the CRC covers the post-compression frame
+    /// bytes and the parser verifies it after reversing unsync.
+    #[test]
+    fn compressed_crc_whole_tag_unsync_composes() {
+        let tag = compressible_tag();
+        for version in [Id3Version::V2_3, Id3Version::V2_4] {
+            let opts = WriteOptions::new()
+                .with_compression(true)
+                .with_crc(true)
+                .with_unsync(UnsyncMode::WholeTag);
+            let bytes = write_tag_with_options(&tag, version, &opts).unwrap();
+            let (parsed, _) = parse_tag(&bytes).unwrap();
+            assert_frames_eq(&parsed.frames, &tag.frames);
+        }
+    }
+
+    /// Hand-built v2.3 compressed frame (spec §3.3 wire layout, not
+    /// our writer's output): format flag 0x80, 4 BE bytes of
+    /// decompressed size, then the zlib stream.
+    #[test]
+    fn v23_handbuilt_compressed_frame_parses() {
+        let plain = [&[0u8][..], b"Compressed Title"].concat();
+        let zlib = deflate_frame(&plain).unwrap();
+        let body = [&(plain.len() as u32).to_be_bytes()[..], &zlib].concat();
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"TIT2");
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x80]); // status, format (i bit)
+        frame.extend_from_slice(&body);
+
+        let tag = wrap_v23_tag(&frame);
+        let (parsed, _) = parse_tag(&tag).unwrap();
+        assert_frames_eq(
+            &parsed.frames,
+            &[Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["Compressed Title".into()],
+            }],
+        );
+    }
+
+    /// Wrap raw v2.3 frame bytes in a 10-byte tag header.
+    fn wrap_v23_tag(frames: &[u8]) -> Vec<u8> {
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"ID3");
+        tag.extend_from_slice(&[3, 0, 0]);
+        let s = frames.len() as u32;
+        tag.push(((s >> 21) & 0x7F) as u8);
+        tag.push(((s >> 14) & 0x7F) as u8);
+        tag.push(((s >> 7) & 0x7F) as u8);
+        tag.push((s & 0x7F) as u8);
+        tag.extend_from_slice(frames);
+        tag
+    }
+
+    /// v2.3 grouping-identity flag (k = 0x20): the group-identifier
+    /// byte is a header addition, not payload — a grouped TIT2 must
+    /// parse to its text, not to garbage shifted by one byte.
+    #[test]
+    fn v23_grouped_frame_skips_group_byte() {
+        let body = [&[0xA5u8, 0x00][..], b"Grouped"].concat();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"TIT2");
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x20]); // status, format (k bit)
+        frame.extend_from_slice(&body);
+
+        let (parsed, _) = parse_tag(&wrap_v23_tag(&frame)).unwrap();
+        assert_frames_eq(
+            &parsed.frames,
+            &[Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["Grouped".into()],
+            }],
+        );
+    }
+
+    /// v2.3 encryption flag (j = 0x40): without keys the frame
+    /// surfaces as Unknown with the method byte + ciphertext
+    /// preserved. With compression also set (i | j), the
+    /// decompressed-size addition precedes the method byte (§3.3
+    /// orders additions by flag order) and is stripped, while the
+    /// method byte + data are preserved.
+    #[test]
+    fn v23_encrypted_frame_surfaces_unknown() {
+        // Encrypted-only.
+        let body = [&[0x42u8][..], b"ciphertext"].concat();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"GEOB");
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x40]);
+        frame.extend_from_slice(&body);
+        let (parsed, _) = parse_tag(&wrap_v23_tag(&frame)).unwrap();
+        assert_frames_eq(
+            &parsed.frames,
+            &[Id3Frame::Unknown {
+                id: "GEOB".into(),
+                raw: body.clone(),
+            }],
+        );
+
+        // Compressed + encrypted: 4-byte size first, then method byte.
+        let body2 = [&1234u32.to_be_bytes()[..], &[0x42], b"ciphertext"].concat();
+        let mut frame2 = Vec::new();
+        frame2.extend_from_slice(b"GEOB");
+        frame2.extend_from_slice(&(body2.len() as u32).to_be_bytes());
+        frame2.extend_from_slice(&[0x00, 0xC0]);
+        frame2.extend_from_slice(&body2);
+        let (parsed2, _) = parse_tag(&wrap_v23_tag(&frame2)).unwrap();
+        assert_frames_eq(
+            &parsed2.frames,
+            &[Id3Frame::Unknown {
+                id: "GEOB".into(),
+                raw: body.clone(), // size addition stripped, method + data kept
+            }],
+        );
+    }
+
+    /// v2.4 §4.1.2 makes the data-length indicator mandatory under
+    /// compression ("this requires the 'Data Length Indicator' bit to
+    /// be set as well"). A compressed frame without it is malformed;
+    /// frames parsed before it survive, per the parser's
+    /// keep-what-we-got posture for corrupted frames.
+    #[test]
+    fn v24_compressed_without_dli_drops_frame() {
+        let good_tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["Kept".into()],
+            }],
+        };
+        let mut bytes =
+            write_tag_with_options(&good_tag, Id3Version::V2_4, &WriteOptions::new()).unwrap();
+
+        // Append a compressed frame whose format flags claim 0x08
+        // without 0x01.
+        let zlib = deflate_frame(b"\x00whatever").unwrap();
+        let mut bad = Vec::new();
+        bad.extend_from_slice(b"TALB");
+        bad.extend_from_slice(&synchsafe_bytes_u28(zlib.len() as u32));
+        bad.extend_from_slice(&[0x00, 0x08]);
+        bad.extend_from_slice(&zlib);
+        bytes.extend_from_slice(&bad);
+        let new_size = (bytes.len() - ID3V2_HEADER_SIZE) as u32;
+        bytes[6..10].copy_from_slice(&synchsafe_bytes_u28(new_size));
+
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        assert_frames_eq(&parsed.frames, &good_tag.frames);
+    }
+
+    /// The announced decompressed size is authoritative: a stream
+    /// that inflates to a different length is rejected as corruption
+    /// (the frame is dropped), matching the CRC-mismatch posture.
+    #[test]
+    fn compressed_announce_mismatch_drops_frame() {
+        let plain = [&[0u8][..], b"Mismatch"].concat();
+        let zlib = deflate_frame(&plain).unwrap();
+        // Announce one byte more than the stream actually inflates to.
+        let body = [&((plain.len() + 1) as u32).to_be_bytes()[..], &zlib].concat();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"TIT2");
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x80]);
+        frame.extend_from_slice(&body);
+        let (parsed, _) = parse_tag(&wrap_v23_tag(&frame)).unwrap();
+        assert!(parsed.frames.is_empty());
+    }
+
+    /// A zlib bomb can't force a huge allocation: an announce beyond
+    /// the 64 MiB per-frame ceiling is rejected before any inflation
+    /// happens, and output is capped at the announce otherwise.
+    #[test]
+    fn compressed_bomb_announce_capped() {
+        let zlib = deflate_frame(&vec![0u8; 1024]).unwrap();
+        let body = [&u32::MAX.to_be_bytes()[..], &zlib].concat();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"PRIV");
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x80]);
+        frame.extend_from_slice(&body);
+        let (parsed, _) = parse_tag(&wrap_v23_tag(&frame)).unwrap();
+        assert!(parsed.frames.is_empty());
+
+        // Direct check on the helper: cap error, not OOM.
+        assert!(inflate_frame(&zlib, MAX_DECOMPRESSED_FRAME + 1).is_err());
+        // And inflating with the honest announce succeeds.
+        assert_eq!(inflate_frame(&zlib, 1024).unwrap(), vec![0u8; 1024]);
     }
 }

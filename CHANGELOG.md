@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Frame-level zlib compression, both directions (spec v2.3 §3.3
+  format flag `i` / v2.4 §4.1.2 format flag `k`). `parse_tag` now
+  inflates compressed frames transparently in both dialects — v2.3's
+  4-byte big-endian decompressed-size header addition and v2.4's
+  mandatory data-length indicator (a compressed v2.4 frame without
+  the DLI bit is rejected per the spec's "requires the 'Data Length
+  Indicator' bit to be set as well") — and dispatches the recovered
+  payload structurally. The announced decompressed size is
+  authoritative: an inflate-length mismatch drops the frame (earlier
+  frames survive, matching the corrupted-frame posture), and the
+  announce doubles as the allocation cap under a 64 MiB per-frame
+  ceiling so a zlib bomb can't force a huge allocation. On the
+  writer side `WriteOptions::with_compression(true)` deflates every
+  frame and emits the per-version flag + size field; it composes
+  with per-frame unsync (compression first, unsync second, mirroring
+  the parse order), the extended-header CRC (computed over the
+  post-compression frame bytes), and whole-tag unsync. The zlib
+  stream comes from `compcol` (the workspace-wide compression
+  collection), `default-features = false`, `features = ["zlib"]`.
 - Typed accessor `Id3Frame::content_types()` for the `TCON`
   content-type (genre) frame (spec v2.3 §4.2.1 / v2.4 §4.2.3). Decodes
   the frame's one-or-several content-type references into a
@@ -282,6 +301,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The v2.3 frame parser previously ignored the frame-flags bytes
+  entirely, so a v2.3 frame with any format flag set had its payload
+  dispatched at the wrong offset (grouping) or its raw
+  ciphertext/deflate bytes fed to a structural parser (encryption /
+  compression). The §3.3 header additions are now consumed in spec
+  order — decompressed size, then encryption-method byte, then
+  group-identifier byte — with grouped frames parsing their real
+  payload and encrypted frames surfacing as `Id3Frame::Unknown` with
+  the method byte + ciphertext preserved, matching the existing v2.4
+  posture.
 - v2.4 extended-header CRC writer was silently truncating CRC bit 31
   when serialising the 32-bit CRC into the spec's 5-byte synchsafe
   encoding. Spec §3.2 specifies 5×7-bit bytes = 35 bits, of which
