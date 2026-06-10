@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed accessor `Id3Frame::content_types()` for the `TCON`
+  content-type (genre) frame (spec v2.3 §4.2.1 / v2.4 §4.2.3). Decodes
+  the frame's one-or-several content-type references into a
+  `Vec<ContentType>`, normalising both version dialects onto one
+  vocabulary: v2.3's parenthesised grammar (`(21)` numeric ID3v1 genre
+  reference, `(RX)` / `(CR)` Remix / Cover keyword references,
+  `(4)Eurodisco` numeric reference + free-text refinement, `(51)(39)`
+  multiple references in one string, the `((`-escape for a literal-`(`
+  custom genre, and a non-conforming unclosed `(` surfacing the
+  remainder as free text rather than dropping it) and v2.4's bare form
+  (numeric string → genre, bare `RX` / `CR` keywords, NUL-separated
+  values as independent references). The new `ContentType` enum carries
+  `Genre { index: u8, name: Option<&'static str> }` (numeric reference
+  resolved against the same Winamp-extended ID3v1 genre table the v1
+  trailer uses; `name: None` for an out-of-table index so a
+  forward-compatible reference surfaces structurally rather than being
+  dropped), `Remix`, `Cover`, and `Custom(String)` for free-text
+  genres. The accessor walks the parser's already-NUL-split `values`
+  and applies the per-value grammar to each, returning `None` for any
+  non-`TCON` frame and `Some(Vec::new())` for a present-but-empty
+  `TCON`. The raw `Id3Frame::Text::values` is unchanged and round-trips
+  losslessly through `write_tag`, so the typed view never costs callers
+  the ability to preserve the exact on-wire string — matching the
+  forward-compatible posture already published by `etco_event_types()`,
+  `sytc_tempo_codes()`, and the per-byte enum accessors. Four new tests
+  (lib-level grammar coverage of the parenthesised + bare forms, the
+  `((`-escape, an unclosed `(`, and bare numeric / keyword / free-text
+  values; integration accessor decoding of the v2.3 parenthesised form
+  including out-of-table `name: None` and cross-variant `None`; v2.4
+  bare-form decoding including a present-but-empty frame; writer→parser
+  round-trip preserving the typed view under both v2.3 and v2.4
+  envelopes) cover the matrix.
 - Typed accessor `Id3Frame::sytc_tempo_codes()` for the per-record
   tempo values carried by a `SYTC` payload (spec v2.4 §4.7). Decodes
   to a `Vec<Option<SytcTempo>>` whose length equals the source

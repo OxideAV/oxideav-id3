@@ -482,6 +482,27 @@ never silently drops data.
   unchanged and round-trips losslessly through the writer for every
   value the wire format can represent, so the typed view never costs
   callers the ability to preserve forward-compatible payloads.
+- `Id3Frame::content_types()` returns a typed `Vec<ContentType>` for
+  the `TCON` content-type (genre) frame (spec v2.3 §4.2.1 / v2.4
+  §4.2.3). The frame carries one or several content-type references in
+  one string; the two version dialects share a vocabulary but frame it
+  differently and the accessor normalises both. v2.3 references are
+  parenthesised — `(21)` is an ID3v1 numeric genre reference, `(RX)` /
+  `(CR)` the Remix / Cover keywords, `(4)Eurodisco` a numeric reference
+  plus a free-text refinement, `(51)(39)` two references in one string,
+  and `((` an escape for a literal-`(` custom genre. v2.4 dropped the
+  parentheses — a numeric content type is a bare number, `RX` / `CR`
+  are bare keywords, and the text-frame NUL list separates multiple
+  references. `ContentType` collapses both onto `Genre { index, name }`
+  (numeric reference resolved against the same Winamp-extended ID3v1
+  genre table the v1 trailer uses, `name: None` for an out-of-table
+  index so a forward-compatible reference surfaces structurally rather
+  than being dropped), `Remix`, `Cover`, and `Custom(String)` for
+  free-text genres. The raw `Id3Frame::Text::values` is unchanged and
+  round-trips losslessly through the writer, so the typed view never
+  costs callers the ability to preserve the exact on-wire string,
+  matching the forward-compatible posture of `etco_event_types()` and
+  `sytc_tempo_codes()`.
 
 ## Fuzzing
 

@@ -6,11 +6,12 @@
 use oxideav_core::{AttachedPicture, PictureType};
 use oxideav_id3::{
     attached_pictures, parse_id3v1, parse_tag, parse_tag_with_extended_header, to_key_value_pairs,
-    write_id3v1, write_tag, write_tag_with_options, CommercialDelivery, Equ2Interpolation,
-    EquaBand, EtcoEventType, Id3Frame, Id3Tag, Id3Version, ImageEncodingRestriction,
-    ImageSizeRestriction, Restrictions, Rva2Channel, Rva2ChannelType, RvadBackChannels,
-    RvadChannel, RvadFrontChannels, SyltContentType, SytcTempo, TagSizeRestriction,
-    TextEncodingRestriction, TextFieldsRestriction, TimestampUnit, UnsyncMode, WriteOptions,
+    write_id3v1, write_tag, write_tag_with_options, CommercialDelivery, ContentType,
+    Equ2Interpolation, EquaBand, EtcoEventType, Id3Frame, Id3Tag, Id3Version,
+    ImageEncodingRestriction, ImageSizeRestriction, Restrictions, Rva2Channel, Rva2ChannelType,
+    RvadBackChannels, RvadChannel, RvadFrontChannels, SyltContentType, SytcTempo,
+    TagSizeRestriction, TextEncodingRestriction, TextFieldsRestriction, TimestampUnit, UnsyncMode,
+    WriteOptions,
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
@@ -3673,5 +3674,181 @@ fn sytc_tempo_codes_roundtrip_v23_and_v24() {
             })
             .expect("SYTC code vector surfaces");
         assert_eq!(raw_codes, codes, "version {version:?} raw codes lost");
+    }
+}
+
+/// `Id3Frame::content_types` decodes the v2.3 parenthesised `TCON`
+/// grammar (spec v2.3 §4.2.1): numeric ID3v1 genre references `(21)`,
+/// the `(RX)` / `(CR)` keyword references, multiple references in one
+/// string `(51)(39)`, a numeric reference plus a free-text refinement
+/// `(4)Eurodisco`, the `((`-escaped literal-`(` custom genre, and an
+/// out-of-table numeric index surfacing as `name: None`.
+#[test]
+fn content_types_accessor_parses_v23_parenthesised() {
+    // `(21)` → Ska (index 21 in the Winamp-extended ID3v1 table).
+    let single = Id3Frame::Text {
+        id: "TCON".into(),
+        values: vec!["(21)".into()],
+    };
+    assert_eq!(
+        single.content_types().expect("TCON surfaces"),
+        vec![ContentType::Genre {
+            index: 21,
+            name: Some("Ska"),
+        }],
+    );
+
+    // `(RX)` Remix and `(CR)` Cover keyword references.
+    let keywords = Id3Frame::Text {
+        id: "TCON".into(),
+        values: vec!["(RX)(CR)".into()],
+    };
+    assert_eq!(
+        keywords.content_types().expect("TCON surfaces"),
+        vec![ContentType::Remix, ContentType::Cover],
+    );
+
+    // `(51)(39)` → two numeric references in one string.
+    let multi = Id3Frame::Text {
+        id: "TCON".into(),
+        values: vec!["(51)(39)".into()],
+    };
+    assert_eq!(
+        multi.content_types().expect("TCON surfaces"),
+        vec![
+            ContentType::Genre {
+                index: 51,
+                name: Some("Techno-Industrial"),
+            },
+            ContentType::Genre {
+                index: 39,
+                name: Some("Noise"),
+            },
+        ],
+    );
+
+    // `(4)Eurodisco` → numeric reference plus a free-text refinement.
+    let refined = Id3Frame::Text {
+        id: "TCON".into(),
+        values: vec!["(4)Eurodisco".into()],
+    };
+    assert_eq!(
+        refined.content_types().expect("TCON surfaces"),
+        vec![
+            ContentType::Genre {
+                index: 4,
+                name: Some("Disco"),
+            },
+            ContentType::Custom("Eurodisco".into()),
+        ],
+    );
+
+    // `((I can figure out any genre)` → `((` escapes a literal leading
+    // `(`; the refinement keeps a single `(`.
+    let escaped = Id3Frame::Text {
+        id: "TCON".into(),
+        values: vec!["((I can figure out any genre)".into()],
+    };
+    assert_eq!(
+        escaped.content_types().expect("TCON surfaces"),
+        vec![ContentType::Custom("(I can figure out any genre)".into())],
+    );
+
+    // An out-of-table numeric index surfaces structurally with
+    // `name: None` rather than being dropped.
+    let out_of_table = Id3Frame::Text {
+        id: "TCON".into(),
+        values: vec!["(200)".into()],
+    };
+    assert_eq!(
+        out_of_table.content_types().expect("TCON surfaces"),
+        vec![ContentType::Genre {
+            index: 200,
+            name: None,
+        }],
+    );
+
+    // A non-TCON frame returns None outright.
+    let other = Id3Frame::Text {
+        id: "TIT2".into(),
+        values: vec!["Song".into()],
+    };
+    assert_eq!(other.content_types(), None);
+}
+
+/// `Id3Frame::content_types` decodes the v2.4 bare `TCON` form (spec
+/// v2.4 §4.2.3): a bare numeric string is a genre reference, `RX` / `CR`
+/// are bare keyword references, NUL-separated values are independent
+/// references, and any non-numeric non-keyword value is free text.
+#[test]
+fn content_types_accessor_parses_v24_bare() {
+    // Bare `"21"` numeric reference + a `"Eurodisco"` custom value, as
+    // the parser splits a `"21\0Eurodisco"` v2.4 frame.
+    let frame = Id3Frame::Text {
+        id: "TCON".into(),
+        values: vec!["21".into(), "Eurodisco".into()],
+    };
+    assert_eq!(
+        frame.content_types().expect("TCON surfaces"),
+        vec![
+            ContentType::Genre {
+                index: 21,
+                name: Some("Ska"),
+            },
+            ContentType::Custom("Eurodisco".into()),
+        ],
+    );
+
+    // Bare `RX` / `CR` keyword references across two NUL-split values.
+    let keywords = Id3Frame::Text {
+        id: "TCON".into(),
+        values: vec!["RX".into(), "CR".into()],
+    };
+    assert_eq!(
+        keywords.content_types().expect("TCON surfaces"),
+        vec![ContentType::Remix, ContentType::Cover],
+    );
+
+    // A present-but-empty TCON yields an empty reference list.
+    let empty = Id3Frame::Text {
+        id: "TCON".into(),
+        values: vec![],
+    };
+    assert_eq!(empty.content_types(), Some(Vec::new()));
+}
+
+/// A round-trip writer→parser preserves the raw `TCON` string, so the
+/// typed accessor surfaces the same content-type references after
+/// re-parsing under both v2.3 and v2.4 envelopes. The writer joins
+/// multi-value text frames with `/` for v2.3 and NUL for v2.4; both
+/// produce a value list the accessor re-flattens onto the same vector.
+#[test]
+fn content_types_roundtrip_v23_and_v24() {
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        // A single parenthesised v2.3-style value round-trips under
+        // either envelope (no embedded NUL, so the writer keeps it as a
+        // single value).
+        let tag = Id3Tag {
+            version,
+            frames: vec![Id3Frame::Text {
+                id: "TCON".into(),
+                values: vec!["(21)".into()],
+            }],
+        };
+        let bytes = write_tag(&tag, version).expect("write");
+        let (parsed, _) = parse_tag(&bytes).expect("parse");
+        let decoded = parsed
+            .frames
+            .iter()
+            .find_map(Id3Frame::content_types)
+            .expect("TCON surfaces after round-trip");
+        assert_eq!(
+            decoded,
+            vec![ContentType::Genre {
+                index: 21,
+                name: Some("Ska"),
+            }],
+            "version {version:?} did not round-trip the typed view",
+        );
     }
 }

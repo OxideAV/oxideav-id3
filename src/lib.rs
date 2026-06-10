@@ -1010,6 +1010,126 @@ impl SytcTempo {
     }
 }
 
+/// Typed view of one `TCON` "Content type" reference (spec v2.3 §4.2.1
+/// `TCON` / v2.4 §4.2.3 `TCON`). The genre frame carries one or several
+/// content-type references in a single string. The two version dialects
+/// differ in framing but share the underlying vocabulary:
+///
+/// * v2.3 stores references parenthesised: an ID3v1 numeric genre is
+///   `"("` + a number from the appendix-A list + `")"` (e.g. `"(21)"`),
+///   optionally followed by a free-text refinement (e.g. `"(4)Eurodisco"`).
+///   Several references can sit in one string (`"(51)(39)"`). A literal
+///   `"("` opening a free-text refinement is escaped by doubling it
+///   (`"((I can figure out any genre)"`). The spec also defines two
+///   keyword references — `"(RX)"` Remix and `"(CR)"` Cover.
+/// * v2.4 dropped the parentheses: a numeric content type is a bare
+///   numeric string and `"RX"` / `"CR"` are bare keyword strings, with
+///   multiple references separated by the text-frame NUL list (so each
+///   appears as its own entry in [`Id3Frame::Text::values`]).
+///
+/// This enum collapses both dialects onto the same vocabulary. It is
+/// surfaced via [`Id3Frame::content_types`]; see that accessor for how
+/// the two framings are parsed into a single `Vec<ContentType>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContentType {
+    /// A reference to the ID3v1 numeric genre list (appendix A). `index`
+    /// is the raw numeric value; `name` is the resolved genre string from
+    /// the same Winamp-extended table [`parse_id3v1`] uses, or `None`
+    /// when the number falls outside that table (a forward-compatible
+    /// numeric reference a future genre list might define).
+    Genre {
+        /// The numeric genre reference (`"21"` → `21`).
+        index: u8,
+        /// The resolved genre name, or `None` for an out-of-table index.
+        name: Option<&'static str>,
+    },
+    /// The `RX` keyword reference per spec — "Remix".
+    Remix,
+    /// The `CR` keyword reference per spec — "Cover".
+    Cover,
+    /// A free-text content type the spec lets a producer "define their
+    /// own": a v2.3 refinement after a parenthesised reference, a v2.3
+    /// `((`-escaped custom string, or any v2.4 bare value that is neither
+    /// a pure number nor an `RX` / `CR` keyword. The inner string is the
+    /// refinement text with any `((` escape already collapsed to a single
+    /// leading `(`.
+    Custom(String),
+}
+
+impl ContentType {
+    /// Resolve a numeric genre reference into a [`ContentType::Genre`],
+    /// looking the name up in the same Winamp-extended ID3v1 genre table
+    /// used by [`parse_id3v1`].
+    fn from_genre_index(index: u8) -> ContentType {
+        ContentType::Genre {
+            index,
+            name: id3v1_genre(index),
+        }
+    }
+}
+
+/// Parse a single TCON value string into its content-type references.
+///
+/// Handles the v2.3 parenthesised grammar (`(21)`, `(RX)`, `(CR)`,
+/// `(4)Eurodisco`, the `((` escape) and falls back to the v2.4 bare
+/// interpretation (a pure numeric string, the `RX` / `CR` keywords, or
+/// free text) when the value does not open with a `(`. References are
+/// appended to `out` in left-to-right wire order.
+fn parse_tcon_value(value: &str, out: &mut Vec<ContentType>) {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    // Walk leading parenthesised references per spec v2.3 §4.2.1.
+    while i < bytes.len() && bytes[i] == b'(' {
+        // "((" escapes a literal '(' that begins a free-text refinement.
+        if i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+            let refinement = format!("({}", &value[i + 2..]);
+            out.push(ContentType::Custom(refinement));
+            return;
+        }
+        // Find the closing ')'. A '(' with no ')' is non-conforming;
+        // surface the remainder as free text rather than dropping it.
+        let Some(rel_close) = value[i + 1..].find(')') else {
+            out.push(ContentType::Custom(value[i..].to_string()));
+            return;
+        };
+        let close = i + 1 + rel_close;
+        let inner = &value[i + 1..close];
+        push_bare_reference(inner, out);
+        i = close + 1;
+    }
+    // Anything left after the parenthesised references is a free-text
+    // refinement (v2.3) or — when there were no parentheses at all — a
+    // bare v2.4 value.
+    if i < bytes.len() {
+        let rest = &value[i..];
+        if i == 0 {
+            push_bare_reference(rest, out);
+        } else {
+            out.push(ContentType::Custom(rest.to_string()));
+        }
+    }
+}
+
+/// Interpret a bare (unparenthesised) reference token: a pure numeric
+/// string maps to a numeric genre, `RX` / `CR` to the keyword variants,
+/// and anything else to free text. Empty tokens are ignored.
+fn push_bare_reference(token: &str, out: &mut Vec<ContentType>) {
+    if token.is_empty() {
+        return;
+    }
+    match token {
+        "RX" => out.push(ContentType::Remix),
+        "CR" => out.push(ContentType::Cover),
+        _ => {
+            if let Ok(index) = token.parse::<u8>() {
+                out.push(ContentType::from_genre_index(index));
+            } else {
+                out.push(ContentType::Custom(token.to_string()));
+            }
+        }
+    }
+}
+
 /// Typed view of the `ETCO` "type of event" byte (spec v2.3 §4.6 /
 /// v2.4 §4.5). The byte sits at the start of each per-event record in
 /// an `ETCO` payload — one event-type byte followed by a 32-bit
@@ -1401,6 +1521,51 @@ impl Id3Frame {
                     .map(|(bpm, _)| SytcTempo::from_wire(*bpm))
                     .collect(),
             ),
+            _ => None,
+        }
+    }
+
+    /// Decode the `TCON` "Content type" (genre) frame into its typed
+    /// content-type references (spec v2.3 §4.2.1 / v2.4 §4.2.3). Returns
+    /// `None` for any frame that is not a `TCON` text frame; returns
+    /// `Some(Vec::new())` for a present-but-empty `TCON`.
+    ///
+    /// TCON carries one or several content-type references in a single
+    /// string. The two version dialects share a vocabulary but frame it
+    /// differently, and this accessor normalises both onto
+    /// [`ContentType`]:
+    ///
+    /// * v2.3 references are parenthesised — `"(21)"` is a numeric ID3v1
+    ///   genre reference, `"(RX)"` / `"(CR)"` the Remix / Cover keywords,
+    ///   `"(4)Eurodisco"` a numeric reference plus a free-text
+    ///   refinement, `"(51)(39)"` two references in one string, and
+    ///   `"((..."` a `((`-escaped literal-`(` free-text genre.
+    /// * v2.4 dropped the parentheses — a numeric content type is a bare
+    ///   number, `"RX"` / `"CR"` are bare keywords, and the text-frame
+    ///   NUL list separates multiple references (so each is a separate
+    ///   entry in [`Id3Frame::Text::values`]).
+    ///
+    /// The accessor walks the parser's already-NUL-split `values` and
+    /// applies [`parse_tcon_value`] to each, so both dialects flatten to
+    /// the same `Vec<ContentType>` in left-to-right wire order. Numeric
+    /// references resolve their name against the same Winamp-extended
+    /// ID3v1 genre table [`parse_id3v1`] uses; an out-of-table number
+    /// surfaces structurally as [`ContentType::Genre`] with `name: None`
+    /// rather than being dropped, matching the forward-compatible
+    /// posture of the per-byte typed accessors
+    /// ([`Id3Frame::etco_event_types`], [`Id3Frame::sytc_tempo_codes`]).
+    /// The raw [`Id3Frame::Text::values`] is unchanged and round-trips
+    /// losslessly through [`write_tag`], so the typed view never costs a
+    /// caller the ability to preserve the exact on-wire string.
+    pub fn content_types(&self) -> Option<Vec<ContentType>> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TCON" => {
+                let mut out = Vec::new();
+                for value in values {
+                    parse_tcon_value(value, &mut out);
+                }
+                Some(out)
+            }
             _ => None,
         }
     }
@@ -8403,5 +8568,74 @@ mod tests {
         };
         let kv = to_key_value_pairs(&tag);
         assert!(kv.iter().any(|(k, v)| k == "tzzz" && v == "custom"));
+    }
+
+    /// `parse_tcon_value` handles the v2.3 parenthesised grammar and the
+    /// v2.4 bare form within a single value, including the corner cases:
+    /// the `((` escape, an unclosed `(`, a trailing free-text refinement
+    /// after a numeric reference, and a bare value with no parentheses.
+    #[test]
+    fn parse_tcon_value_grammar() {
+        let parse = |s: &str| {
+            let mut out = Vec::new();
+            parse_tcon_value(s, &mut out);
+            out
+        };
+
+        // Numeric reference + keyword references chained in one string.
+        assert_eq!(
+            parse("(21)(RX)(CR)"),
+            vec![
+                ContentType::Genre {
+                    index: 21,
+                    name: Some("Ska"),
+                },
+                ContentType::Remix,
+                ContentType::Cover,
+            ],
+        );
+
+        // Trailing free-text refinement after a parenthesised reference.
+        assert_eq!(
+            parse("(4)Eurodisco"),
+            vec![
+                ContentType::Genre {
+                    index: 4,
+                    name: Some("Disco"),
+                },
+                ContentType::Custom("Eurodisco".into()),
+            ],
+        );
+
+        // `((` escape: a literal leading `(` for a free-text genre.
+        assert_eq!(
+            parse("((55)((I think...)"),
+            vec![ContentType::Custom("(55)((I think...)".into())],
+        );
+
+        // An unclosed `(` is non-conforming; the remainder surfaces as
+        // free text rather than being dropped.
+        assert_eq!(parse("(21"), vec![ContentType::Custom("(21".into())],);
+
+        // A bare value with no parentheses (v2.4): numeric → genre.
+        assert_eq!(
+            parse("17"),
+            vec![ContentType::Genre {
+                index: 17,
+                name: Some("Rock"),
+            }],
+        );
+
+        // A bare non-numeric non-keyword value (v2.4) → free text.
+        assert_eq!(
+            parse("My Genre"),
+            vec![ContentType::Custom("My Genre".into())]
+        );
+
+        // A bare keyword (v2.4).
+        assert_eq!(parse("RX"), vec![ContentType::Remix]);
+
+        // An empty value contributes nothing.
+        assert_eq!(parse(""), Vec::<ContentType>::new());
     }
 }
