@@ -306,8 +306,23 @@ never silently drops data.
 
 - **ID3v1 / ID3v1.1** — parse + write 128-byte trailers, Winamp's
   genre byte range, v1.1 track number.
-- **ID3v2.2** — parse only (read-only legacy). Frame ids are promoted
-  to their v2.3 equivalents (`TT2 -> TIT2`, `PIC -> APIC`, ...).
+- **ID3v2.2** — parse only (read-only legacy), covering the complete
+  ID3v2.2.0 §4 frame table. Frame ids are promoted to their v2.3
+  equivalents (`TT2 -> TIT2`, `PIC -> APIC`, ...): all `T**` text and
+  `W**` URL ids plus `UFI`, `IPL`, `MCI`, `ETC`, `MLL`, `STC`, `SLT`,
+  `ULT`, `COM`, `RVA`, `EQU`, `REV`, `PIC`, `GEO`, `CNT`, `POP`,
+  `BUF`, `CRA`, and `LNK` land in the same typed `Id3Frame` variants
+  their 4-char descendants use. Two need v2.2-specific walkers: `RVA`
+  (§4.12) carries its right/left volume-change fields unconditionally
+  — presence is not keyed on the inc/dec sign bits the way v2.3
+  `RVAD` gates its front block — and `LNK` (§4.22) always carries a
+  3-byte linked-frame id, so no 3-vs-4-byte heuristic applies. `CRM`
+  (encrypted meta frame, §4.20) has no v2.3/v2.4 descendant and is
+  preserved verbatim via `Id3Frame::Unknown`. The v2.2 header
+  compression bit (§3.1 flag bit 6, a tag-wide scheme the spec never
+  defined: "the ID3 decoder (for now) should just ignore the entire
+  tag") yields an empty frame list while still reporting the correct
+  consumed size so container callers can seek past the tag.
 - **ID3v2.3 / ID3v2.4** — parse + write. Whole-tag unsync, per-frame
   unsync, data-length indicator, and extended headers are handled on
   read; the extended-header CRC-32 is verified against the spec-defined

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Complete ID3v2.2.0 §4 frame-table read support. The v2.2 walker
+  (3-char ids, 3-byte sizes, no frame flags) previously dispatched
+  only text / URL / `COM` / `ULT` / `PIC` / `REV` / `EQU`; it now maps
+  every declared v2.2 frame onto the crate's typed surface: `UFI` §4.1
+  → `Ufid`, `IPL` §4.4 → `Ipls`, `MCI` §4.5 → `MusicCdId`, `ETC` §4.6
+  → `EventTimingCodes`, `MLL` §4.7 → `MpegLocationLookup`, `STC` §4.8
+  → `SyncedTempo`, `SLT` §4.10 → `SyncedLyrics`, `GEO` §4.16 → `Geob`,
+  `CNT` §4.17 → `PlayCounter`, `POP` §4.18 → `Popularimeter`, `BUF`
+  §4.19 → `RecommendedBuffer`, `CRA` §4.21 → `AudioEncryption` (all
+  byte-identical to their v2.3 descendants' payload layouts), plus two
+  v2.2-specific walkers — `RVA` §4.12 (right/left volume-change fields
+  are unconditional; presence is not keyed on the inc/dec sign bits
+  the way v2.3 `RVAD` gates its front block, so a both-decrement frame
+  keeps its data) and `LNK` §4.22 (the linked frame identifier is
+  always exactly 3 bytes, so a URL whose first byte is an uppercase
+  id-class character can never be folded into the identifier the way
+  the v2.3/v2.4 3-vs-4-byte heuristic would). `CRM` §4.20 (encrypted
+  meta frame) has no v2.3/v2.4 descendant and is preserved verbatim
+  via `Id3Frame::Unknown`. The `v22_promote` conversion table now
+  covers the full §4 id list so pass-through writes promote correctly.
 - Frame-level zlib compression, both directions (spec v2.3 §3.3
   format flag `i` / v2.4 §4.1.2 format flag `k`). `parse_tag` now
   inflates compressed frames transparently in both dialects — v2.3's
@@ -301,6 +321,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The v2.2 header compression bit (§3.1 flag bit 6) was misread as the
+  v2.3/v2.4 extended-header flag, silently parsing a tag body the spec
+  says to skip ("Since no compression scheme has been decided yet, the
+  ID3 decoder (for now) should just ignore the entire tag if the
+  compression bit is set"). Both `parse_tag` and
+  `parse_tag_with_extended_header` now return the v2.2 version
+  envelope with an empty frame list and the correct consumed size so
+  container callers can still seek past the tag.
 - The v2.3 frame parser previously ignored the frame-flags bytes
   entirely, so a v2.3 frame with any format flag set had its payload
   dispatched at the wrong offset (grouping) or its raw

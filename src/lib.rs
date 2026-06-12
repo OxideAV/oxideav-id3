@@ -59,6 +59,15 @@
 //! * `W***` URL frames and `WXXX` user-defined URL.
 //! * `COMM` comments and `USLT` lyrics.
 //! * `APIC` attached pictures (v2.3/2.4) and `PIC` (v2.2).
+//! * The full ID3v2.2.0 §4 frame table — every declared 3-char id
+//!   maps onto the typed variants below (`UFI`/`IPL`/`MCI`/`ETC`/
+//!   `MLL`/`STC`/`SLT`/`COM`/`RVA`/`EQU`/`REV`/`PIC`/`GEO`/`CNT`/
+//!   `POP`/`BUF`/`CRA`/`LNK` plus all text and URL ids), except `CRM`
+//!   (encrypted meta frame, v2.2 §4.20 — no v2.3/v2.4 descendant)
+//!   which is preserved via [`Id3Frame::Unknown`]. The v2.2 header
+//!   compression bit (§3.1 flag bit 6) makes the parser ignore the
+//!   entire tag body per spec while still reporting the correct
+//!   consumed size.
 //! * `POPM` popularimeter (email + rating + play counter).
 //! * `PCNT` play counter.
 //! * `PRIV` private frame (owner id + opaque bytes).
@@ -1941,6 +1950,23 @@ pub fn parse_tag(buf: &[u8]) -> Result<(Id3Tag, usize)> {
         }
     }
 
+    // v2.2 §3.1: header flag bit 6 means *compression*, not an
+    // extended header (v2.2 has none): "Since no compression scheme
+    // has been decided yet, the ID3 decoder (for now) should just
+    // ignore the entire tag if the compression bit is set." We honour
+    // that by returning the version envelope with no frames — the
+    // `total` is still correct so a container caller can seek past
+    // the tag.
+    if matches!(version, Id3Version::V2_2) && flags & 0x40 != 0 {
+        return Ok((
+            Id3Tag {
+                version,
+                frames: Vec::new(),
+            },
+            total,
+        ));
+    }
+
     // Whole-tag unsync is a v2.2/v2.3 mechanism. v2.4 moves it to a
     // per-frame flag, but some taggers still set the header bit; we
     // honour whichever is present.
@@ -2045,6 +2071,20 @@ pub fn parse_tag_with_extended_header(buf: &[u8]) -> Result<(Id3Tag, ExtendedHea
         if footer_size != size {
             return Err(Error::invalid("ID3v2 footer size does not match header"));
         }
+    }
+
+    // v2.2 §3.1 compression bit — same ignore-the-entire-tag posture
+    // as [`parse_tag`]; v2.2 has no extended header so the default
+    // (all-absent) `ExtendedHeader` is returned.
+    if matches!(version, Id3Version::V2_2) && flags & 0x40 != 0 {
+        return Ok((
+            Id3Tag {
+                version,
+                frames: Vec::new(),
+            },
+            ExtendedHeader::default(),
+            total,
+        ));
     }
 
     let unsync_whole_tag =
@@ -2944,6 +2984,36 @@ fn dispatch_v22(id: &str, payload: &[u8]) -> Id3Frame {
         "PIC" => parse_pic(payload),
         "REV" => parse_rvrb(payload),
         "EQU" => parse_equa(payload),
+        // The remaining ID3v2.2 §4 frame bodies are byte-identical to
+        // their v2.3 descendants (only the 6-byte frame header — 3-char
+        // id + 3-byte size, no flags — differs), so they share the
+        // v2.3 payload parsers:
+        //   UFI §4.1 = UFID, IPL §4.4 = IPLS, MCI §4.5 = MCDI,
+        //   ETC §4.6 = ETCO, MLL §4.7 = MLLT, STC §4.8 = SYTC,
+        //   SLT §4.10 = SYLT, GEO §4.16 = GEOB, CNT §4.17 = PCNT,
+        //   POP §4.18 = POPM, BUF §4.19 = RBUF, CRA §4.21 = AENC.
+        "UFI" => parse_ufid(payload),
+        "IPL" => parse_ipls(payload),
+        "MCI" => parse_mcdi(payload),
+        "ETC" => parse_etco(payload),
+        "MLL" => parse_mllt(payload),
+        "STC" => parse_sytc(payload),
+        "SLT" => parse_sylt(payload),
+        "GEO" => parse_geob(payload),
+        "CNT" => parse_pcnt(payload),
+        "POP" => parse_popm(payload),
+        "BUF" => parse_rbuf(payload),
+        "CRA" => parse_aenc(payload),
+        // RVA (§4.12) and LNK (§4.22) need v2.2-specific walkers: RVA's
+        // right/left fields are unconditional (presence is not keyed on
+        // the sign bits) and LNK's linked frame identifier is always
+        // exactly 3 bytes (no 3-vs-4 heuristic applies).
+        "RVA" => parse_rva_v22(payload),
+        "LNK" => parse_link_v22(payload),
+        // CRM (encrypted meta frame, §4.20) has no v2.3/v2.4 descendant
+        // and we carry no decryption plugins, so it falls through to
+        // Unknown with the payload preserved verbatim — same posture as
+        // the v2.3/v2.4 encrypted-frame flag.
         _ => Id3Frame::Unknown {
             id: id.to_string(),
             raw: payload.to_vec(),
@@ -2995,6 +3065,23 @@ fn v22_promote(id: &str) -> &str {
         "TXX" => "TXXX",
         "REV" => "RVRB",
         "EQU" => "EQUA",
+        "COM" => "COMM",
+        "ULT" => "USLT",
+        "PIC" => "APIC",
+        "UFI" => "UFID",
+        "IPL" => "IPLS",
+        "MCI" => "MCDI",
+        "ETC" => "ETCO",
+        "MLL" => "MLLT",
+        "STC" => "SYTC",
+        "SLT" => "SYLT",
+        "RVA" => "RVAD",
+        "GEO" => "GEOB",
+        "CNT" => "PCNT",
+        "POP" => "POPM",
+        "BUF" => "RBUF",
+        "CRA" => "AENC",
+        "LNK" => "LINK",
         "WAF" => "WOAF",
         "WAR" => "WOAR",
         "WAS" => "WOAS",
@@ -3811,6 +3898,38 @@ fn parse_link(payload: &[u8]) -> Id3Frame {
     }
 }
 
+/// Parse a v2.2 `LNK` linked-information payload (ID3v2.2 §4.22).
+/// Layout:
+///
+/// ```text
+/// Frame identifier    $xx xx xx                    (always 3 bytes)
+/// URL                 <ISO-8859-1 textstring> $00
+/// Additional ID data  <textstring(s)>
+/// ```
+///
+/// Unlike [`parse_link`] no 3-vs-4-byte id heuristic applies — every
+/// v2.2 frame id is exactly three characters, so a URL whose first
+/// byte happens to be an uppercase letter or digit can never be
+/// misread as a fourth id character. The 4th slot of the shared
+/// [`Id3Frame::LinkedInfo`] `frame_id` array is zero-padded, matching
+/// the representation [`parse_link`] uses for short v2.3 ids.
+fn parse_link_v22(payload: &[u8]) -> Id3Frame {
+    if payload.len() < 3 {
+        return Id3Frame::LinkedInfo {
+            frame_id: [0; 4],
+            url: String::new(),
+            additional: Vec::new(),
+        };
+    }
+    let frame_id = [payload[0], payload[1], payload[2], 0];
+    let (url_bytes, additional_bytes) = split_once_nul_bytes(&payload[3..]);
+    Id3Frame::LinkedInfo {
+        frame_id,
+        url: latin1_to_string(url_bytes),
+        additional: additional_bytes.to_vec(),
+    }
+}
+
 /// Parse an `ASPI` audio-seek-point-index payload (spec v2.4 §4.30).
 /// Layout:
 ///
@@ -4070,6 +4189,79 @@ fn parse_rvad(payload: &[u8]) -> Id3Frame {
         back,
         center,
         bass,
+    }
+}
+
+/// Parse a v2.2 `RVA` relative-volume-adjustment payload (ID3v2.2
+/// §4.12). Layout:
+///
+/// ```text
+/// Increment/decrement            %000000xx
+/// Bits used for volume descr.    $xx                  (must be != 0)
+/// Relative volume change, right  ceil(bits/8) bytes BE (unsigned magnitude)
+/// Relative volume change, left   ceil(bits/8) bytes BE
+/// Peak volume right              ceil(bits/8) bytes BE (optional)
+/// Peak volume left               ceil(bits/8) bytes BE (optional)
+/// ```
+///
+/// The v2.2 frame is the two-channel predecessor of v2.3's `RVAD`,
+/// sharing the inc/dec sign bitfield (bit 0 = right, bit 1 = left;
+/// `1` = increment, `0` = decrement) and the field widths — but its
+/// right/left volume-change fields are listed *unconditionally* in
+/// §4.12, so presence is NOT keyed on the sign bits the way
+/// [`parse_rvad`] gates its front block: a both-decrement frame
+/// (inc/dec `$00`) still carries both magnitudes on the wire. Peak
+/// fields "could be left zeroed or completely omitted" per §4.12 and
+/// are read greedily, surfacing omission as `peak.is_empty()`.
+///
+/// The result is surfaced through the shared [`Id3Frame::Rvad`]
+/// variant with `front` always populated and `back` / `center` /
+/// `bass` always `None` (v2.2 §4.12 defines only the two channels),
+/// so callers and the v2.3 writer handle both vintages uniformly.
+fn parse_rva_v22(payload: &[u8]) -> Id3Frame {
+    if payload.len() < 2 {
+        // The inc/dec + bits_used preamble is the smallest
+        // interpretable form — preserve anything shorter verbatim
+        // (the 3-char wire id promotes on write via `v22_promote`).
+        return Id3Frame::Unknown {
+            id: "RVA".to_string(),
+            raw: payload.to_vec(),
+        };
+    }
+    let increment_decrement = payload[0];
+    let bits_used = payload[1];
+    let width = (bits_used as usize).div_ceil(8);
+    let mut cursor = 2usize;
+    let take_field = |cursor: &mut usize| -> Vec<u8> {
+        if *cursor + width <= payload.len() {
+            let v = payload[*cursor..*cursor + width].to_vec();
+            *cursor += width;
+            v
+        } else {
+            Vec::new()
+        }
+    };
+    // Wire order per §4.12: both deltas first, then both peaks.
+    let right_delta = take_field(&mut cursor);
+    let left_delta = take_field(&mut cursor);
+    let right_peak = take_field(&mut cursor);
+    let left_peak = take_field(&mut cursor);
+    Id3Frame::Rvad {
+        increment_decrement,
+        bits_used,
+        front: Some(RvadFrontChannels {
+            right: RvadChannel {
+                volume_delta: right_delta,
+                peak: right_peak,
+            },
+            left: RvadChannel {
+                volume_delta: left_delta,
+                peak: left_peak,
+            },
+        }),
+        back: None,
+        center: None,
+        bass: None,
     }
 }
 
@@ -6365,6 +6557,447 @@ mod tests {
         assert_eq!(pic[0].mime_type, "image/jpeg");
         assert_eq!(pic[0].picture_type, PictureType::FrontCover);
         assert_eq!(pic[0].data, b"JPGDATA");
+    }
+
+    /// Assemble a synthetic ID3v2.2.0 tag (spec §3.1 header + §3.2
+    /// frame headers: 3-char id + 3-byte BE size, no frame flags)
+    /// from `(id, payload)` pairs. `header_flags` is the §3.1 flags
+    /// byte (`%xx000000`).
+    fn build_v22_tag(header_flags: u8, frames: &[(&[u8; 3], &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (id, payload) in frames {
+            body.extend_from_slice(*id);
+            let size = payload.len() as u32;
+            body.push(((size >> 16) & 0xFF) as u8);
+            body.push(((size >> 8) & 0xFF) as u8);
+            body.push((size & 0xFF) as u8);
+            body.extend_from_slice(payload);
+        }
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"ID3");
+        tag.push(2); // major
+        tag.push(0); // revision
+        tag.push(header_flags);
+        let s = body.len() as u32;
+        tag.push(((s >> 21) & 0x7F) as u8);
+        tag.push(((s >> 14) & 0x7F) as u8);
+        tag.push(((s >> 7) & 0x7F) as u8);
+        tag.push((s & 0x7F) as u8);
+        tag.extend_from_slice(&body);
+        tag
+    }
+
+    /// The common v2.2 text frames (§4.2.1) + COM (§4.11) walk onto
+    /// the typed surface and the Vorbis-style key/value projection
+    /// under their promoted 4-char ids.
+    #[test]
+    fn v22_common_frames_to_kv() {
+        let tt2 = [&[0u8][..], b"A Title"].concat();
+        let tp1 = [&[0u8][..], b"An Artist"].concat();
+        let tal = [&[0u8][..], b"An Album"].concat();
+        let trk = [&[0u8][..], b"4/9"].concat();
+        let tye = [&[0u8][..], b"1998"].concat();
+        // COM: enc + lang + short description $00 + text (§4.11).
+        let mut com = vec![0u8];
+        com.extend_from_slice(b"eng");
+        com.push(0);
+        com.extend_from_slice(b"a comment");
+        let tag = build_v22_tag(
+            0,
+            &[
+                (b"TT2", &tt2),
+                (b"TP1", &tp1),
+                (b"TAL", &tal),
+                (b"TRK", &trk),
+                (b"TYE", &tye),
+                (b"COM", &com),
+            ],
+        );
+        let (parsed, consumed) = parse_tag(&tag).unwrap();
+        assert_eq!(consumed, tag.len());
+        assert_eq!(parsed.version, Id3Version::V2_2);
+        assert_eq!(parsed.frames.len(), 6);
+        let kv = to_key_value_pairs(&parsed);
+        assert!(kv.contains(&("title".to_string(), "A Title".to_string())));
+        assert!(kv.contains(&("artist".to_string(), "An Artist".to_string())));
+        assert!(kv.contains(&("album".to_string(), "An Album".to_string())));
+        assert!(kv.contains(&("track".to_string(), "4/9".to_string())));
+        assert!(kv.contains(&("date".to_string(), "1998".to_string())));
+        assert!(kv.contains(&("comment".to_string(), "a comment".to_string())));
+    }
+
+    /// v2.2 §4.1 UFI / §4.17 CNT / §4.18 POP share their v2.3
+    /// descendants' payload layout and land in the typed variants.
+    #[test]
+    fn v22_ufi_cnt_pop() {
+        let ufi = [&b"db@example\0"[..], b"\x01\x02\x03"].concat();
+        // CNT with a 5-byte (grown) counter per §4.17.
+        let cnt = [0x01u8, 0x00, 0x00, 0x00, 0x02];
+        let pop = [&b"who@example\0"[..], &[196u8], &[0, 0, 0, 7]].concat();
+        let tag = build_v22_tag(0, &[(b"UFI", &ufi), (b"CNT", &cnt), (b"POP", &pop)]);
+        let (parsed, _) = parse_tag(&tag).unwrap();
+        assert_eq!(parsed.frames.len(), 3);
+        match &parsed.frames[0] {
+            Id3Frame::Ufid { owner, identifier } => {
+                assert_eq!(owner, "db@example");
+                assert_eq!(identifier, &[1, 2, 3]);
+            }
+            other => panic!("expected Ufid from v2.2 UFI, got {other:?}"),
+        }
+        match &parsed.frames[1] {
+            Id3Frame::PlayCounter { count } => assert_eq!(*count, 0x01_0000_0002),
+            other => panic!("expected PlayCounter from v2.2 CNT, got {other:?}"),
+        }
+        match &parsed.frames[2] {
+            Id3Frame::Popularimeter {
+                email,
+                rating,
+                counter,
+            } => {
+                assert_eq!(email, "who@example");
+                assert_eq!(*rating, 196);
+                assert_eq!(*counter, 7);
+            }
+            other => panic!("expected Popularimeter from v2.2 POP, got {other:?}"),
+        }
+    }
+
+    /// v2.2 §4.16 GEO and §4.5 MCI map onto `Geob` / `MusicCdId`.
+    #[test]
+    fn v22_geo_mci() {
+        let mut geo = vec![0u8];
+        geo.extend_from_slice(b"text/plain\0");
+        geo.extend_from_slice(b"notes.txt\0");
+        geo.extend_from_slice(b"some notes\0");
+        geo.extend_from_slice(b"PAYLOAD");
+        let mci = b"\x00\x04TOCDATA1";
+        let tag = build_v22_tag(0, &[(b"GEO", &geo), (b"MCI", &mci[..])]);
+        let (parsed, _) = parse_tag(&tag).unwrap();
+        match &parsed.frames[0] {
+            Id3Frame::Geob {
+                mime_type,
+                filename,
+                description,
+                data,
+            } => {
+                assert_eq!(mime_type, "text/plain");
+                assert_eq!(filename, "notes.txt");
+                assert_eq!(description, "some notes");
+                assert_eq!(data, b"PAYLOAD");
+            }
+            other => panic!("expected Geob from v2.2 GEO, got {other:?}"),
+        }
+        match &parsed.frames[1] {
+            Id3Frame::MusicCdId { toc } => assert_eq!(toc, &mci[..]),
+            other => panic!("expected MusicCdId from v2.2 MCI, got {other:?}"),
+        }
+    }
+
+    /// v2.2 §4.6 ETC / §4.8 STC / §4.10 SLT carry the same payload
+    /// shapes as ETCO / SYTC / SYLT.
+    #[test]
+    fn v22_etc_stc_slt() {
+        // ETC: time format $02 (ms), one "intro start" ($02) event at 1500ms.
+        let etc = [2u8, 0x02, 0x00, 0x00, 0x05, 0xDC];
+        // STC: time format $02, tempo $7B (123 BPM) at 0ms, then the
+        // two-byte $FF+$0A extension form (265 BPM) at 2000ms.
+        let stc = [
+            2u8, 0x7B, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x0A, 0x00, 0x00, 0x07, 0xD0,
+        ];
+        // SLT: enc 0, lang "eng", time fmt $02, content type $01
+        // (lyrics), empty descriptor, one synced syllable.
+        let mut slt = vec![0u8];
+        slt.extend_from_slice(b"eng");
+        slt.push(2);
+        slt.push(1);
+        slt.push(0); // empty content descriptor
+        slt.extend_from_slice(b"Strang\0");
+        slt.extend_from_slice(&[0x00, 0x00, 0x01, 0xF4]);
+        let tag = build_v22_tag(0, &[(b"ETC", &etc), (b"STC", &stc), (b"SLT", &slt)]);
+        let (parsed, _) = parse_tag(&tag).unwrap();
+        match &parsed.frames[0] {
+            Id3Frame::EventTimingCodes {
+                time_format,
+                events,
+            } => {
+                assert_eq!(*time_format, 2);
+                assert_eq!(events, &[(0x02u8, 1500u32)]);
+            }
+            other => panic!("expected EventTimingCodes from v2.2 ETC, got {other:?}"),
+        }
+        match &parsed.frames[1] {
+            Id3Frame::SyncedTempo { time_format, codes } => {
+                assert_eq!(*time_format, 2);
+                assert_eq!(codes, &[(123u16, 0u32), (265u16, 2000u32)]);
+            }
+            other => panic!("expected SyncedTempo from v2.2 STC, got {other:?}"),
+        }
+        match &parsed.frames[2] {
+            Id3Frame::SyncedLyrics {
+                lang,
+                time_format,
+                content_type,
+                description,
+                syncs,
+            } => {
+                assert_eq!(lang, b"eng");
+                assert_eq!(*time_format, 2);
+                assert_eq!(*content_type, 1);
+                assert!(description.is_empty());
+                assert_eq!(syncs, &[("Strang".to_string(), 500u32)]);
+            }
+            other => panic!("expected SyncedLyrics from v2.2 SLT, got {other:?}"),
+        }
+    }
+
+    /// v2.2 §4.4 IPL maps onto `Ipls` and the `involved_people()`
+    /// accessor.
+    #[test]
+    fn v22_ipl() {
+        let mut ipl = vec![0u8];
+        ipl.extend_from_slice(b"producer\0Alice\0engineer\0Bob\0");
+        let tag = build_v22_tag(0, &[(b"IPL", &ipl)]);
+        let (parsed, _) = parse_tag(&tag).unwrap();
+        match &parsed.frames[0] {
+            f @ Id3Frame::Ipls { pairs } => {
+                assert_eq!(
+                    pairs,
+                    &[
+                        ("producer".to_string(), "Alice".to_string()),
+                        ("engineer".to_string(), "Bob".to_string()),
+                    ]
+                );
+                assert_eq!(f.involved_people().unwrap().len(), 2);
+            }
+            other => panic!("expected Ipls from v2.2 IPL, got {other:?}"),
+        }
+    }
+
+    /// v2.2 §4.19 BUF (offset-to-next-tag omitted per "This field may
+    /// be omitted") and §4.21 CRA map onto `RecommendedBuffer` /
+    /// `AudioEncryption`.
+    #[test]
+    fn v22_buf_cra() {
+        let buf = [0x00u8, 0x10, 0x00, 0x01]; // 4096-byte buffer, embedded info
+        let cra = [&b"scheme@example\0"[..], &[0, 5, 0, 9], b"KEYDATA"].concat();
+        let tag = build_v22_tag(0, &[(b"BUF", &buf), (b"CRA", &cra)]);
+        let (parsed, _) = parse_tag(&tag).unwrap();
+        match &parsed.frames[0] {
+            Id3Frame::RecommendedBuffer {
+                buffer_size,
+                embedded_info,
+                offset_to_next,
+            } => {
+                assert_eq!(*buffer_size, 0x1000);
+                assert!(*embedded_info);
+                assert_eq!(*offset_to_next, 0);
+            }
+            other => panic!("expected RecommendedBuffer from v2.2 BUF, got {other:?}"),
+        }
+        match &parsed.frames[1] {
+            Id3Frame::AudioEncryption {
+                owner,
+                preview_start,
+                preview_length,
+                encryption_info,
+            } => {
+                assert_eq!(owner, "scheme@example");
+                assert_eq!(*preview_start, 5);
+                assert_eq!(*preview_length, 9);
+                assert_eq!(encryption_info, b"KEYDATA");
+            }
+            other => panic!("expected AudioEncryption from v2.2 CRA, got {other:?}"),
+        }
+    }
+
+    /// v2.2 §4.7 MLL shares MLLT's descriptor + bit-packed reference
+    /// layout.
+    #[test]
+    fn v22_mll() {
+        let mut mll = Vec::new();
+        mll.extend_from_slice(&2u16.to_be_bytes()); // frames between refs
+        mll.extend_from_slice(&[0x00, 0x04, 0x00]); // bytes between refs
+        mll.extend_from_slice(&[0x00, 0x00, 0x1A]); // ms between refs
+        mll.push(8); // bits for bytes deviation
+        mll.push(8); // bits for ms deviation
+        mll.extend_from_slice(&[0x12, 0x34, 0x56, 0x78]); // two references
+        let tag = build_v22_tag(0, &[(b"MLL", &mll)]);
+        let (parsed, _) = parse_tag(&tag).unwrap();
+        match &parsed.frames[0] {
+            Id3Frame::MpegLocationLookup {
+                mpeg_frames_between_reference,
+                bytes_between_reference,
+                ms_between_reference,
+                bits_for_bytes_deviation,
+                bits_for_ms_deviation,
+                references,
+            } => {
+                assert_eq!(*mpeg_frames_between_reference, 2);
+                assert_eq!(*bytes_between_reference, 0x0400);
+                assert_eq!(*ms_between_reference, 0x1A);
+                assert_eq!(*bits_for_bytes_deviation, 8);
+                assert_eq!(*bits_for_ms_deviation, 8);
+                assert_eq!(references, &[(0x12, 0x34), (0x56, 0x78)]);
+            }
+            other => panic!("expected MpegLocationLookup from v2.2 MLL, got {other:?}"),
+        }
+    }
+
+    /// v2.2 §4.12 RVA lists the right/left volume-change fields
+    /// unconditionally — a both-decrement frame (inc/dec `$00`) still
+    /// carries both magnitudes, unlike v2.3 RVAD's presence-gated
+    /// front block.
+    #[test]
+    fn v22_rva_both_decrement_keeps_front_block() {
+        let rva = [
+            0x00u8, // inc/dec: both channels decrement
+            0x10,   // 16 bits per field
+            0x01, 0x00, // right delta
+            0x02, 0x00, // left delta
+            0x7F, 0xFF, // right peak
+            0x7E, 0x00, // left peak
+        ];
+        let tag = build_v22_tag(0, &[(b"RVA", &rva)]);
+        let (parsed, _) = parse_tag(&tag).unwrap();
+        match &parsed.frames[0] {
+            Id3Frame::Rvad {
+                increment_decrement,
+                bits_used,
+                front,
+                back,
+                center,
+                bass,
+            } => {
+                assert_eq!(*increment_decrement, 0);
+                assert_eq!(*bits_used, 16);
+                let front = front.as_ref().expect("v2.2 RVA front block");
+                assert_eq!(front.right.volume_delta, vec![0x01, 0x00]);
+                assert_eq!(front.left.volume_delta, vec![0x02, 0x00]);
+                assert_eq!(front.right.peak, vec![0x7F, 0xFF]);
+                assert_eq!(front.left.peak, vec![0x7E, 0x00]);
+                assert!(back.is_none() && center.is_none() && bass.is_none());
+            }
+            other => panic!("expected Rvad from v2.2 RVA, got {other:?}"),
+        }
+    }
+
+    /// v2.2 §4.12 RVA with the peak fields "completely omitted"
+    /// surfaces empty peaks.
+    #[test]
+    fn v22_rva_omitted_peaks() {
+        let rva = [
+            0x03u8, // both channels increment
+            0x08,   // 8 bits per field
+            0x05,   // right delta
+            0x06,   // left delta
+        ];
+        let tag = build_v22_tag(0, &[(b"RVA", &rva)]);
+        let (parsed, _) = parse_tag(&tag).unwrap();
+        match &parsed.frames[0] {
+            Id3Frame::Rvad { front, .. } => {
+                let front = front.as_ref().expect("v2.2 RVA front block");
+                assert_eq!(front.right.volume_delta, vec![0x05]);
+                assert_eq!(front.left.volume_delta, vec![0x06]);
+                assert!(front.right.peak.is_empty());
+                assert!(front.left.peak.is_empty());
+            }
+            other => panic!("expected Rvad from v2.2 RVA, got {other:?}"),
+        }
+    }
+
+    /// v2.2 §4.22 LNK always carries a 3-byte linked frame id; a URL
+    /// whose first byte is an uppercase id-class character must not be
+    /// folded into the identifier (the v2.3/v2.4 heuristic would).
+    #[test]
+    fn v22_lnk_three_byte_id_uppercase_url() {
+        let lnk = [&b"TAL"[..], b"FTP://example/tag.bin\0", b"extra"].concat();
+        let tag = build_v22_tag(0, &[(b"LNK", &lnk)]);
+        let (parsed, _) = parse_tag(&tag).unwrap();
+        match &parsed.frames[0] {
+            Id3Frame::LinkedInfo {
+                frame_id,
+                url,
+                additional,
+            } => {
+                assert_eq!(frame_id, b"TAL\0");
+                assert_eq!(url, "FTP://example/tag.bin");
+                assert_eq!(additional, b"extra");
+            }
+            other => panic!("expected LinkedInfo from v2.2 LNK, got {other:?}"),
+        }
+    }
+
+    /// v2.2 §4.20 CRM has no v2.3/v2.4 descendant — preserved verbatim
+    /// as an Unknown frame.
+    #[test]
+    fn v22_crm_preserved_as_unknown() {
+        let crm = b"plugin@example\0why it is locked\0CIPHERTEXT";
+        let tag = build_v22_tag(0, &[(b"CRM", &crm[..])]);
+        let (parsed, _) = parse_tag(&tag).unwrap();
+        match &parsed.frames[0] {
+            Id3Frame::Unknown { id, raw } => {
+                assert_eq!(id, "CRM");
+                assert_eq!(raw, &crm[..]);
+            }
+            other => panic!("expected Unknown from v2.2 CRM, got {other:?}"),
+        }
+    }
+
+    /// v2.2 §3.1: a set compression bit (header flag bit 6) means the
+    /// decoder "should just ignore the entire tag" — no frames, but
+    /// the consumed size still spans the whole tag so a container
+    /// caller can seek past it.
+    #[test]
+    fn v22_compression_bit_skips_tag() {
+        let tt2 = [&[0u8][..], b"Hidden"].concat();
+        let tag = build_v22_tag(0x40, &[(b"TT2", &tt2)]);
+        let (parsed, consumed) = parse_tag(&tag).unwrap();
+        assert_eq!(parsed.version, Id3Version::V2_2);
+        assert!(parsed.frames.is_empty());
+        assert_eq!(consumed, tag.len());
+        let (parsed2, ext, consumed2) = parse_tag_with_extended_header(&tag).unwrap();
+        assert!(parsed2.frames.is_empty());
+        assert_eq!(consumed2, tag.len());
+        assert!(!ext.is_update && ext.crc.is_none() && ext.restrictions.is_none());
+    }
+
+    /// Whole-tag unsynchronisation (v2.2 §5) composes with the v2.2
+    /// frame walker: a 3-byte frame size whose payload contains
+    /// `$FF $00` pairs is recovered after the reversal.
+    #[test]
+    fn v22_unsync_whole_tag() {
+        // One CNT frame whose counter ($00 00 FF FE = 0xFFFE) contains
+        // a false-sync $FF byte that the §5 scheme escapes on the wire.
+        let cnt_payload = [0x00u8, 0x00, 0xFF, 0xFE];
+        // Unsynchronised body: insert $00 after each $FF.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"CNT");
+        body.extend_from_slice(&[0x00, 0x00, cnt_payload.len() as u8]);
+        body.extend_from_slice(&cnt_payload);
+        let mut unsynced = Vec::new();
+        for &b in &body {
+            unsynced.push(b);
+            if b == 0xFF {
+                unsynced.push(0x00);
+            }
+        }
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"ID3");
+        tag.push(2);
+        tag.push(0);
+        tag.push(0x80); // unsynchronisation flag
+        let s = unsynced.len() as u32;
+        tag.push(((s >> 21) & 0x7F) as u8);
+        tag.push(((s >> 14) & 0x7F) as u8);
+        tag.push(((s >> 7) & 0x7F) as u8);
+        tag.push((s & 0x7F) as u8);
+        tag.extend_from_slice(&unsynced);
+        let (parsed, consumed) = parse_tag(&tag).unwrap();
+        assert_eq!(consumed, tag.len());
+        match &parsed.frames[0] {
+            Id3Frame::PlayCounter { count } => assert_eq!(*count, 0xFFFE),
+            other => panic!("expected PlayCounter from unsynced v2.2 CNT, got {other:?}"),
+        }
     }
 
     #[test]
