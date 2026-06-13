@@ -569,6 +569,25 @@ never silently drops data.
   costs callers the ability to preserve the exact on-wire string,
   matching the forward-compatible posture of `etco_event_types()` and
   `sytc_tempo_codes()`.
+- `Id3Frame::media_type()` returns a typed `Vec<MediaType>` for the
+  `TMED` media-type frame (spec v2.3 §4.6.3 / v2.4 §4.2.3). The frame
+  "describes from which media the sound originated" as either free text
+  or a reference to the spec's predefined media list, and the two version
+  dialects frame the reference differently — the accessor normalises both,
+  exactly as `content_types()` does for `TCON`. v2.3 wraps a reference in
+  `(...)` optionally followed by a free-text refinement (`(MC) with four
+  channels` → `Predefined { media: "MC", text: Some(" with four
+  channels") }`; `(VID/PAL/VHS)` → `media: "VID"`, `refinements: ["PAL",
+  "VHS"]`), with `((` escaping a literal-`(` free-text name; v2.4 dropped
+  the parentheses so its bare example `VID/PAL/VHS` parses to the same
+  reference. The 15 predefined top-level codes
+  (`DIG`/`ANA`/`CD`/`LD`/`TT`/`MD`/`DAT`/`DCC`/`DVD`/`TV`/`VID`/`RAD`/`TEL`/`MC`/`REE`)
+  resolve to their spec descriptions via `MediaType::Predefined { name }`;
+  an out-of-table top-level code surfaces structurally with `name: None`
+  so a forward-compatible reference is preserved rather than dropped, and
+  a free-text value surfaces as `MediaType::Custom`. The raw
+  `Id3Frame::Text::values` is unchanged and round-trips losslessly through
+  the writer, matching the posture of `content_types()`.
 
 ## Fuzzing
 

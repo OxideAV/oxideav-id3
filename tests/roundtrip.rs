@@ -8,8 +8,8 @@ use oxideav_id3::{
     attached_pictures, parse_id3v1, parse_tag, parse_tag_with_extended_header, to_key_value_pairs,
     write_id3v1, write_tag, write_tag_with_options, CommercialDelivery, ContentType,
     Equ2Interpolation, EquaBand, EtcoEventType, Id3Frame, Id3Tag, Id3Version,
-    ImageEncodingRestriction, ImageSizeRestriction, Restrictions, Rva2Channel, Rva2ChannelType,
-    RvadBackChannels, RvadChannel, RvadFrontChannels, SyltContentType, SytcTempo,
+    ImageEncodingRestriction, ImageSizeRestriction, MediaType, Restrictions, Rva2Channel,
+    Rva2ChannelType, RvadBackChannels, RvadChannel, RvadFrontChannels, SyltContentType, SytcTempo,
     TagSizeRestriction, TextEncodingRestriction, TextFieldsRestriction, TimestampUnit, UnsyncMode,
     WriteOptions,
 };
@@ -3847,6 +3847,171 @@ fn content_types_roundtrip_v23_and_v24() {
             vec![ContentType::Genre {
                 index: 21,
                 name: Some("Ska"),
+            }],
+            "version {version:?} did not round-trip the typed view",
+        );
+    }
+}
+
+fn tmed(values: Vec<&str>) -> Id3Frame {
+    Id3Frame::Text {
+        id: "TMED".into(),
+        values: values.into_iter().map(str::to_string).collect(),
+    }
+}
+
+#[test]
+fn media_type_accessor_parses_v23_parenthesised() {
+    // Bare predefined reference (spec example "(CD/A)" → CD + /A).
+    assert_eq!(
+        tmed(vec!["(CD/A)"]).media_type().expect("TMED surfaces"),
+        vec![MediaType::Predefined {
+            media: "CD".into(),
+            name: Some("CD"),
+            refinements: vec!["A".into()],
+            text: None,
+        }],
+    );
+
+    // Multi-refinement reference (spec example "(VID/PAL/VHS)").
+    assert_eq!(
+        tmed(vec!["(VID/PAL/VHS)"])
+            .media_type()
+            .expect("TMED surfaces"),
+        vec![MediaType::Predefined {
+            media: "VID".into(),
+            name: Some("Video"),
+            refinements: vec!["PAL".into(), "VHS".into()],
+            text: None,
+        }],
+    );
+
+    // Reference followed by a free-text refinement (spec example
+    // "(MC) with four channels").
+    assert_eq!(
+        tmed(vec!["(MC) with four channels"])
+            .media_type()
+            .expect("TMED surfaces"),
+        vec![MediaType::Predefined {
+            media: "MC".into(),
+            name: Some("MC (normal cassette)"),
+            refinements: vec![],
+            text: Some(" with four channels".into()),
+        }],
+    );
+
+    // "((" escapes a literal '(' beginning a free-text media name; the
+    // escape collapses to a single leading '('.
+    assert_eq!(
+        tmed(vec!["((my own studio reel"])
+            .media_type()
+            .expect("TMED surfaces"),
+        vec![MediaType::Custom("(my own studio reel".into())],
+    );
+
+    // An out-of-table top-level code surfaces structurally with name: None
+    // rather than being dropped (forward-compatible reference).
+    assert_eq!(
+        tmed(vec!["(NEWMEDIA/X)"])
+            .media_type()
+            .expect("TMED surfaces"),
+        vec![MediaType::Predefined {
+            media: "NEWMEDIA".into(),
+            name: None,
+            refinements: vec!["X".into()],
+            text: None,
+        }],
+    );
+
+    // A non-TMED frame returns None.
+    assert_eq!(
+        Id3Frame::Text {
+            id: "TIT2".into(),
+            values: vec!["x".into()],
+        }
+        .media_type(),
+        None,
+    );
+}
+
+#[test]
+fn media_type_accessor_parses_v24_bare() {
+    // v2.4 dropped the parentheses — the spec's own example "VID/PAL/VHS".
+    assert_eq!(
+        tmed(vec!["VID/PAL/VHS"])
+            .media_type()
+            .expect("TMED surfaces"),
+        vec![MediaType::Predefined {
+            media: "VID".into(),
+            name: Some("Video"),
+            refinements: vec!["PAL".into(), "VHS".into()],
+            text: None,
+        }],
+    );
+
+    // Top-level code only, no refinement.
+    assert_eq!(
+        tmed(vec!["DIG"]).media_type().expect("TMED surfaces"),
+        vec![MediaType::Predefined {
+            media: "DIG".into(),
+            name: Some("Other digital media"),
+            refinements: vec![],
+            text: None,
+        }],
+    );
+
+    // A v2.4 NUL list yields one reference per value.
+    assert_eq!(
+        tmed(vec!["CD/DD", "RAD/FM"])
+            .media_type()
+            .expect("TMED surfaces"),
+        vec![
+            MediaType::Predefined {
+                media: "CD".into(),
+                name: Some("CD"),
+                refinements: vec!["DD".into()],
+                text: None,
+            },
+            MediaType::Predefined {
+                media: "RAD".into(),
+                name: Some("Radio"),
+                refinements: vec!["FM".into()],
+                text: None,
+            },
+        ],
+    );
+
+    // An empty value (degenerate) surfaces as Custom("") rather than
+    // panicking or being silently dropped.
+    assert_eq!(
+        tmed(vec![""]).media_type().expect("TMED surfaces"),
+        vec![MediaType::Custom(String::new())],
+    );
+}
+
+#[test]
+fn media_type_roundtrips_v23_and_v24() {
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        // A single value with no embedded NUL round-trips as one value
+        // under either envelope, so the typed view is preserved.
+        let tag = Id3Tag {
+            version,
+            frames: vec![tmed(vec!["(VID/PAL/VHS)"])],
+        };
+        let bytes = write_tag(&tag, version).expect("write");
+        let (parsed, _) = parse_tag(&bytes).expect("parse");
+        let decoded = parsed
+            .frames
+            .iter()
+            .find_map(Id3Frame::media_type)
+            .expect("TMED surfaces after round-trip");
+        assert_eq!(
+            decoded,
+            vec![MediaType::Predefined {
+                media: "VID".into(),
+                name: Some("Video"),
+                refinements: vec!["PAL".into(), "VHS".into()],
+                text: None,
             }],
             "version {version:?} did not round-trip the typed view",
         );

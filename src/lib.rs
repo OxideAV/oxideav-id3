@@ -1148,6 +1148,151 @@ fn push_bare_reference(token: &str, out: &mut Vec<ContentType>) {
     }
 }
 
+/// Typed view of one `TMED` "Media type" reference (spec v2.3 §4.6.3 /
+/// v2.4 §4.2.3). The frame "describes from which media the sound
+/// originated" and is "either a text string or a reference to the
+/// predefined media types found in the list below."
+///
+/// The two dialects frame the reference differently and this enum
+/// collapses both onto one vocabulary, mirroring [`ContentType`]:
+///
+/// * v2.3 wraps a predefined reference in `"("` and `")"` and lets it be
+///   "optionally followed by a text refinement, e.g. `(MC) with four
+///   channels`". A leading `"("` in a free-text refinement is escaped by
+///   doubling it (`"(("`) "in the same way as in the `TCO` frame".
+///   Predefined `/`-refinements are appended after the top-level code,
+///   e.g. `"(CD/A)"` or `"(VID/PAL/VHS)"`.
+/// * v2.4 dropped the parentheses: a predefined reference is the bare
+///   slash-separated string, e.g. the spec's own example `"VID/PAL/VHS"`.
+///
+/// Surfaced via [`Id3Frame::media_type`]; see that accessor for how the
+/// two framings parse into a single `Vec<MediaType>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MediaType {
+    /// A reference to the spec's predefined media-type list.
+    Predefined {
+        /// The top-level media-type code (`"CD"`, `"VID"`, `"MC"`, …).
+        /// `name` resolves it against the spec's predefined table, or is
+        /// `None` for a code the table does not define (a
+        /// forward-compatible reference surfaces structurally rather than
+        /// being dropped, matching [`ContentType::Genre`]).
+        media: String,
+        /// The resolved top-level media-type description, or `None` for an
+        /// out-of-table code.
+        name: Option<&'static str>,
+        /// The `/`-separated predefined refinement codes that followed the
+        /// top-level code in wire order (`["PAL", "VHS"]` for
+        /// `VID/PAL/VHS`). Empty when the reference carried no refinement.
+        refinements: Vec<String>,
+        /// A v2.3 free-text refinement that followed the closing `")"`
+        /// (`" with four channels"` for `(MC) with four channels`), with
+        /// any `"(("` escape already collapsed to a single leading `"("`.
+        /// Always `None` for a v2.4 bare reference (v2.4 carries no
+        /// post-reference text in this frame).
+        text: Option<String>,
+    },
+    /// A free-text media type the producer wrote in place of a predefined
+    /// reference: a v2.3 `"(("`-escaped literal-`(` string, or any value
+    /// that is not a predefined-reference form. The inner string has any
+    /// `"(("` escape already collapsed to a single leading `"("`.
+    Custom(String),
+}
+
+impl MediaType {
+    /// Resolve a top-level media-type code into a [`MediaType::Predefined`]
+    /// carrying the spec's description, with the given refinements/text.
+    fn predefined(media: &str, refinements: Vec<String>, text: Option<String>) -> MediaType {
+        MediaType::Predefined {
+            media: media.to_string(),
+            name: media_type_name(media),
+            refinements,
+            text,
+        }
+    }
+}
+
+/// Resolve a `TMED` top-level media-type code to its predefined
+/// description (spec v2.3 §4.6.3 / v2.4 §4.2.3 list), or `None` for a
+/// code outside the predefined table.
+fn media_type_name(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "DIG" => "Other digital media",
+        "ANA" => "Other analogue media",
+        "CD" => "CD",
+        "LD" => "Laserdisc",
+        "TT" => "Turntable records",
+        "MD" => "MiniDisc",
+        "DAT" => "DAT",
+        "DCC" => "DCC",
+        "DVD" => "DVD",
+        "TV" => "Television",
+        "VID" => "Video",
+        "RAD" => "Radio",
+        "TEL" => "Telephone",
+        "MC" => "MC (normal cassette)",
+        "REE" => "Reel",
+        _ => return None,
+    })
+}
+
+/// Parse a single TMED value string into its media-type reference.
+///
+/// Handles the v2.3 parenthesised grammar (`(CD/A)`, `(VID/PAL/VHS)`,
+/// `(MC) with four channels`, the `((` escape) and falls back to the
+/// v2.4 bare interpretation (`VID/PAL/VHS`) when the value does not open
+/// with a `(`. The reference is appended to `out`.
+fn parse_tmed_value(value: &str, out: &mut Vec<MediaType>) {
+    let bytes = value.as_bytes();
+    if bytes.first() == Some(&b'(') {
+        // "((" escapes a literal '(' that begins a free-text refinement.
+        if bytes.get(1) == Some(&b'(') {
+            out.push(MediaType::Custom(format!("({}", &value[2..])));
+            return;
+        }
+        // Find the closing ')'. A '(' with no ')' is non-conforming;
+        // surface the remainder as free text rather than dropping it.
+        let Some(rel_close) = value[1..].find(')') else {
+            out.push(MediaType::Custom(value.to_string()));
+            return;
+        };
+        let close = 1 + rel_close;
+        let inner = &value[1..close];
+        let text = &value[close + 1..];
+        let text = if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        };
+        push_media_reference(inner, text, out);
+    } else {
+        // v2.4 bare reference (or a plain producer-written text string).
+        push_media_reference(value, None, out);
+    }
+}
+
+/// Interpret a media reference token (`"VID/PAL/VHS"`, `"CD/A"`, `"MC"`)
+/// into a [`MediaType::Predefined`]. The first `/`-segment is the
+/// top-level media code; the rest are refinement codes. An empty token,
+/// or one whose first segment is empty, surfaces as
+/// [`MediaType::Custom`] so a non-conforming source is preserved rather
+/// than collapsed to an empty reference.
+fn push_media_reference(token: &str, text: Option<String>, out: &mut Vec<MediaType>) {
+    let mut parts = token.split('/');
+    let media = parts.next().unwrap_or("");
+    if media.is_empty() {
+        // No top-level code — treat the whole thing as free text. Re-glue
+        // any text refinement that followed a (degenerate) reference.
+        let mut s = token.to_string();
+        if let Some(t) = text {
+            s.push_str(&t);
+        }
+        out.push(MediaType::Custom(s));
+        return;
+    }
+    let refinements: Vec<String> = parts.map(str::to_string).collect();
+    out.push(MediaType::predefined(media, refinements, text));
+}
+
 /// Typed view of the `ETCO` "type of event" byte (spec v2.3 §4.6 /
 /// v2.4 §4.5). The byte sits at the start of each per-event record in
 /// an `ETCO` payload — one event-type byte followed by a 32-bit
@@ -1581,6 +1726,46 @@ impl Id3Frame {
                 let mut out = Vec::new();
                 for value in values {
                     parse_tcon_value(value, &mut out);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Typed view of the `TMED` "Media type" frame (spec v2.3 §4.6.3 /
+    /// v2.4 §4.2.3). The frame "describes from which media the sound
+    /// originated" — "either a text string or a reference to the
+    /// predefined media types found in the list below".
+    ///
+    /// Returns `None` for any frame other than `TMED`. For `TMED` it
+    /// returns the references in left-to-right wire order, normalising
+    /// both version dialects onto [`MediaType`]:
+    ///
+    /// * v2.3 wraps a reference in `"("` / `")"`, optionally followed by a
+    ///   free-text refinement — `(MC) with four channels` parses to
+    ///   [`MediaType::Predefined`] `media = "MC"`, `text = Some(" with
+    ///   four channels")`. `(VID/PAL/VHS)` parses to `media = "VID"`,
+    ///   `refinements = ["PAL", "VHS"]`. A `"(("`-escaped value surfaces
+    ///   as [`MediaType::Custom`] with the escape collapsed.
+    /// * v2.4 dropped the parentheses, so the spec's bare example
+    ///   `VID/PAL/VHS` parses to the same `Predefined` reference.
+    ///
+    /// Each value in the parser's already-NUL-split
+    /// [`Id3Frame::Text::values`] yields one reference. A top-level code
+    /// outside the spec's predefined table resolves to
+    /// [`MediaType::Predefined`] with `name: None` so a forward-compatible
+    /// reference surfaces structurally rather than being dropped, matching
+    /// the posture of [`Id3Frame::content_types`]. The raw
+    /// [`Id3Frame::Text::values`] is unchanged and round-trips losslessly
+    /// through [`write_tag`], so the typed view never costs a caller the
+    /// ability to preserve the exact on-wire string.
+    pub fn media_type(&self) -> Option<Vec<MediaType>> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TMED" => {
+                let mut out = Vec::new();
+                for value in values {
+                    parse_tmed_value(value, &mut out);
                 }
                 Some(out)
             }

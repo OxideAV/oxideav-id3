@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed `TMED` media-type accessor `Id3Frame::media_type()` + `MediaType`
+  enum (spec v2.3 §4.6.3 / v2.4 §4.2.3). The frame "describes from which
+  media the sound originated — either a text string or a reference to the
+  predefined media types found in the list below." The accessor
+  normalises both version dialects onto one vocabulary, mirroring the
+  `TCON` `content_types()` accessor: v2.3 wraps a reference in `(...)`
+  optionally followed by a free-text refinement (`(MC) with four
+  channels` → `media="MC"`, `text=" with four channels"`; `(VID/PAL/VHS)`
+  → `media="VID"`, `refinements=["PAL","VHS"]`) with a `((` escape for a
+  literal-`(` free-text name, while v2.4 drops the parentheses (the spec
+  example `VID/PAL/VHS` parses to the same reference). The 15 predefined
+  top-level codes (DIG/ANA/CD/LD/TT/MD/DAT/DCC/DVD/TV/VID/RAD/TEL/MC/REE)
+  resolve to their spec descriptions; an out-of-table code surfaces as
+  `MediaType::Predefined { name: None, .. }` so a forward-compatible
+  reference is preserved rather than dropped. The raw text value is
+  unchanged and round-trips losslessly through `write_tag`.
 - Complete ID3v2.2.0 §4 frame-table read support. The v2.2 walker
   (3-char ids, 3-byte sizes, no frame flags) previously dispatched
   only text / URL / `COM` / `ULT` / `PIC` / `REV` / `EQU`; it now maps
