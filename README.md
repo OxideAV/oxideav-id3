@@ -588,6 +588,26 @@ never silently drops data.
   a free-text value surfaces as `MediaType::Custom`. The raw
   `Id3Frame::Text::values` is unchanged and round-trips losslessly through
   the writer, matching the posture of `content_types()`.
+- `Id3Frame::file_type()` returns a typed `Vec<FileType>` for the `TFLT`
+  file-type frame (spec v2.3 §4.2.1 / v2.4 §4.2.3). The frame "indicates
+  which type of audio this tag defines" via a predefined code optionally
+  followed by `/`-separated refinements, "in a similar way to the
+  predefined types in the `TMED` frame, but without parentheses". Because
+  `TFLT` never uses parentheses and carries no v2.3 free-text refinement,
+  the wire form is identical across both versions — `MPG/3` →
+  `Predefined { code: "MPG", refinements: ["3"] }`, `MPG/2.5` keeps its
+  dotted refinement verbatim — so a single bare grammar covers both
+  dialects, unlike the parenthesised `TMED`/`TCON` accessors. The only
+  version difference is the v2.4-added `MIME` top-level code, which the
+  predefined table resolves under either envelope since the byte-form is
+  version-independent. The four predefined codes
+  (`MIME`/`MPG`/`VQF`/`PCM`) resolve to their spec descriptions via
+  `FileType::Predefined { name }`; an out-of-table top-level code
+  surfaces structurally with `name: None` so a forward-compatible
+  reference is preserved rather than dropped, and a value whose top-level
+  segment is empty surfaces as `FileType::Custom`. The raw
+  `Id3Frame::Text::values` is unchanged and round-trips losslessly through
+  the writer, matching the posture of `media_type()`.
 - `Id3Frame::language()` returns a typed `Language` for the three-byte
   language field carried by the language-tagged frames (`COMM`, `USLT`,
   `USER`, `SYLT`), per the structure doc's "three byte language field …

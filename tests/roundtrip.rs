@@ -7,7 +7,7 @@ use oxideav_core::{AttachedPicture, PictureType};
 use oxideav_id3::{
     attached_pictures, parse_id3v1, parse_tag, parse_tag_with_extended_header, to_key_value_pairs,
     write_id3v1, write_tag, write_tag_with_options, CommercialDelivery, ContentType,
-    Equ2Interpolation, EquaBand, EtcoEventType, Id3Frame, Id3Tag, Id3Version,
+    Equ2Interpolation, EquaBand, EtcoEventType, FileType, Id3Frame, Id3Tag, Id3Version,
     ImageEncodingRestriction, ImageSizeRestriction, MediaType, Restrictions, Rva2Channel,
     Rva2ChannelType, RvadBackChannels, RvadChannel, RvadFrontChannels, SyltContentType, SytcTempo,
     TagSizeRestriction, TextEncodingRestriction, TextFieldsRestriction, TimestampUnit, UnsyncMode,
@@ -4012,6 +4012,141 @@ fn media_type_roundtrips_v23_and_v24() {
                 name: Some("Video"),
                 refinements: vec!["PAL".into(), "VHS".into()],
                 text: None,
+            }],
+            "version {version:?} did not round-trip the typed view",
+        );
+    }
+}
+
+fn tflt(values: Vec<&str>) -> Id3Frame {
+    Id3Frame::Text {
+        id: "TFLT".into(),
+        values: values.into_iter().map(str::to_string).collect(),
+    }
+}
+
+#[test]
+fn file_type_accessor_parses_predefined() {
+    // Top-level code with a refinement (spec example "MPG" + "/3").
+    assert_eq!(
+        tflt(vec!["MPG/3"]).file_type().expect("TFLT surfaces"),
+        vec![FileType::Predefined {
+            code: "MPG".into(),
+            name: Some("MPEG Audio"),
+            refinements: vec!["3".into()],
+        }],
+    );
+
+    // MPEG 2.5 refinement keeps its dotted form verbatim.
+    assert_eq!(
+        tflt(vec!["MPG/2.5"]).file_type().expect("TFLT surfaces"),
+        vec![FileType::Predefined {
+            code: "MPG".into(),
+            name: Some("MPEG Audio"),
+            refinements: vec!["2.5".into()],
+        }],
+    );
+
+    // Top-level code only, no refinement.
+    assert_eq!(
+        tflt(vec!["PCM"]).file_type().expect("TFLT surfaces"),
+        vec![FileType::Predefined {
+            code: "PCM".into(),
+            name: Some("Pulse Code Modulated audio"),
+            refinements: vec![],
+        }],
+    );
+
+    // VQF top-level code.
+    assert_eq!(
+        tflt(vec!["VQF"]).file_type().expect("TFLT surfaces"),
+        vec![FileType::Predefined {
+            code: "VQF".into(),
+            name: Some("Transform-domain Weighted Interleave Vector Quantization"),
+            refinements: vec![],
+        }],
+    );
+}
+
+#[test]
+fn file_type_accessor_v24_mime_and_unknown_codes() {
+    // v2.4-added "MIME" top-level code resolves under either envelope.
+    assert_eq!(
+        tflt(vec!["MIME"]).file_type().expect("TFLT surfaces"),
+        vec![FileType::Predefined {
+            code: "MIME".into(),
+            name: Some("MIME type follows"),
+            refinements: vec![],
+        }],
+    );
+
+    // An out-of-table top-level code surfaces structurally with
+    // name: None so a forward-compatible reference is preserved.
+    assert_eq!(
+        tflt(vec!["OGG/Q5"]).file_type().expect("TFLT surfaces"),
+        vec![FileType::Predefined {
+            code: "OGG".into(),
+            name: None,
+            refinements: vec!["Q5".into()],
+        }],
+    );
+
+    // A value whose top-level segment is empty surfaces as Custom.
+    assert_eq!(
+        tflt(vec!["/3"]).file_type().expect("TFLT surfaces"),
+        vec![FileType::Custom("/3".into())],
+    );
+
+    // An empty value (degenerate) surfaces as Custom("") rather than
+    // panicking or being silently dropped.
+    assert_eq!(
+        tflt(vec![""]).file_type().expect("TFLT surfaces"),
+        vec![FileType::Custom(String::new())],
+    );
+
+    // A NUL list yields one reference per value.
+    assert_eq!(
+        tflt(vec!["MPG/1", "PCM"])
+            .file_type()
+            .expect("TFLT surfaces"),
+        vec![
+            FileType::Predefined {
+                code: "MPG".into(),
+                name: Some("MPEG Audio"),
+                refinements: vec!["1".into()],
+            },
+            FileType::Predefined {
+                code: "PCM".into(),
+                name: Some("Pulse Code Modulated audio"),
+                refinements: vec![],
+            },
+        ],
+    );
+
+    // A non-TFLT frame returns None.
+    assert_eq!(tmed(vec!["(CD)"]).file_type(), None);
+}
+
+#[test]
+fn file_type_roundtrips_v23_and_v24() {
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        let tag = Id3Tag {
+            version,
+            frames: vec![tflt(vec!["MPG/3"])],
+        };
+        let bytes = write_tag(&tag, version).expect("write");
+        let (parsed, _) = parse_tag(&bytes).expect("parse");
+        let decoded = parsed
+            .frames
+            .iter()
+            .find_map(Id3Frame::file_type)
+            .expect("TFLT surfaces after round-trip");
+        assert_eq!(
+            decoded,
+            vec![FileType::Predefined {
+                code: "MPG".into(),
+                name: Some("MPEG Audio"),
+                refinements: vec!["3".into()],
             }],
             "version {version:?} did not round-trip the typed view",
         );

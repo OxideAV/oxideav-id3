@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed `TFLT` file-type accessor `Id3Frame::file_type()` + `FileType`
+  enum (spec v2.3 §4.2.1 / v2.4 §4.2.3). The frame "indicates which type
+  of audio this tag defines" via a predefined code optionally followed by
+  `/`-separated refinements, "in a similar way to the predefined types in
+  the `TMED` frame, but without parentheses". Because the wire form is
+  identical in both versions (`MPG/3` → `code="MPG"`, `refinements=["3"]`)
+  and carries no parentheses or v2.3 free-text refinement, a single bare
+  grammar covers both dialects; the only version difference is the
+  v2.4-added `MIME` top-level code, which the predefined table resolves
+  under either envelope. The four predefined codes (MIME/MPG/VQF/PCM)
+  resolve to their spec descriptions; an out-of-table code surfaces as
+  `FileType::Predefined { name: None, .. }` so a forward-compatible
+  reference is preserved structurally rather than dropped, and a value
+  with an empty top-level segment surfaces as `FileType::Custom`. The raw
+  `Id3Frame::Text::values` is unchanged and round-trips losslessly,
+  mirroring the `TMED` `media_type()` accessor.
 - Typed `TMED` media-type accessor `Id3Frame::media_type()` + `MediaType`
   enum (spec v2.3 §4.6.3 / v2.4 §4.2.3). The frame "describes from which
   media the sound originated — either a text string or a reference to the

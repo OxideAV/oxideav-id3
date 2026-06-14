@@ -1398,6 +1398,88 @@ fn push_media_reference(token: &str, text: Option<String>, out: &mut Vec<MediaTy
     out.push(MediaType::predefined(media, refinements, text));
 }
 
+/// Typed view of the `TFLT` "File type" frame (spec v2.3 §4.2.1 / v2.4
+/// §4.2.3). The frame "indicates which type of audio this tag defines"
+/// as a predefined type — optionally followed by `/`-separated
+/// refinements — "in a similar way to the predefined types in the
+/// `TMED` frame, but without parentheses".
+///
+/// Unlike [`MediaType`], `TFLT` carries no parentheses and no v2.3
+/// free-text refinement: the wire form is identical in both versions
+/// (v2.4 only adds the `MIME` top-level code), so a single bare
+/// grammar covers both dialects.
+///
+/// Surfaced via [`Id3Frame::file_type`]; see that accessor for how a
+/// value parses into a single `Vec<FileType>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileType {
+    /// A reference to the spec's predefined file-type list.
+    Predefined {
+        /// The top-level file-type code (`"MPG"`, `"VQF"`, `"PCM"`,
+        /// `"MIME"`). `name` resolves it against the spec's predefined
+        /// table, or is `None` for a code the table does not define (a
+        /// forward-compatible reference surfaces structurally rather than
+        /// being dropped, matching [`MediaType::Predefined`]).
+        code: String,
+        /// The resolved top-level file-type description, or `None` for an
+        /// out-of-table code.
+        name: Option<&'static str>,
+        /// The `/`-separated refinement codes that followed the top-level
+        /// code in wire order (`["3"]` for `MPG/3`). Empty when the
+        /// reference carried no refinement. Per spec the refinements are
+        /// only defined for `MPG` (`/1`, `/2`, `/3`, `/2.5`, `/AAC`); a
+        /// refinement on any other code is preserved verbatim.
+        refinements: Vec<String>,
+    },
+    /// A free-text file type the producer wrote in place of a predefined
+    /// reference — any value whose top-level segment is empty (a
+    /// non-conforming source preserved rather than collapsed).
+    Custom(String),
+}
+
+impl FileType {
+    /// Resolve a top-level file-type code into a [`FileType::Predefined`]
+    /// carrying the spec's description, with the given refinements.
+    fn predefined(code: &str, refinements: Vec<String>) -> FileType {
+        FileType::Predefined {
+            code: code.to_string(),
+            name: file_type_name(code),
+            refinements,
+        }
+    }
+}
+
+/// Resolve a `TFLT` top-level file-type code to its predefined
+/// description (spec v2.3 §4.2.1 / v2.4 §4.2.3 list), or `None` for a
+/// code outside the predefined table. `MIME` is v2.4-only per spec but
+/// the byte-form is version-independent so the table resolves it under
+/// either envelope.
+fn file_type_name(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "MIME" => "MIME type follows",
+        "MPG" => "MPEG Audio",
+        "VQF" => "Transform-domain Weighted Interleave Vector Quantization",
+        "PCM" => "Pulse Code Modulated audio",
+        _ => return None,
+    })
+}
+
+/// Parse a single TFLT value string into its file-type reference. The
+/// first `/`-segment is the top-level file-type code; the rest are
+/// refinement codes. An empty value, or one whose first segment is
+/// empty, surfaces as [`FileType::Custom`] so a non-conforming source
+/// is preserved rather than collapsed to an empty reference.
+fn parse_tflt_value(value: &str, out: &mut Vec<FileType>) {
+    let mut parts = value.split('/');
+    let code = parts.next().unwrap_or("");
+    if code.is_empty() {
+        out.push(FileType::Custom(value.to_string()));
+        return;
+    }
+    let refinements: Vec<String> = parts.map(str::to_string).collect();
+    out.push(FileType::predefined(code, refinements));
+}
+
 /// Typed view of the `ETCO` "type of event" byte (spec v2.3 §4.6 /
 /// v2.4 §4.5). The byte sits at the start of each per-event record in
 /// an `ETCO` payload — one event-type byte followed by a 32-bit
@@ -1901,6 +1983,42 @@ impl Id3Frame {
                 let mut out = Vec::new();
                 for value in values {
                     parse_tmed_value(value, &mut out);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Typed view of the `TFLT` "File type" frame (spec v2.3 §4.2.1 /
+    /// v2.4 §4.2.3). The frame "indicates which type of audio this tag
+    /// defines" via a predefined code optionally followed by
+    /// `/`-separated refinements, "in a similar way to the predefined
+    /// types in the `TMED` frame, but without parentheses".
+    ///
+    /// Returns `None` for any frame other than `TFLT`. For `TFLT` it
+    /// returns one [`FileType`] per [`Id3Frame::Text::values`] entry in
+    /// wire order. Because the frame never uses parentheses and carries
+    /// no v2.3 free-text refinement, the same bare grammar covers both
+    /// version dialects — `MPG/3` → [`FileType::Predefined`] `code =
+    /// "MPG"`, `refinements = ["3"]`. The only version difference is the
+    /// v2.4-added `MIME` top-level code, which the predefined table
+    /// resolves under either envelope since the byte-form is identical.
+    ///
+    /// A top-level code outside the spec's predefined table resolves to
+    /// [`FileType::Predefined`] with `name: None` so a forward-compatible
+    /// reference surfaces structurally rather than being dropped, matching
+    /// the posture of [`Id3Frame::media_type`]. A value whose top-level
+    /// segment is empty surfaces as [`FileType::Custom`]. The raw
+    /// [`Id3Frame::Text::values`] is unchanged and round-trips losslessly
+    /// through [`write_tag`], so the typed view never costs a caller the
+    /// ability to preserve the exact on-wire string.
+    pub fn file_type(&self) -> Option<Vec<FileType>> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TFLT" => {
+                let mut out = Vec::new();
+                for value in values {
+                    parse_tflt_value(value, &mut out);
                 }
                 Some(out)
             }
