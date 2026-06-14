@@ -681,6 +681,111 @@ impl TimestampUnit {
     }
 }
 
+/// Typed view of the three-byte language field carried by the frames
+/// whose content is language-tagged (`COMM`, `USLT`, `USER`, `SYLT`).
+///
+/// Spec wording (v2.4 structure doc): "The three byte language field,
+/// present in several frames, is used to describe the language of the
+/// frame's content, according to ISO-639-2. The language should be
+/// represented in lower case. If the language is not known the string
+/// 'XXX' should be used." The v2.3 structure doc carries the same
+/// field with the ISO-639-2 reference but without the lower-case
+/// recommendation or the explicit `XXX` sentinel — those are v2.4
+/// additions, so an upper-case code on a v2.3 source is conformant
+/// there while merely discouraged under v2.4.
+///
+/// Returned by [`Id3Frame::language`]. The three states separate the
+/// two meaningful cases the spec calls out from everything else:
+///
+/// * [`Language::Unknown`] — the `XXX` sentinel. Matched
+///   case-insensitively (`XXX`, `xxx`, or any mixed case) because the
+///   v2.4 lower-case recommendation applies to ordinary codes and
+///   real-world tags carry the sentinel in either case; the typed view
+///   collapses them to one "language not known" state.
+/// * [`Language::Code`] — a well-formed three-letter code, i.e. all
+///   three bytes are ASCII letters and the code is not the `XXX`
+///   sentinel. The stored bytes are normalised to lower case per the
+///   v2.4 recommendation, so `Eng`, `eng`, and `ENG` all surface as
+///   the same `Code(*b"eng")` and compare equal regardless of the
+///   wire casing.
+/// * [`Language::Malformed`] — anything else: bytes outside the ASCII
+///   letter range, including the all-`$00` padding written when a
+///   frame's language is absent or truncated. The raw bytes are
+///   preserved verbatim so a caller can inspect or round-trip them
+///   without the typed view silently rewriting non-conforming input.
+///
+/// The view is non-destructive: it never invents a code for malformed
+/// input and never discards the original bytes, mirroring the posture
+/// of the other typed accessors (e.g. [`TimestampUnit`]) that surface
+/// `None` / a raw fallback rather than guessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Language {
+    /// The `XXX` "language not known" sentinel (matched
+    /// case-insensitively per the doc above).
+    Unknown,
+    /// A well-formed three-letter ISO-639-2 code, normalised to lower
+    /// case. The inner bytes are guaranteed to be three ASCII lower-case
+    /// letters and are never the `XXX` sentinel.
+    Code([u8; 3]),
+    /// Wire bytes that are neither the `XXX` sentinel nor a three-letter
+    /// alphabetic code (e.g. all-`$00` padding or digits). The raw
+    /// bytes are preserved exactly as they appeared on the wire.
+    Malformed([u8; 3]),
+}
+
+impl Language {
+    /// Decode a raw three-byte language field into the typed view.
+    ///
+    /// All-letter input that equals `XXX` (any case) maps to
+    /// [`Language::Unknown`]; any other all-ASCII-letter input maps to
+    /// [`Language::Code`] with the bytes lower-cased per the v2.4
+    /// recommendation; everything else maps to [`Language::Malformed`]
+    /// with the bytes preserved verbatim.
+    pub fn from_wire(bytes: [u8; 3]) -> Self {
+        if !bytes.iter().all(|b| b.is_ascii_alphabetic()) {
+            return Language::Malformed(bytes);
+        }
+        let lower = [
+            bytes[0].to_ascii_lowercase(),
+            bytes[1].to_ascii_lowercase(),
+            bytes[2].to_ascii_lowercase(),
+        ];
+        if lower == *b"xxx" {
+            Language::Unknown
+        } else {
+            Language::Code(lower)
+        }
+    }
+
+    /// Encode this view back to a three-byte wire field.
+    ///
+    /// [`Language::Unknown`] serialises to the upper-case `XXX` sentinel
+    /// spelt out in the v2.4 doc; [`Language::Code`] serialises to its
+    /// stored lower-case bytes; [`Language::Malformed`] serialises to
+    /// the preserved raw bytes. `from_wire` ∘ `to_wire` is the identity
+    /// for `Unknown` and `Code`, and for any `Malformed` whose raw
+    /// bytes are not coincidentally a valid code (i.e. it round-trips a
+    /// value the decoder itself produced).
+    pub fn to_wire(self) -> [u8; 3] {
+        match self {
+            Language::Unknown => *b"XXX",
+            Language::Code(code) => code,
+            Language::Malformed(raw) => raw,
+        }
+    }
+
+    /// The lower-case ISO-639-2 code as a string slice when this is a
+    /// well-formed [`Language::Code`]; `None` for [`Language::Unknown`]
+    /// and [`Language::Malformed`]. Always valid UTF-8 because a
+    /// `Code` is by construction three ASCII letters.
+    pub fn as_code(&self) -> Option<&str> {
+        match self {
+            Language::Code(code) => std::str::from_utf8(code).ok(),
+            _ => None,
+        }
+    }
+}
+
 /// Typed view of the `SYLT` "content type" byte (spec v2.3 §4.10 /
 /// v2.4 §4.9). The byte sits between the `time_stamp_format` and the
 /// content descriptor; its nine spec-defined values describe what
@@ -1490,6 +1595,36 @@ impl Id3Frame {
             _ => return None,
         };
         TimestampUnit::from_wire(wire)
+    }
+
+    /// Typed accessor for the three-byte language field carried by the
+    /// language-tagged frames (`COMM`, `USLT`, `USER`, `SYLT`). Returns
+    /// `Some(lang)` decoded via [`Language::from_wire`] for those four
+    /// variants, and `None` for every other variant — letting a caller
+    /// reach the content language uniformly without matching each
+    /// frame's struct shape.
+    ///
+    /// The wire bytes are interpreted per the structure doc's
+    /// "three byte language field … according to ISO-639-2 … should be
+    /// represented in lower case … 'XXX' if not known". The typed view
+    /// distinguishes the `XXX` sentinel ([`Language::Unknown`]) from a
+    /// well-formed code ([`Language::Code`], lower-cased) and from
+    /// non-conforming bytes ([`Language::Malformed`], preserved). The
+    /// field is identical across v2.3 and v2.4, so this accessor is
+    /// version-independent — only the v2.4-specific lower-case
+    /// recommendation and explicit sentinel come into play, both of
+    /// which the typed view applies uniformly. Mirrors the
+    /// cross-version, non-destructive posture of
+    /// [`Id3Frame::timestamp_unit`].
+    pub fn language(&self) -> Option<Language> {
+        let bytes = match self {
+            Id3Frame::Comment { lang, .. }
+            | Id3Frame::Lyrics { lang, .. }
+            | Id3Frame::TermsOfUse { lang, .. }
+            | Id3Frame::SyncedLyrics { lang, .. } => *lang,
+            _ => return None,
+        };
+        Some(Language::from_wire(bytes))
     }
 
     /// Typed accessor for the spec §4.2.2 "involved persons" pairs
@@ -9984,5 +10119,107 @@ mod tests {
         assert!(inflate_frame(&zlib, MAX_DECOMPRESSED_FRAME + 1).is_err());
         // And inflating with the honest announce succeeds.
         assert_eq!(inflate_frame(&zlib, 1024).unwrap(), vec![0u8; 1024]);
+    }
+
+    #[test]
+    fn language_from_wire_classifies_three_states() {
+        // Well-formed code, lower-cased per the v2.4 recommendation.
+        assert_eq!(Language::from_wire(*b"eng"), Language::Code(*b"eng"));
+        assert_eq!(Language::from_wire(*b"Eng"), Language::Code(*b"eng"));
+        assert_eq!(Language::from_wire(*b"ENG"), Language::Code(*b"eng"));
+        assert_eq!(Language::from_wire(*b"fre"), Language::Code(*b"fre"));
+
+        // The XXX "not known" sentinel, matched case-insensitively.
+        assert_eq!(Language::from_wire(*b"XXX"), Language::Unknown);
+        assert_eq!(Language::from_wire(*b"xxx"), Language::Unknown);
+        assert_eq!(Language::from_wire(*b"Xxx"), Language::Unknown);
+
+        // Anything non-alphabetic is preserved verbatim as Malformed,
+        // including the all-NUL padding written for an absent language.
+        assert_eq!(
+            Language::from_wire([0, 0, 0]),
+            Language::Malformed([0, 0, 0])
+        );
+        assert_eq!(Language::from_wire(*b"e1g"), Language::Malformed(*b"e1g"));
+        assert_eq!(Language::from_wire(*b"   "), Language::Malformed(*b"   "));
+    }
+
+    #[test]
+    fn language_to_wire_and_as_code() {
+        assert_eq!(Language::Code(*b"deu").to_wire(), *b"deu");
+        assert_eq!(Language::Unknown.to_wire(), *b"XXX");
+        assert_eq!(Language::Malformed([0, 0, 0]).to_wire(), [0, 0, 0]);
+
+        assert_eq!(Language::Code(*b"deu").as_code(), Some("deu"));
+        assert_eq!(Language::Unknown.as_code(), None);
+        assert_eq!(Language::Malformed(*b"e1g").as_code(), None);
+
+        // from_wire ∘ to_wire is the identity for the decoder's own
+        // outputs (Unknown, Code, and decoder-produced Malformed).
+        for v in [
+            Language::Code(*b"jpn"),
+            Language::Unknown,
+            Language::Malformed([0, 0, 0]),
+        ] {
+            assert_eq!(Language::from_wire(v.to_wire()), v);
+        }
+    }
+
+    #[test]
+    fn frame_language_accessor_spans_tagged_variants() {
+        // All four language-tagged frames surface their code uniformly.
+        let comm = Id3Frame::Comment {
+            lang: *b"eng",
+            description: String::new(),
+            text: "hi".into(),
+        };
+        assert_eq!(comm.language(), Some(Language::Code(*b"eng")));
+
+        let uslt = Id3Frame::Lyrics {
+            lang: *b"FRE",
+            description: String::new(),
+            text: "salut".into(),
+        };
+        assert_eq!(uslt.language(), Some(Language::Code(*b"fre")));
+
+        let user = Id3Frame::TermsOfUse {
+            lang: *b"XXX",
+            text: "terms".into(),
+        };
+        assert_eq!(user.language(), Some(Language::Unknown));
+
+        let sylt = Id3Frame::SyncedLyrics {
+            lang: [0, 0, 0],
+            time_format: 2,
+            content_type: 1,
+            description: String::new(),
+            syncs: Vec::new(),
+        };
+        assert_eq!(sylt.language(), Some(Language::Malformed([0, 0, 0])));
+
+        // A non-language-tagged variant yields None.
+        assert_eq!(Id3Frame::PlayCounter { count: 3 }.language(), None);
+    }
+
+    #[test]
+    fn language_accessor_survives_comm_roundtrip() {
+        // Build a COMM frame, serialise + re-parse a whole tag, and
+        // confirm the typed language survives the wire round-trip.
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Comment {
+                lang: *b"eng",
+                description: "d".into(),
+                text: "body".into(),
+            }],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        let comm = parsed
+            .frames
+            .iter()
+            .find(|f| matches!(f, Id3Frame::Comment { .. }))
+            .unwrap();
+        assert_eq!(comm.language(), Some(Language::Code(*b"eng")));
     }
 }

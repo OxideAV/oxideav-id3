@@ -588,6 +588,23 @@ never silently drops data.
   a free-text value surfaces as `MediaType::Custom`. The raw
   `Id3Frame::Text::values` is unchanged and round-trips losslessly through
   the writer, matching the posture of `content_types()`.
+- `Id3Frame::language()` returns a typed `Language` for the three-byte
+  language field carried by the language-tagged frames (`COMM`, `USLT`,
+  `USER`, `SYLT`), per the structure doc's "three byte language field …
+  according to ISO-639-2 … should be represented in lower case … 'XXX'
+  if not known". The view has three states: `Unknown` for the `XXX`
+  sentinel (matched case-insensitively), `Code([u8; 3])` for a
+  well-formed three-letter code normalised to lower case (so `Eng` /
+  `eng` / `ENG` all compare equal, with `as_code()` exposing the
+  `&str`), and `Malformed([u8; 3])` for anything else — non-alphabetic
+  bytes or the all-`$00` padding written for an absent language — with
+  the raw bytes preserved verbatim. The field is identical across v2.3
+  and v2.4 (only the v2.4-specific lower-case recommendation and `XXX`
+  sentinel apply, both folded into the typed view), so the accessor is
+  version-independent; `from_wire` / `to_wire` round-trip the decoder's
+  own outputs, and the underlying `lang: [u8; 3]` field is untouched so
+  callers keep the exact on-wire bytes. Matches the cross-version,
+  non-destructive posture of `timestamp_unit()`.
 
 ## Fuzzing
 
