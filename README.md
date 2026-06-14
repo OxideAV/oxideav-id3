@@ -306,8 +306,8 @@ never silently drops data.
 
 - **ID3v1 / ID3v1.1** — parse + write 128-byte trailers, Winamp's
   genre byte range, v1.1 track number.
-- **ID3v2.2** — parse only (read-only legacy), covering the complete
-  ID3v2.2.0 §4 frame table. Frame ids are promoted to their v2.3
+- **ID3v2.2** — parse **and write**, covering the complete
+  ID3v2.2.0 §4 frame table. On read, frame ids are promoted to their v2.3
   equivalents (`TT2 -> TIT2`, `PIC -> APIC`, ...): all `T**` text and
   `W**` URL ids plus `UFI`, `IPL`, `MCI`, `ETC`, `MLL`, `STC`, `SLT`,
   `ULT`, `COM`, `RVA`, `EQU`, `REV`, `PIC`, `GEO`, `CNT`, `POP`,
@@ -322,7 +322,23 @@ never silently drops data.
   compression bit (§3.1 flag bit 6, a tag-wide scheme the spec never
   defined: "the ID3 decoder (for now) should just ignore the entire
   tag") yields an empty frame list while still reporting the correct
-  consumed size so container callers can seek past the tag.
+  consumed size so container callers can seek past the tag. On write,
+  `write_tag(&tag, Id3Version::V2_2)` demotes each four-char id back to
+  its three-character v2.2 id, emits the six-byte v2.2 frame header
+  (3-char id + 3-byte big-endian size, no flags), and reconstructs the
+  v2.2 PIC layout (fixed three-character image-format code in place of
+  v2.3 APIC's NUL-terminated MIME string). The §4 frame set is closed:
+  a frame with no v2.2 equivalent — a v2.4-only addition (`SEEK`,
+  `RVA2`, `EQU2`, `ASPI`, the timestamp frames, …) or an unrecognised
+  `Id3Frame::Unknown` whose id is not a valid three-character v2.2
+  identifier — is skipped rather than emitted under an id a conformant
+  v2.2 reader could not interpret. v2.2 predates every post-v2.2
+  `WriteOptions` sub-field, so the writer rejects `with_crc`,
+  `with_footer`, `with_update`, `with_restrictions`, and
+  `with_compression` under a v2.2 target (there is no extended header,
+  footer, or per-frame flags byte in v2.2); `UnsyncMode::WholeTag` is
+  supported via the header's bit-7 unsync flag and `PerFrame` collapses
+  to whole-tag the same way it does for v2.3.
 - **ID3v2.3 / ID3v2.4** — parse + write. Whole-tag unsync, per-frame
   unsync, data-length indicator, and extended headers are handled on
   read; the extended-header CRC-32 is verified against the spec-defined

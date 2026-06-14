@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ID3v2.2 write support** (`write_tag(&tag, Id3Version::V2_2)` / the
+  `write_tag_with_options` path), completing the v2.2 round-trip — the
+  format was previously parse-only. Each four-char id is demoted to its
+  three-character v2.2 id (the inverse of the existing v2.2→v2.3
+  promotion table), the six-byte v2.2 frame header (3-char id + 3-byte
+  big-endian size, no flags; spec `id3v2-00` §3.2) is emitted, and the
+  v2.2 PIC layout is reconstructed (fixed three-character image-format
+  code per §4.15 in place of v2.3 APIC's NUL-terminated MIME). The §4
+  frame set is closed, so a frame with no v2.2 equivalent (a v2.4-only
+  addition or an unrecognised `Unknown` id) is skipped rather than
+  emitted under an id a conformant v2.2 reader could not interpret. v2.2
+  predates the extended header, footer, and per-frame flags byte, so the
+  writer rejects `with_crc` / `with_footer` / `with_update` /
+  `with_restrictions` / `with_compression` under a v2.2 target;
+  `UnsyncMode::WholeTag` is supported via the header bit-7 unsync flag
+  and `PerFrame` collapses to whole-tag as it does for v2.3. Six new
+  round-trip tests cover text/comment/lyrics/URL/picture frames, the PIC
+  three-char image format, whole-tag unsync over a false-sync payload,
+  v2.4-only-frame skipping, the post-v2.2 option rejections, and a
+  structured `POPM` frame; the fuzz target now also drives the v2.2
+  write+reparse path for panic-freedom.
 - Typed `TFLT` file-type accessor `Id3Frame::file_type()` + `FileType`
   enum (spec v2.3 §4.2.1 / v2.4 §4.2.3). The frame "indicates which type
   of audio this tag defines" via a predefined code optionally followed by

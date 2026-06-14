@@ -4152,3 +4152,221 @@ fn file_type_roundtrips_v23_and_v24() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// ID3v2.2 writer (spec id3v2-00)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn roundtrip_v22_common_frames() {
+    // Build a tag with the canonical four-char ids; the v2.2 writer
+    // demotes each to its three-char id, and the parser promotes them
+    // back, so the round-trip is the identity at the logical level.
+    let tag = make_tag(Id3Version::V2_2);
+    let bytes = write_tag(&tag, Id3Version::V2_2).expect("write v2.2");
+
+    // Header: "ID3", major 2, revision 0, flags 0 (no unsync here).
+    assert_eq!(&bytes[0..3], b"ID3");
+    assert_eq!(bytes[3], 2);
+    assert_eq!(bytes[4], 0);
+    assert_eq!(bytes[5], 0);
+
+    // First frame header is six bytes: three-char id "TT2" + 3-byte BE
+    // size. Confirm the writer emitted the demoted id, not "TIT2".
+    assert_eq!(&bytes[10..13], b"TT2");
+
+    let (parsed, consumed) = parse_tag(&bytes).expect("re-parse v2.2");
+    assert_eq!(consumed, bytes.len());
+    assert_eq!(parsed.version, Id3Version::V2_2);
+
+    assert_eq!(
+        find_text(&parsed, "TIT2"),
+        Some(&["Round Trip".to_string()][..])
+    );
+    assert_eq!(
+        find_text(&parsed, "TPE1"),
+        Some(&["The Tester".to_string()][..])
+    );
+    assert_eq!(
+        find_text(&parsed, "TALB"),
+        Some(&["Test Album".to_string()][..])
+    );
+    assert_eq!(find_text(&parsed, "TRCK"), Some(&["3/10".to_string()][..]));
+    assert_eq!(find_text(&parsed, "TCON"), Some(&["Rock".to_string()][..]));
+
+    let (lang, desc, text) = find_comment(&parsed).expect("comment");
+    assert_eq!(lang, b"eng");
+    assert_eq!(desc, "");
+    assert_eq!(text, "This is a comment.");
+
+    let (ldesc, ltext) = find_lyrics(&parsed).expect("lyrics");
+    assert_eq!(ldesc, "");
+    assert_eq!(ltext, "La la la");
+
+    assert_eq!(
+        find_user_text(&parsed, "REPLAYGAIN_TRACK_GAIN"),
+        Some("-7.50 dB")
+    );
+    assert_eq!(
+        find_url(&parsed, "WOAR"),
+        Some("https://example.com/artist")
+    );
+
+    // The picture round-trips through the v2.2 PIC layout (3-char
+    // "JPG" image format reconstructed back to image/jpeg by the
+    // parser).
+    let pics = attached_pictures(&parsed);
+    assert_eq!(pics.len(), 1);
+    assert_eq!(pics[0].mime_type, "image/jpeg");
+    assert_eq!(pics[0].picture_type, PictureType::FrontCover);
+    assert_eq!(pics[0].description, "cover");
+    assert_eq!(
+        pics[0].data,
+        vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46]
+    );
+}
+
+#[test]
+fn v22_pic_emits_three_char_image_format() {
+    // A PNG picture must serialise to the v2.2 PIC "PNG" image-format
+    // code (not a NUL-terminated MIME string as v2.3 APIC would).
+    let tag = Id3Tag {
+        version: Id3Version::V2_2,
+        frames: vec![Id3Frame::Picture(AttachedPicture {
+            mime_type: "image/png".into(),
+            picture_type: PictureType::BackCover,
+            description: String::new(),
+            data: vec![0x89, 0x50, 0x4E, 0x47],
+        })],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_2).expect("write v2.2");
+    // Frame header at offset 10: "PIC" + 3-byte size, then payload:
+    // encoding byte (1) + "PNG" image format + picture-type byte.
+    assert_eq!(&bytes[10..13], b"PIC");
+    let payload = &bytes[16..];
+    assert_eq!(payload[0], 1, "encoding byte should be UCS-2");
+    assert_eq!(&payload[1..4], b"PNG", "3-char image format");
+    assert_eq!(payload[4], PictureType::BackCover as u8);
+
+    let (parsed, _) = parse_tag(&bytes).expect("re-parse");
+    let pics = attached_pictures(&parsed);
+    assert_eq!(pics.len(), 1);
+    assert_eq!(pics[0].mime_type, "image/png");
+    assert_eq!(pics[0].picture_type, PictureType::BackCover);
+    assert_eq!(pics[0].data, vec![0x89, 0x50, 0x4E, 0x47]);
+}
+
+#[test]
+fn v22_whole_tag_unsync_roundtrips() {
+    // A data payload carrying a false sync (0xFF 0xF0) must survive
+    // whole-tag unsync under the v2.2 envelope.
+    let tag = Id3Tag {
+        version: Id3Version::V2_2,
+        frames: vec![Id3Frame::Picture(AttachedPicture {
+            mime_type: "image/jpeg".into(),
+            picture_type: PictureType::Other,
+            description: String::new(),
+            data: vec![0xFF, 0xF0, 0x00, 0xFF, 0xFB, 0x90],
+        })],
+    };
+    let opts = WriteOptions::new().with_unsync(UnsyncMode::WholeTag);
+    let bytes = write_tag_with_options(&tag, Id3Version::V2_2, &opts).expect("write");
+    // Header unsync flag (bit 7) set.
+    assert_eq!(bytes[5] & 0x80, 0x80);
+
+    let (parsed, consumed) = parse_tag(&bytes).expect("re-parse");
+    assert_eq!(consumed, bytes.len());
+    let pics = attached_pictures(&parsed);
+    assert_eq!(pics[0].data, vec![0xFF, 0xF0, 0x00, 0xFF, 0xFB, 0x90]);
+}
+
+#[test]
+fn v22_skips_frames_without_v22_equivalent() {
+    // SEEK is a v2.4-only frame with no v2.2 demotion; it must be
+    // dropped rather than emitted under a truncated id, while the
+    // text frame beside it survives.
+    let tag = Id3Tag {
+        version: Id3Version::V2_2,
+        frames: vec![
+            Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["Keep me".into()],
+            },
+            Id3Frame::Unknown {
+                id: "SEEK".into(),
+                raw: vec![0, 0, 0, 0],
+            },
+        ],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_2).expect("write");
+    // Only the demoted "TT2" frame should appear; "SEE"/"SEEK" must not.
+    assert_eq!(&bytes[10..13], b"TT2");
+    assert!(
+        !bytes.windows(3).any(|w| w == b"SEE"),
+        "v2.4-only SEEK must be skipped, not truncated"
+    );
+    let (parsed, _) = parse_tag(&bytes).expect("re-parse");
+    assert_eq!(
+        find_text(&parsed, "TIT2"),
+        Some(&["Keep me".to_string()][..])
+    );
+    assert_eq!(parsed.frames.len(), 1);
+}
+
+#[test]
+fn v22_rejects_v23plus_only_options() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_2,
+        frames: vec![],
+    };
+    // CRC / footer / compression / update / restrictions are all
+    // post-v2.2 features and must be rejected loudly.
+    for opts in [
+        WriteOptions::new().with_crc(true),
+        WriteOptions::new().with_footer(true),
+        WriteOptions::new().with_compression(true),
+        WriteOptions::new().with_update(true),
+        WriteOptions::new().with_restrictions(Some(Restrictions {
+            tag_size: TagSizeRestriction::Max64Frames128Kb,
+            text_encoding: TextEncodingRestriction::Unrestricted,
+            text_fields: TextFieldsRestriction::Unrestricted,
+            image_encoding: ImageEncodingRestriction::Unrestricted,
+            image_size: ImageSizeRestriction::Unrestricted,
+        })),
+    ] {
+        assert!(
+            write_tag_with_options(&tag, Id3Version::V2_2, &opts).is_err(),
+            "post-v2.2 option should be rejected"
+        );
+    }
+}
+
+#[test]
+fn v22_structural_frame_roundtrips() {
+    // A structured non-text frame (POPM) whose §4 body is shared with
+    // v2.3 demotes to "POP" and round-trips through the v2.2 envelope.
+    let tag = Id3Tag {
+        version: Id3Version::V2_2,
+        frames: vec![Id3Frame::Popularimeter {
+            email: "rater@example.com".into(),
+            rating: 196,
+            counter: 4242,
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_2).expect("write");
+    assert_eq!(&bytes[10..13], b"POP");
+    let (parsed, _) = parse_tag(&bytes).expect("re-parse");
+    let popm = parsed
+        .frames
+        .iter()
+        .find_map(|f| match f {
+            Id3Frame::Popularimeter {
+                email,
+                rating,
+                counter,
+            } => Some((email.clone(), *rating, *counter)),
+            _ => None,
+        })
+        .expect("POPM survives");
+    assert_eq!(popm, ("rater@example.com".to_string(), 196, 4242));
+}

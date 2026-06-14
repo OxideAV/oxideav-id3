@@ -108,6 +108,19 @@ fuzz_target!(|data: &[u8]| {
     let _ = write_tag(&writeable, Id3Version::V2_3);
     let _ = write_tag(&writeable, Id3Version::V2_4);
 
+    // ID3v2.2 writer: demotes four-char ids to three-char, skips
+    // frames with no v2.2 form, and emits a 6-byte frame header. Must
+    // be panic-free, and any output must re-parse without panicking.
+    if let Ok(bytes) = write_tag(&writeable, Id3Version::V2_2) {
+        let _ = parse_tag(&bytes);
+    }
+    for &mode in &[UnsyncMode::None, UnsyncMode::WholeTag] {
+        let opts = WriteOptions::new().with_unsync(mode);
+        if let Ok(bytes) = write_tag_with_options(&writeable, Id3Version::V2_2, &opts) {
+            let _ = parse_tag(&bytes);
+        }
+    }
+
     // 6. Unsync-mode write paths. Each `write_tag_with_options` call
     //    must finish without panicking under either unsync strategy,
     //    on either target version. Whole-tag unsync on a body

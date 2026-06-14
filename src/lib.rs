@@ -3531,6 +3531,89 @@ fn v22_promote(id: &str) -> &str {
     }
 }
 
+/// Demote a v2.3/v2.4 four-char frame id to its ID3v2.2 three-char
+/// equivalent for the writer. Returns `None` when the frame has no
+/// v2.2 form — either because it is a v2.4-only addition (`TDRC`,
+/// `RVA2`, `EQU2`, `SEEK`, `SIGN`, `ASPI`, `TMCL`, `TIPL`, …) or a
+/// v2.3 frame that v2.2 never defined.
+///
+/// This is the inverse of [`v22_promote`]'s table, restricted to the
+/// frames the ID3v2.2.0 §4 spec actually declares. The §4 frame set
+/// is closed, so an id absent from the table maps to `None` and the
+/// caller skips the frame rather than emitting an identifier a
+/// conformant v2.2 reader could not interpret.
+fn demote_to_v22(id: &str) -> Option<&'static str> {
+    Some(match id {
+        // §4.2 text information frames.
+        "TIT1" => "TT1",
+        "TIT2" => "TT2",
+        "TIT3" => "TT3",
+        "TPE1" => "TP1",
+        "TPE2" => "TP2",
+        "TPE3" => "TP3",
+        "TPE4" => "TP4",
+        "TCOM" => "TCM",
+        "TEXT" => "TXT",
+        "TLAN" => "TLA",
+        "TCON" => "TCO",
+        "TALB" => "TAL",
+        "TPOS" => "TPA",
+        "TRCK" => "TRK",
+        "TSRC" => "TRC",
+        "TYER" => "TYE",
+        "TDAT" => "TDA",
+        "TIME" => "TIM",
+        "TRDA" => "TRD",
+        "TMED" => "TMT",
+        "TFLT" => "TFT",
+        "TBPM" => "TBP",
+        "TCMP" => "TCP",
+        "TCOP" => "TCR",
+        "TPUB" => "TPB",
+        "TENC" => "TEN",
+        "TSSE" => "TSS",
+        "TOFN" => "TOF",
+        "TLEN" => "TLE",
+        "TSIZ" => "TSI",
+        "TDLY" => "TDY",
+        "TKEY" => "TKE",
+        "TOAL" => "TOT",
+        "TOPE" => "TOA",
+        "TOLY" => "TOL",
+        "TORY" => "TOR",
+        "TXXX" => "TXX",
+        // §4.x structural / binary frames.
+        "RVRB" => "REV",
+        "EQUA" => "EQU",
+        "COMM" => "COM",
+        "USLT" => "ULT",
+        "APIC" => "PIC",
+        "UFID" => "UFI",
+        "IPLS" => "IPL",
+        "MCDI" => "MCI",
+        "ETCO" => "ETC",
+        "MLLT" => "MLL",
+        "SYTC" => "STC",
+        "SYLT" => "SLT",
+        "RVAD" => "RVA",
+        "GEOB" => "GEO",
+        "PCNT" => "CNT",
+        "POPM" => "POP",
+        "RBUF" => "BUF",
+        "AENC" => "CRA",
+        "LINK" => "LNK",
+        // §4.3 URL link frames.
+        "WOAF" => "WAF",
+        "WOAR" => "WAR",
+        "WOAS" => "WAS",
+        "WCOM" => "WCM",
+        "WCOP" => "WCP",
+        "WPUB" => "WPB",
+        "WXXX" => "WXX",
+        _ => return None,
+    })
+}
+
 fn parse_text_frame(id: &str, payload: &[u8]) -> Id3Frame {
     if payload.is_empty() {
         return Id3Frame::Text {
@@ -5273,10 +5356,14 @@ fn id3v1_genre(b: u8) -> Option<&'static str> {
 
 /// Serialise an [`Id3Tag`] to ID3v2 on-disk bytes.
 ///
-/// `target_version` must be [`Id3Version::V2_3`] or [`Id3Version::V2_4`];
-/// v2.2 is a read-only legacy format and [`Id3Version::V1`] is handled
-/// by [`write_id3v1`] instead. Frames are written in the order they
-/// appear in the tag.
+/// `target_version` may be [`Id3Version::V2_2`], [`Id3Version::V2_3`],
+/// or [`Id3Version::V2_4`]; [`Id3Version::V1`] is handled by
+/// [`write_id3v1`] instead. Frames are written in the order they
+/// appear in the tag. Under a v2.2 target each frame is demoted to its
+/// three-character v2.2 id and a frame with no v2.2 equivalent (a
+/// v2.4-only addition or an unrecognised `Unknown` id) is skipped; the
+/// v2.3/v2.4-only [`WriteOptions`] sub-fields (CRC, footer, update
+/// flag, restrictions, frame compression) are rejected for v2.2.
 ///
 /// * `Id3Frame::Text` — written as a standard `T***` frame with
 ///   encoding byte `3` (UTF-8) for v2.4 tags and encoding byte `1`
@@ -5498,14 +5585,18 @@ pub fn write_tag_with_options(
     target_version: Id3Version,
     options: &WriteOptions,
 ) -> Result<Vec<u8>> {
+    // ID3v2.2 has its own frame-header shape (3-char id + 3-byte BE
+    // size, no flags), no extended header, and no per-frame features,
+    // so it takes a dedicated serialiser rather than threading
+    // version branches through the v2.3/v2.4 body builder.
+    if matches!(target_version, Id3Version::V2_2) {
+        return write_tag_v22(tag, options);
+    }
+
     let major: u8 = match target_version {
         Id3Version::V2_3 => 3,
         Id3Version::V2_4 => 4,
-        Id3Version::V2_2 => {
-            return Err(Error::unsupported(
-                "writing ID3v2.2 is not supported; retag as v2.3 or v2.4",
-            ));
-        }
+        Id3Version::V2_2 => unreachable!("v2.2 dispatched above"),
         Id3Version::V1 => {
             return Err(Error::unsupported(
                 "use write_id3v1 to serialise an ID3v1 trailer",
@@ -5854,6 +5945,208 @@ fn build_extended_header(
             "extended-header emission requires v2.3 or v2.4",
         )),
     }
+}
+
+/// Serialise an [`Id3Tag`] as an ID3v2.2.0 tag (spec `id3v2-00`).
+///
+/// v2.2 predates almost every extension the v2.3/v2.4 writer carries:
+/// the only header flag bits are bit 7 (unsynchronisation) and bit 6
+/// (compression, a scheme the spec never defined). There is no
+/// extended header, no footer, no per-frame flags byte, and no
+/// data-length indicator. Each frame header is six bytes — a
+/// three-character id (capital A–Z, 0–9) plus a three-byte big-endian
+/// size that excludes the header itself (spec §3.2).
+///
+/// Frames are demoted to their three-character v2.2 ids via
+/// [`demote_to_v22`]; a frame with no v2.2 equivalent (a v2.4-only
+/// addition, or an [`Id3Frame::Unknown`] whose id is not a valid v2.2
+/// identifier) is skipped rather than emitted under an id a conformant
+/// v2.2 reader could not interpret. The writer rejects the
+/// v2.3/v2.4-only [`WriteOptions`] sub-fields (CRC, footer, update
+/// flag, restrictions, frame compression) so a caller cannot silently
+/// lose a requested feature; [`UnsyncMode::PerFrame`] downgrades to
+/// [`UnsyncMode::WholeTag`] exactly as it does for v2.3.
+fn write_tag_v22(tag: &Id3Tag, options: &WriteOptions) -> Result<Vec<u8>> {
+    // None of the post-v2.2 extensions have a v2.2 wire slot. Reject
+    // loudly so a caller asking for one gets a clear error instead of
+    // a silently-dropped feature, matching the v2.4-only rejections on
+    // the v2.3 path.
+    if options.crc {
+        return Err(Error::unsupported(
+            "ID3v2.2 has no extended header; the CRC sub-field is v2.3+ only",
+        ));
+    }
+    if options.footer {
+        return Err(Error::unsupported(
+            "ID3v2 footer is v2.4-only; cannot be written under a v2.2 target",
+        ));
+    }
+    if options.is_update {
+        return Err(Error::unsupported(
+            "ID3v2 extended-header `is_update` flag is v2.4-only; cannot be written under a v2.2 target",
+        ));
+    }
+    if options.restrictions.is_some() {
+        return Err(Error::unsupported(
+            "ID3v2 extended-header restrictions byte is v2.4-only; cannot be written under a v2.2 target",
+        ));
+    }
+    if options.compress {
+        return Err(Error::unsupported(
+            "ID3v2.2 frame compression is undefined by the spec; cannot be written",
+        ));
+    }
+
+    // PerFrame unsync has no v2.2 wire slot (there is no per-frame
+    // flags byte at all), so it collapses to whole-tag unsync — the
+    // same downgrade the v2.3 path applies.
+    let whole_tag_unsync = matches!(options.unsync, UnsyncMode::WholeTag | UnsyncMode::PerFrame);
+
+    let mut frame_bytes = Vec::new();
+    for frame in &tag.frames {
+        write_v22_frame(frame, &mut frame_bytes)?;
+    }
+
+    let mut body = frame_bytes;
+    if whole_tag_unsync {
+        body = apply_unsync(&body);
+    }
+
+    let size = body.len();
+    if size >= 1 << 28 {
+        return Err(Error::invalid(
+            "ID3v2 tag body exceeds the 28-bit synchsafe size limit",
+        ));
+    }
+
+    // Header flags: only bit 7 (unsync) is ever set; bit 6
+    // (compression) is left clear since the scheme is undefined.
+    let flags: u8 = if whole_tag_unsync { 0x80 } else { 0 };
+
+    let s = size as u32;
+    let mut out = Vec::with_capacity(ID3V2_HEADER_SIZE + size);
+    out.extend_from_slice(b"ID3");
+    out.push(2); // major version
+    out.push(0); // revision
+    out.push(flags);
+    out.push(((s >> 21) & 0x7F) as u8);
+    out.push(((s >> 14) & 0x7F) as u8);
+    out.push(((s >> 7) & 0x7F) as u8);
+    out.push((s & 0x7F) as u8);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Serialise a single frame under an ID3v2.2 envelope, appending the
+/// six-byte header (3-char id + 3-byte BE size) plus payload to `out`.
+/// Frames with no v2.2 equivalent are skipped (no bytes appended).
+fn write_v22_frame(frame: &Id3Frame, out: &mut Vec<u8>) -> Result<()> {
+    // Build the (v2.2 id, payload) pair. Everything except the
+    // attached picture reuses the v2.3 payload encoder — the §4 frame
+    // bodies are byte-identical between v2.2 and v2.3 (only the header
+    // differs), which is exactly why the parser shares them. The PIC
+    // frame is the one exception: v2.2 carries a fixed three-character
+    // image-format code where v2.3's APIC carries a NUL-terminated
+    // MIME string (spec §4.15).
+    let (id22, payload): (&str, Vec<u8>) = match frame {
+        Id3Frame::Picture(pic) => {
+            // v2.2 §4.15 PIC: encoding + 3-char image format + picture
+            // type + NUL-terminated description + binary data. v2.2
+            // text encodings are only $00 (ISO-8859-1) and $01
+            // (UCS-2); use $01 so non-ASCII descriptions survive.
+            let enc: u8 = 1;
+            let mut payload = Vec::new();
+            payload.push(enc);
+            payload.extend_from_slice(&mime_to_v22_image_format(&pic.mime_type));
+            payload.push(pic.picture_type as u8);
+            encode_string(&mut payload, enc, &pic.description);
+            encode_terminator(&mut payload, enc);
+            payload.extend_from_slice(&pic.data);
+            ("PIC", payload)
+        }
+        Id3Frame::Unknown { id, raw } => {
+            // An Unknown frame round-trips verbatim, but only if its id
+            // is already a valid three-character v2.2 identifier. A
+            // four-char id (parsed from v2.3/v2.4) has no v2.2 demotion
+            // here unless it appears in `demote_to_v22`, so a frame the
+            // structural parsers didn't recognise is dropped rather
+            // than truncated to three bytes.
+            match demote_to_v22(id) {
+                Some(id22) => (id22, raw.clone()),
+                None if is_valid_v22_id(id) => {
+                    // Already a v2.2-shaped id (e.g. a v2.2 `CRM` the
+                    // parser preserved verbatim). Emit it unchanged.
+                    out.extend_from_slice(id.as_bytes());
+                    push_v22_size(out, raw.len())?;
+                    out.extend_from_slice(raw);
+                    return Ok(());
+                }
+                None => return Ok(()),
+            }
+        }
+        _ => {
+            // Reuse the v2.3 encoder for the shared §4 bodies, then
+            // demote the four-char id. encode_frame uses v2.3 text
+            // conventions (UTF-16-with-BOM, '/' multi-value join) which
+            // are valid v2.2 — encoding $01 and the '/' separator both
+            // predate v2.2.
+            let (id, payload) = encode_frame(Id3Version::V2_3, frame)?;
+            match demote_to_v22(&id) {
+                Some(id22) => (id22, payload),
+                None => return Ok(()),
+            }
+        }
+    };
+
+    out.extend_from_slice(id22.as_bytes());
+    push_v22_size(out, payload.len())?;
+    out.extend_from_slice(&payload);
+    Ok(())
+}
+
+/// Append a three-byte big-endian frame size to `out` (ID3v2.2 §3.2),
+/// rejecting payloads that overflow the 24-bit field.
+fn push_v22_size(out: &mut Vec<u8>, len: usize) -> Result<()> {
+    if len > 0x00FF_FFFF {
+        return Err(Error::invalid(
+            "ID3v2.2 frame payload exceeds the 24-bit frame-size field",
+        ));
+    }
+    let s = len as u32;
+    out.push(((s >> 16) & 0xFF) as u8);
+    out.push(((s >> 8) & 0xFF) as u8);
+    out.push((s & 0xFF) as u8);
+    Ok(())
+}
+
+/// True when `id` is a well-formed ID3v2.2 frame identifier — exactly
+/// three characters, each a capital A–Z or digit 0–9 (spec §3.2).
+fn is_valid_v22_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    b.len() == 3
+        && b.iter()
+            .all(|&c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+/// Map a MIME type to the three-character image-format code an ID3v2.2
+/// PIC frame carries (spec §4.15: "Image format is preferably 'PNG'
+/// [PNG] or 'JPG' [JFIF]"). The field is a fixed three bytes; the
+/// common image types collapse onto the spec's two named codes and
+/// anything else is upper-cased and padded/truncated to three bytes so
+/// the slot is always exactly filled. This inverts the parser's
+/// format→MIME mapping in [`parse_pic`].
+fn mime_to_v22_image_format(mime: &str) -> [u8; 3] {
+    let lower = mime.to_ascii_lowercase();
+    let code: &str = match lower.as_str() {
+        "image/jpeg" | "image/jpg" => "JPG",
+        "image/png" => "PNG",
+        other => other.strip_prefix("image/").unwrap_or(other),
+    };
+    let mut out = [b' '; 3];
+    for (i, b) in code.bytes().take(3).enumerate() {
+        out[i] = b.to_ascii_uppercase();
+    }
+    out
 }
 
 /// Serialise a single frame into the caller's buffer, optionally
