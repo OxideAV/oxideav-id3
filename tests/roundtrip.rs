@@ -8,10 +8,10 @@ use oxideav_id3::{
     attached_pictures, parse_id3v1, parse_tag, parse_tag_with_extended_header, to_key_value_pairs,
     write_id3v1, write_tag, write_tag_with_options, CommercialDelivery, ContentType,
     Equ2Interpolation, EquaBand, EtcoEventType, FileType, Id3Frame, Id3Tag, Id3Version,
-    ImageEncodingRestriction, ImageSizeRestriction, MediaType, Restrictions, Rva2Channel,
-    Rva2ChannelType, RvadBackChannels, RvadChannel, RvadFrontChannels, SyltContentType, SytcTempo,
-    TagSizeRestriction, TextEncodingRestriction, TextFieldsRestriction, TimestampUnit, UnsyncMode,
-    WriteOptions,
+    ImageEncodingRestriction, ImageSizeRestriction, KeyAccidental, MediaType, MusicalKey,
+    Restrictions, Rva2Channel, Rva2ChannelType, RvadBackChannels, RvadChannel, RvadFrontChannels,
+    SyltContentType, SytcTempo, TagSizeRestriction, TextEncodingRestriction, TextFieldsRestriction,
+    TimestampUnit, UnsyncMode, WriteOptions,
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
@@ -4369,4 +4369,78 @@ fn v22_structural_frame_roundtrips() {
         })
         .expect("POPM survives");
     assert_eq!(popm, ("rater@example.com".to_string(), 196, 4242));
+}
+
+#[test]
+fn roundtrip_tkey_initial_key_typed_view() {
+    // The TKEY initial-key typed accessor decodes the spec grammar
+    // (ground key A..G + optional b/# halfkey + optional m minor, the
+    // standalone "o" off-key) and survives a full write -> parse cycle
+    // under both v2.3 and v2.4 envelopes via the public surface.
+    let cases: &[(&str, MusicalKey)] = &[
+        (
+            "Dbm",
+            MusicalKey::Key {
+                tonic: 'D',
+                accidental: Some(KeyAccidental::Flat),
+                minor: true,
+            },
+        ),
+        (
+            "F#",
+            MusicalKey::Key {
+                tonic: 'F',
+                accidental: Some(KeyAccidental::Sharp),
+                minor: false,
+            },
+        ),
+        (
+            "C",
+            MusicalKey::Key {
+                tonic: 'C',
+                accidental: None,
+                minor: false,
+            },
+        ),
+        ("o", MusicalKey::OffKey),
+        // A non-conforming value is preserved verbatim.
+        ("Z9", MusicalKey::Custom("Z9".to_string())),
+    ];
+
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        for (wire, expected) in cases {
+            let tag = Id3Tag {
+                version,
+                frames: vec![Id3Frame::Text {
+                    id: "TKEY".into(),
+                    values: vec![(*wire).to_string()],
+                }],
+            };
+            let bytes = write_tag(&tag, version).expect("write");
+            let (parsed, _) = parse_tag(&bytes).expect("re-parse");
+            let tkey = parsed
+                .frames
+                .iter()
+                .find(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TKEY"))
+                .expect("TKEY survives");
+            // The typed accessor reconstructs the expected key.
+            assert_eq!(
+                tkey.initial_key(),
+                Some(vec![expected.clone()]),
+                "wire {wire:?} under {version:?}"
+            );
+            // The raw value also round-trips losslessly.
+            assert_eq!(
+                find_text(&parsed, "TKEY"),
+                Some([(*wire).to_string()].as_slice())
+            );
+        }
+    }
+
+    // The accessor returns None for any other frame.
+    let tit2 = Id3Frame::Text {
+        id: "TIT2".into(),
+        values: vec!["Dbm".into()],
+    };
+    assert_eq!(tit2.initial_key(), None);
 }

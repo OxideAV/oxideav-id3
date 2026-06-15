@@ -1480,6 +1480,111 @@ fn parse_tflt_value(value: &str, out: &mut Vec<FileType>) {
     out.push(FileType::predefined(code, refinements));
 }
 
+/// The accidental on a [`MusicalKey::Key`] tonic (spec v2.3 §4.2.1 /
+/// v2.4 §4.2.3 `TKEY`). The spec defines exactly two "halfkeys":
+/// `"b"` (flat) and `"#"` (sharp). A natural key (no accidental) is
+/// the absence of either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyAccidental {
+    /// `"b"` per spec — the tonic is flattened a halfkey.
+    Flat,
+    /// `"#"` per spec — the tonic is sharpened a halfkey.
+    Sharp,
+}
+
+/// Typed view of the `TKEY` "Initial key" frame (spec v2.3 §4.2.1 /
+/// v2.4 §4.2.3). The frame "contains the musical key in which the sound
+/// starts", "represented as a string with a maximum length of three
+/// characters". Per spec the ground keys are `"A"`..`"G"`, the halfkeys
+/// are `"b"` and `"#"`, minor is `"m"`, and "Off key is represented with
+/// an `"o"` only" — e.g. `"Dbm"` is D-flat minor and `"o"` is off-key.
+///
+/// The byte-form is identical across v2.2 (`TKE`), v2.3, and v2.4 — the
+/// grammar paragraph is reproduced verbatim in all three version docs —
+/// so the accessor is version-independent, matching the cross-version
+/// posture of [`Id3Frame::content_types`] and [`Id3Frame::media_type`].
+/// Surfaced via [`Id3Frame::initial_key`].
+///
+/// Spec-conforming values decode to a structured variant; anything that
+/// does not match the spec grammar (a tonic outside `A`..`G`, an unknown
+/// trailing character, or a length over the spec's three-character
+/// maximum) surfaces as [`MusicalKey::Custom`] so a forward-compatible or
+/// non-conforming source is preserved rather than dropped — matching the
+/// posture of [`FileType::Custom`]. The raw [`Id3Frame::Text::values`] is
+/// unchanged and round-trips losslessly through [`write_tag`], so the
+/// typed view never costs a caller the ability to preserve the exact
+/// on-wire string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MusicalKey {
+    /// The spec's `"o"` off-key sentinel — "Off key is represented with
+    /// an `"o"` only". Carries no tonic.
+    OffKey,
+    /// A structured key: a ground tonic `A`..`G`, an optional flat / sharp
+    /// accidental, and a minor flag.
+    Key {
+        /// The ground key, an uppercase `'A'`..`'G'` per spec.
+        tonic: char,
+        /// The `"b"` / `"#"` halfkey, or `None` for a natural tonic.
+        accidental: Option<KeyAccidental>,
+        /// `true` when the trailing `"m"` minor marker is present.
+        minor: bool,
+    },
+    /// A value that does not match the spec grammar — preserved verbatim
+    /// so a non-conforming or forward-compatible source surfaces
+    /// structurally rather than being dropped.
+    Custom(String),
+}
+
+/// Parse a single `TKEY` value string into a [`MusicalKey`] per the spec
+/// grammar (ground key `A`..`G`, optional `b` / `#` halfkey, optional
+/// `m` minor; the standalone `o` off-key sentinel). Any value that
+/// violates the grammar — including a value longer than the spec's
+/// three-character maximum — surfaces as [`MusicalKey::Custom`].
+fn parse_tkey_value(value: &str) -> MusicalKey {
+    if value == "o" {
+        return MusicalKey::OffKey;
+    }
+    // The spec caps the field at three characters; a longer value cannot
+    // be a conforming key, so preserve it verbatim.
+    let chars: Vec<char> = value.chars().collect();
+    if chars.is_empty() || chars.len() > 3 {
+        return MusicalKey::Custom(value.to_string());
+    }
+    let mut iter = chars.iter().copied();
+    let tonic = iter.next().unwrap();
+    if !('A'..='G').contains(&tonic) {
+        return MusicalKey::Custom(value.to_string());
+    }
+    let mut accidental = None;
+    let mut minor = false;
+    let mut pending = iter.next();
+    if let Some(c) = pending {
+        accidental = match c {
+            'b' => Some(KeyAccidental::Flat),
+            '#' => Some(KeyAccidental::Sharp),
+            _ => None,
+        };
+        if accidental.is_some() {
+            pending = iter.next();
+        }
+    }
+    if let Some(c) = pending {
+        if c == 'm' {
+            minor = true;
+            pending = iter.next();
+        }
+    }
+    // Any leftover character means the value does not match the grammar.
+    if pending.is_some() {
+        return MusicalKey::Custom(value.to_string());
+    }
+    MusicalKey::Key {
+        tonic,
+        accidental,
+        minor,
+    }
+}
+
 /// Typed view of the `ETCO` "type of event" byte (spec v2.3 §4.6 /
 /// v2.4 §4.5). The byte sits at the start of each per-event record in
 /// an `ETCO` payload — one event-type byte followed by a 32-bit
@@ -2021,6 +2126,34 @@ impl Id3Frame {
                     parse_tflt_value(value, &mut out);
                 }
                 Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Typed view of the `TKEY` "Initial key" frame (spec v2.3 §4.2.1 /
+    /// v2.4 §4.2.3). The frame "contains the musical key in which the
+    /// sound starts", represented as a string of at most three
+    /// characters: a ground key `"A"`..`"G"`, an optional `"b"` / `"#"`
+    /// halfkey, an optional `"m"` minor marker, or the standalone `"o"`
+    /// off-key sentinel.
+    ///
+    /// Returns `None` for any frame other than `TKEY`. For `TKEY` it
+    /// returns one [`MusicalKey`] per [`Id3Frame::Text::values`] entry in
+    /// wire order (a conformant tag carries a single value, but the
+    /// text-frame parser splits on NUL so the accessor tolerates a
+    /// multi-value source). A value that does not match the spec grammar
+    /// surfaces as [`MusicalKey::Custom`] so a forward-compatible or
+    /// non-conforming source is preserved rather than dropped. The wire
+    /// grammar is identical across v2.2 (`TKE`), v2.3, and v2.4 so the
+    /// accessor is version-independent, matching the posture of
+    /// [`Id3Frame::content_types`] and [`Id3Frame::media_type`]. The raw
+    /// [`Id3Frame::Text::values`] is unchanged and round-trips losslessly
+    /// through [`write_tag`].
+    pub fn initial_key(&self) -> Option<Vec<MusicalKey>> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TKEY" => {
+                Some(values.iter().map(|v| parse_tkey_value(v)).collect())
             }
             _ => None,
         }
@@ -10632,5 +10765,140 @@ mod tests {
             .find(|f| matches!(f, Id3Frame::Comment { .. }))
             .unwrap();
         assert_eq!(comm.language(), Some(Language::Code(*b"eng")));
+    }
+
+    #[test]
+    fn tkey_grammar_covers_spec_examples() {
+        // Spec §4.2.1 (v2.3) / §4.2.3 (v2.4): ground key A..G, optional
+        // b/# halfkey, optional m minor, the standalone "o" off-key.
+        assert_eq!(
+            parse_tkey_value("C"),
+            MusicalKey::Key {
+                tonic: 'C',
+                accidental: None,
+                minor: false
+            }
+        );
+        assert_eq!(
+            parse_tkey_value("Cm"),
+            MusicalKey::Key {
+                tonic: 'C',
+                accidental: None,
+                minor: true
+            }
+        );
+        // The spec's worked v2.4 example "Dbm" — D-flat minor.
+        assert_eq!(
+            parse_tkey_value("Dbm"),
+            MusicalKey::Key {
+                tonic: 'D',
+                accidental: Some(KeyAccidental::Flat),
+                minor: true
+            }
+        );
+        // The spec's worked v2.3 example "Cbm" — C-flat minor.
+        assert_eq!(
+            parse_tkey_value("Cbm"),
+            MusicalKey::Key {
+                tonic: 'C',
+                accidental: Some(KeyAccidental::Flat),
+                minor: true
+            }
+        );
+        assert_eq!(
+            parse_tkey_value("F#"),
+            MusicalKey::Key {
+                tonic: 'F',
+                accidental: Some(KeyAccidental::Sharp),
+                minor: false
+            }
+        );
+        assert_eq!(
+            parse_tkey_value("A#m"),
+            MusicalKey::Key {
+                tonic: 'A',
+                accidental: Some(KeyAccidental::Sharp),
+                minor: true
+            }
+        );
+        // Off key is "o" only.
+        assert_eq!(parse_tkey_value("o"), MusicalKey::OffKey);
+    }
+
+    #[test]
+    fn tkey_non_conforming_surfaces_custom() {
+        // Tonic outside A..G.
+        assert_eq!(parse_tkey_value("H"), MusicalKey::Custom("H".to_string()));
+        // Empty value.
+        assert_eq!(parse_tkey_value(""), MusicalKey::Custom(String::new()));
+        // Over the three-character spec maximum.
+        assert_eq!(
+            parse_tkey_value("Cbmm"),
+            MusicalKey::Custom("Cbmm".to_string())
+        );
+        // A trailing character that isn't part of the grammar.
+        assert_eq!(parse_tkey_value("Cx"), MusicalKey::Custom("Cx".to_string()));
+        // Minor marker before the accidental is out of order.
+        assert_eq!(
+            parse_tkey_value("Cmb"),
+            MusicalKey::Custom("Cmb".to_string())
+        );
+        // Lowercase off-key sentinel is exactly "o"; "O" is not.
+        assert_eq!(parse_tkey_value("O"), MusicalKey::Custom("O".to_string()));
+    }
+
+    #[test]
+    fn initial_key_accessor_only_on_tkey() {
+        let tkey = Id3Frame::Text {
+            id: "TKEY".into(),
+            values: vec!["Dbm".into()],
+        };
+        assert_eq!(
+            tkey.initial_key(),
+            Some(vec![MusicalKey::Key {
+                tonic: 'D',
+                accidental: Some(KeyAccidental::Flat),
+                minor: true
+            }])
+        );
+        // Any other text frame yields None.
+        let tit2 = Id3Frame::Text {
+            id: "TIT2".into(),
+            values: vec!["Dbm".into()],
+        };
+        assert_eq!(tit2.initial_key(), None);
+        // A non-text variant yields None.
+        assert_eq!(Id3Frame::PlayCounter { count: 1 }.initial_key(), None);
+    }
+
+    #[test]
+    fn initial_key_survives_tkey_roundtrip() {
+        // Serialise a TKEY frame, re-parse the whole tag under both
+        // envelopes, and confirm the typed key survives. The raw value
+        // is unchanged so the typed view is reconstructed identically.
+        for version in [Id3Version::V2_3, Id3Version::V2_4] {
+            let tag = Id3Tag {
+                version,
+                frames: vec![Id3Frame::Text {
+                    id: "TKEY".into(),
+                    values: vec!["F#m".into()],
+                }],
+            };
+            let bytes = write_tag(&tag, version).unwrap();
+            let (parsed, _) = parse_tag(&bytes).unwrap();
+            let tkey = parsed
+                .frames
+                .iter()
+                .find(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TKEY"))
+                .unwrap();
+            assert_eq!(
+                tkey.initial_key(),
+                Some(vec![MusicalKey::Key {
+                    tonic: 'F',
+                    accidental: Some(KeyAccidental::Sharp),
+                    minor: true
+                }])
+            );
+        }
     }
 }

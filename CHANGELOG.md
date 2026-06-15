@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed `TKEY` initial-key accessor `Id3Frame::initial_key()` + the
+  `MusicalKey` / `KeyAccidental` enums (spec v2.3 §4.2.1 / v2.4 §4.2.3).
+  The frame "contains the musical key in which the sound starts",
+  "represented as a string with a maximum length of three characters";
+  the ground keys are `A`..`G`, the halfkeys `b` / `#`, minor `m`, and
+  "off key is represented with an `o` only" (e.g. the spec example
+  `Dbm`). The accessor decodes that grammar to `MusicalKey::Key { tonic,
+  accidental, minor }`, `MusicalKey::OffKey`, or `MusicalKey::Custom` for
+  any value outside the grammar (tonic not in `A`..`G`, unknown / out-of-
+  order trailing character, or a value past the three-character maximum)
+  so a forward-compatible or non-conforming source surfaces structurally
+  rather than being dropped, matching the posture of `file_type()` /
+  `media_type()`. The grammar paragraph is identical across v2.2 (`TKE`),
+  v2.3, and v2.4 so the accessor is version-independent; the raw
+  `Id3Frame::Text::values` is unchanged and round-trips losslessly
+  through `write_tag`. Three new lib tests (spec-example grammar coverage
+  for natural / minor / flat / sharp keys and the `o` off-key; non-
+  conforming inputs collapsing to `Custom`; accessor `None` on non-`TKEY`
+  frames) plus one integration round-trip test (write → parse under both
+  v2.3 and v2.4 envelopes preserving both the typed view and the raw
+  value) cover the matrix.
 - **ID3v2.2 write support** (`write_tag(&tag, Id3Version::V2_2)` / the
   `write_tag_with_options` path), completing the v2.2 round-trip — the
   format was previously parse-only. Each four-char id is demoted to its

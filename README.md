@@ -624,6 +624,22 @@ never silently drops data.
   segment is empty surfaces as `FileType::Custom`. The raw
   `Id3Frame::Text::values` is unchanged and round-trips losslessly through
   the writer, matching the posture of `media_type()`.
+- `Id3Frame::initial_key()` returns a typed `Vec<MusicalKey>` for the
+  `TKEY` initial-key frame (spec v2.3 §4.2.1 / v2.4 §4.2.3). The frame
+  "contains the musical key in which the sound starts", represented as a
+  string of at most three characters: a ground key (`A`..`G`), an
+  optional `b` / `#` halfkey (typed `KeyAccidental::Flat` / `Sharp`), an
+  optional `m` minor marker, or the standalone `o` off-key sentinel. The
+  accessor decodes that grammar to `MusicalKey::Key { tonic, accidental,
+  minor }`, `MusicalKey::OffKey`, or `MusicalKey::Custom(String)` for any
+  value that violates the grammar — a tonic outside `A`..`G`, an unknown
+  trailing character, an out-of-order marker, or a value past the
+  three-character maximum — so a forward-compatible or non-conforming
+  source surfaces structurally rather than being dropped, matching the
+  posture of `file_type()` / `media_type()`. The grammar paragraph is
+  reproduced verbatim across v2.2 (`TKE`), v2.3, and v2.4, so the accessor
+  is version-independent; the raw `Id3Frame::Text::values` is unchanged
+  and round-trips losslessly through `write_tag`.
 - `Id3Frame::language()` returns a typed `Language` for the three-byte
   language field carried by the language-tagged frames (`COMM`, `USLT`,
   `USER`, `SYLT`), per the structure doc's "three byte language field …
