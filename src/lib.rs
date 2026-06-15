@@ -1766,6 +1766,94 @@ impl EtcoEventType {
     }
 }
 
+/// Typed view of a single price element carried by the `OWNE` "price
+/// paid" field (spec v2.3 §4.24 / v2.4 §4.23) and the `COMR` "price
+/// string" field (spec v2.3 §4.25 / v2.4 §4.24).
+///
+/// Spec wording (`OWNE`): "The first three characters of this field
+/// contains the currency used for the transaction, encoded according
+/// to ISO-4217 alphabetic currency code. Concatenated to this is the
+/// actual price paid, as a numerical string using \".\" as the decimal
+/// separator." `COMR`'s "price string" reuses the same per-element
+/// grammar ("one three character currency code … followed by a
+/// numerical value where \".\" is used as decimal separator"), and a
+/// `COMR` field may concatenate several such elements separated by
+/// `/` (with at most one element per currency).
+///
+/// A well-formed element is surfaced as [`Price::Element`] with the
+/// three-letter currency split from the trailing amount; anything too
+/// short to carry a three-character currency code, or whose currency
+/// bytes are not three ASCII letters, surfaces as [`Price::Malformed`]
+/// with the raw bytes preserved verbatim — matching the
+/// forward-compatible, non-destructive posture of [`Language`] and the
+/// other typed views. The accessors leave the underlying `price`
+/// strings untouched so the exact on-wire bytes still round-trip
+/// through [`write_tag`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Price {
+    /// A spec-conforming element: a three-letter ISO-4217 alphabetic
+    /// currency code (normalised to upper case for comparison; the
+    /// spec gives ISO-4217 codes in upper case) plus the trailing
+    /// numerical amount string exactly as it appeared on the wire
+    /// (decimal separator `.` preserved, not parsed into a number so
+    /// no precision is lost and a malformed-but-present amount is kept).
+    Element {
+        /// The three-letter currency code, upper-cased.
+        currency: [u8; 3],
+        /// The numerical amount string, verbatim after the currency.
+        amount: String,
+    },
+    /// A non-conforming element: fewer than three leading bytes, or a
+    /// leading three bytes that are not all ASCII letters. The raw
+    /// element string is preserved so the caller can still inspect it.
+    Malformed(String),
+}
+
+impl Price {
+    /// Decode a single price element (no `/` separators) into the typed
+    /// view. The leading three ASCII-letter bytes are the ISO-4217
+    /// currency; the remainder is the amount string. An element that is
+    /// too short or whose currency bytes are not all ASCII letters maps
+    /// to [`Price::Malformed`] with the raw string preserved.
+    pub fn from_element(element: &str) -> Price {
+        let bytes = element.as_bytes();
+        if bytes.len() >= 3 && bytes[..3].iter().all(|b| b.is_ascii_alphabetic()) {
+            let currency = [
+                bytes[0].to_ascii_uppercase(),
+                bytes[1].to_ascii_uppercase(),
+                bytes[2].to_ascii_uppercase(),
+            ];
+            Price::Element {
+                currency,
+                amount: element[3..].to_string(),
+            }
+        } else {
+            Price::Malformed(element.to_string())
+        }
+    }
+
+    /// The three-letter currency code as a string slice when this is a
+    /// well-formed [`Price::Element`]; `None` for [`Price::Malformed`].
+    /// Always valid UTF-8 because an `Element` currency is by
+    /// construction three ASCII letters.
+    pub fn currency(&self) -> Option<&str> {
+        match self {
+            Price::Element { currency, .. } => std::str::from_utf8(currency).ok(),
+            Price::Malformed(_) => None,
+        }
+    }
+
+    /// The numerical amount string for a well-formed [`Price::Element`];
+    /// `None` for [`Price::Malformed`]. Returned verbatim — not parsed
+    /// into a floating-point number — so no precision is lost.
+    pub fn amount(&self) -> Option<&str> {
+        match self {
+            Price::Element { amount, .. } => Some(amount),
+            Price::Malformed(_) => None,
+        }
+    }
+}
+
 impl Id3Frame {
     /// Typed accessor for the `time_stamp_format` byte carried by the
     /// frames whose spec layout opens with one (`ETCO`, `SYTC`, `SYLT`,
@@ -1911,6 +1999,61 @@ impl Id3Frame {
     pub fn commercial_delivery(&self) -> Option<CommercialDelivery> {
         match self {
             Id3Frame::Commercial { received_as, .. } => CommercialDelivery::from_wire(*received_as),
+            _ => None,
+        }
+    }
+
+    /// Typed accessor for the `COMR` "price string" field (spec v2.3
+    /// §4.25 / v2.4 §4.24). Returns `Some(prices)` for a
+    /// [`Id3Frame::Commercial`] frame and `None` for any other variant.
+    ///
+    /// Spec wording (v2.4 §4.24): "A price is constructed by one three
+    /// character currency code, encoded according to ISO 4217 …
+    /// followed by a numerical value where \".\" is used as decimal
+    /// separator. In the price string several prices may be
+    /// concatenated, separated by a \"/\" character, but there may only
+    /// be one currency of each type." This accessor splits the stored
+    /// `price` string on `/` and decodes each element via
+    /// [`Price::from_element`]; the returned vector preserves wire
+    /// order. An empty `price` string yields `Some(Vec::new())` so the
+    /// caller can distinguish "frame present, no price" from "frame
+    /// absent". The spec's "one currency of each type" invariant is not
+    /// enforced — a non-conforming source carrying a duplicate currency
+    /// surfaces both elements rather than dropping data, matching the
+    /// forward-compatible posture of the other typed views. The
+    /// underlying `price` string is untouched, so the exact on-wire
+    /// bytes still round-trip through [`write_tag`].
+    pub fn commercial_prices(&self) -> Option<Vec<Price>> {
+        match self {
+            Id3Frame::Commercial { price, .. } => {
+                if price.is_empty() {
+                    Some(Vec::new())
+                } else {
+                    Some(price.split('/').map(Price::from_element).collect())
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Typed accessor for the `OWNE` "price paid" field (spec v2.3
+    /// §4.24 / v2.4 §4.23). Returns `Some(price)` for an
+    /// [`Id3Frame::Ownership`] frame and `None` for any other variant.
+    ///
+    /// Spec wording (v2.4 §4.23): "The frame begins … with a 'price
+    /// paid' field. The first three characters of this field contains
+    /// the currency used for the transaction, encoded according to ISO
+    /// 4217 alphabetic currency code. Concatenated to this is the
+    /// actual price paid, as a numerical string using \".\" as the
+    /// decimal separator." Unlike `COMR`, the `OWNE` field carries a
+    /// single price element (no `/` concatenation — "the actual price
+    /// paid"), so this accessor decodes the whole `price` string as one
+    /// [`Price`] via [`Price::from_element`]. The underlying `price`
+    /// string is untouched, so the exact on-wire bytes still round-trip
+    /// through [`write_tag`].
+    pub fn ownership_price(&self) -> Option<Price> {
+        match self {
+            Id3Frame::Ownership { price, .. } => Some(Price::from_element(price)),
             _ => None,
         }
     }
@@ -10765,6 +10908,192 @@ mod tests {
             .find(|f| matches!(f, Id3Frame::Comment { .. }))
             .unwrap();
         assert_eq!(comm.language(), Some(Language::Code(*b"eng")));
+    }
+
+    #[test]
+    fn price_from_element_splits_currency_and_amount() {
+        // Spec: first three characters = ISO-4217 currency, the
+        // remainder = numerical amount with "." as decimal separator.
+        assert_eq!(
+            Price::from_element("USD8.99"),
+            Price::Element {
+                currency: *b"USD",
+                amount: "8.99".into(),
+            }
+        );
+        // Lower-case currency normalises to upper case for comparison.
+        assert_eq!(
+            Price::from_element("eur9.50"),
+            Price::Element {
+                currency: *b"EUR",
+                amount: "9.50".into(),
+            }
+        );
+        // A whole-number amount (no decimal point) is preserved verbatim.
+        assert_eq!(
+            Price::from_element("JPY1000"),
+            Price::Element {
+                currency: *b"JPY",
+                amount: "1000".into(),
+            }
+        );
+        // Exactly three chars = currency with an empty amount string.
+        assert_eq!(
+            Price::from_element("GBP"),
+            Price::Element {
+                currency: *b"GBP",
+                amount: String::new(),
+            }
+        );
+
+        // currency()/amount() expose the parts for a well-formed element.
+        let p = Price::from_element("USD8.99");
+        assert_eq!(p.currency(), Some("USD"));
+        assert_eq!(p.amount(), Some("8.99"));
+    }
+
+    #[test]
+    fn price_from_element_preserves_malformed() {
+        // Too short to carry a three-character currency code.
+        assert_eq!(Price::from_element("US"), Price::Malformed("US".into()));
+        assert_eq!(Price::from_element(""), Price::Malformed(String::new()));
+        // Leading three bytes not all ASCII letters.
+        assert_eq!(
+            Price::from_element("1SD8.99"),
+            Price::Malformed("1SD8.99".into())
+        );
+        let m = Price::from_element("12");
+        assert_eq!(m.currency(), None);
+        assert_eq!(m.amount(), None);
+    }
+
+    #[test]
+    fn commercial_prices_splits_on_slash() {
+        // Spec §4.24: "several prices may be concatenated, separated by
+        // a '/' character, but there may only be one currency of each
+        // type." Wire order is preserved.
+        let comr = Id3Frame::Commercial {
+            price: "USD8.99/EUR9.50".into(),
+            valid_until: "20260101".into(),
+            contact_url: "http://x".into(),
+            received_as: 0,
+            seller: String::new(),
+            description: String::new(),
+            logo_mime: String::new(),
+            logo_data: Vec::new(),
+        };
+        assert_eq!(
+            comr.commercial_prices(),
+            Some(vec![
+                Price::Element {
+                    currency: *b"USD",
+                    amount: "8.99".into(),
+                },
+                Price::Element {
+                    currency: *b"EUR",
+                    amount: "9.50".into(),
+                },
+            ])
+        );
+
+        // An empty price field yields an empty Vec (frame present,
+        // no price) rather than None or a single malformed element.
+        let empty = Id3Frame::Commercial {
+            price: String::new(),
+            valid_until: String::new(),
+            contact_url: String::new(),
+            received_as: 0,
+            seller: String::new(),
+            description: String::new(),
+            logo_mime: String::new(),
+            logo_data: Vec::new(),
+        };
+        assert_eq!(empty.commercial_prices(), Some(Vec::new()));
+
+        // A non-Commercial variant yields None.
+        assert_eq!(Id3Frame::PlayCounter { count: 1 }.commercial_prices(), None);
+    }
+
+    #[test]
+    fn ownership_price_is_single_element() {
+        // Spec §4.23: the OWNE "price paid" field carries a single
+        // price element (no "/" concatenation).
+        let owne = Id3Frame::Ownership {
+            price: "USD8.99".into(),
+            date: "20260101".into(),
+            seller: "Acme".into(),
+        };
+        assert_eq!(
+            owne.ownership_price(),
+            Some(Price::Element {
+                currency: *b"USD",
+                amount: "8.99".into(),
+            })
+        );
+
+        // A non-Ownership variant yields None.
+        assert_eq!(Id3Frame::PlayCounter { count: 1 }.ownership_price(), None);
+    }
+
+    #[test]
+    fn price_accessors_survive_wire_roundtrip() {
+        // Build COMR + OWNE frames, serialise + re-parse a whole tag,
+        // and confirm the typed prices survive the wire round-trip and
+        // the raw `price` strings are untouched.
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![
+                Id3Frame::Commercial {
+                    price: "USD8.99/EUR9.50".into(),
+                    valid_until: "20260101".into(),
+                    contact_url: "http://x".into(),
+                    received_as: 3,
+                    seller: "Store".into(),
+                    description: "Offer".into(),
+                    logo_mime: String::new(),
+                    logo_data: Vec::new(),
+                },
+                Id3Frame::Ownership {
+                    price: "GBP4.00".into(),
+                    date: "20251231".into(),
+                    seller: "Owner".into(),
+                },
+            ],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+
+        let comr = parsed
+            .frames
+            .iter()
+            .find(|f| matches!(f, Id3Frame::Commercial { .. }))
+            .unwrap();
+        assert_eq!(
+            comr.commercial_prices(),
+            Some(vec![
+                Price::Element {
+                    currency: *b"USD",
+                    amount: "8.99".into(),
+                },
+                Price::Element {
+                    currency: *b"EUR",
+                    amount: "9.50".into(),
+                },
+            ])
+        );
+
+        let owne = parsed
+            .frames
+            .iter()
+            .find(|f| matches!(f, Id3Frame::Ownership { .. }))
+            .unwrap();
+        assert_eq!(
+            owne.ownership_price(),
+            Some(Price::Element {
+                currency: *b"GBP",
+                amount: "4.00".into(),
+            })
+        );
     }
 
     #[test]

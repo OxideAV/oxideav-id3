@@ -657,6 +657,25 @@ never silently drops data.
   own outputs, and the underlying `lang: [u8; 3]` field is untouched so
   callers keep the exact on-wire bytes. Matches the cross-version,
   non-destructive posture of `timestamp_unit()`.
+- `Id3Frame::commercial_prices()` / `Id3Frame::ownership_price()` return
+  typed `Price` values for the `COMR` price string (spec v2.3 §4.25 /
+  v2.4 §4.24) and the `OWNE` price-paid field (spec v2.3 §4.24 / v2.4
+  §4.23). The spec defines a price element as "one three character
+  currency code, encoded according to ISO 4217 … followed by a numerical
+  value where `.` is used as decimal separator". `COMR` may concatenate
+  several elements "separated by a `/` character", so
+  `commercial_prices()` returns a `Vec<Price>` in wire order (empty
+  `Vec` for an empty price field); `OWNE` carries a single element so
+  `ownership_price()` returns one `Price`. A well-formed element decodes
+  to `Price::Element { currency: [u8; 3], amount }` (currency upper-cased
+  for comparison, amount preserved verbatim — not parsed into a float so
+  no precision is lost); a too-short or non-letter-prefixed element
+  surfaces as `Price::Malformed` with the raw string preserved, matching
+  the forward-compatible posture of `language()`. The spec's "one
+  currency of each type" invariant is not enforced (a duplicate-currency
+  source surfaces both elements rather than dropping data). The raw
+  `price` strings are untouched, so the exact on-wire bytes still
+  round-trip through `write_tag`.
 
 ## Fuzzing
 

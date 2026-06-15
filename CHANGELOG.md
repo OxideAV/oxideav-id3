@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Typed price accessors `Id3Frame::commercial_prices()` (for `COMR`,
+  spec v2.3 §4.25 / v2.4 §4.24) and `Id3Frame::ownership_price()` (for
+  `OWNE`, spec v2.3 §4.24 / v2.4 §4.23) plus the `Price` enum. The spec
+  defines a price element as "one three character currency code, encoded
+  according to ISO 4217 … followed by a numerical value where `.` is
+  used as decimal separator"; the `COMR` field may concatenate several
+  such elements "separated by a `/` character". `commercial_prices()`
+  splits the stored price string on `/` and decodes each element into
+  `Price::Element { currency: [u8; 3], amount: String }` (currency
+  upper-cased, amount preserved verbatim — not parsed to a float so no
+  precision is lost), preserving wire order; an empty price yields an
+  empty `Vec`. `ownership_price()` decodes the single `OWNE` element. A
+  too-short or non-letter-prefixed element surfaces as
+  `Price::Malformed` with the raw string preserved, matching the
+  forward-compatible posture of `Language` and the other typed views;
+  the raw `price` strings are untouched so the exact on-wire bytes still
+  round-trip through `write_tag`. Five new lib tests (currency/amount
+  split incl. lower-case + empty-amount + 3-char-only cases; malformed
+  preservation; `COMR` `/`-split + empty-Vec + `None`-on-other-variant;
+  `OWNE` single element; write → parse round-trip for both frames).
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-id3/compare/v0.0.5...v0.0.6) - 2026-06-15
 
 ### Other
