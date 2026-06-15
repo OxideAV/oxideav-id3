@@ -1057,6 +1057,69 @@ impl Equ2Interpolation {
     }
 }
 
+/// Typed view of the `POPM` "rating" byte (spec v2.3 §4.18 / v2.4
+/// §4.17). The spec states verbatim: "The rating is 1-255 where 1 is
+/// worst and 255 is best. 0 is unknown." This enum surfaces that two-
+/// state semantic — a categorical [`PopmRating::Unknown`] for the
+/// reserved `$00` and a [`PopmRating::Rated`] carrying the raw
+/// `1..=255` magnitude — without losing the round-trip through the raw
+/// `u8` field. The underlying [`Id3Frame::Popularimeter::rating`] is
+/// unchanged, so the exact on-wire byte still serialises through
+/// [`write_tag`].
+///
+/// The rating byte is identical between v2.3 and v2.4 (the wording is
+/// reproduced verbatim in both version docs), so the accessor is
+/// version-independent, matching the cross-version posture of
+/// [`Id3Frame::etco_event_types`] and [`Id3Frame::timestamp_unit`].
+/// No normalisation onto a star scale is performed: the spec defines
+/// only the `1`-worst / `255`-best ordering and the `0`-unknown
+/// sentinel, and any bucketing into N stars is an out-of-spec
+/// convention, so [`PopmRating::Rated`] preserves the raw byte and
+/// leaves any scaling to the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopmRating {
+    /// `$00` per spec — "0 is unknown": no rating has been expressed.
+    Unknown,
+    /// `$01..=$FF` per spec — a concrete rating where `1` is worst and
+    /// `255` is best. The inner byte is the raw on-wire magnitude,
+    /// guaranteed non-zero.
+    Rated(u8),
+}
+
+impl PopmRating {
+    /// Decode a raw `POPM` rating byte. `$00` maps to
+    /// [`PopmRating::Unknown`] per the spec sentinel; every other byte
+    /// (`$01..=$FF`) maps to [`PopmRating::Rated`] carrying that
+    /// magnitude. Total over all 256 byte values — there is no reserved
+    /// range — so this returns `Self` rather than `Option<Self>`,
+    /// unlike the enumerated-variant accessors (`from_wire` on
+    /// [`Equ2Interpolation`] etc.) which reject reserved bytes.
+    pub fn from_wire(value: u8) -> Self {
+        match value {
+            0 => PopmRating::Unknown,
+            n => PopmRating::Rated(n),
+        }
+    }
+
+    /// Encode this rating back to the raw wire byte: `$00` for
+    /// [`PopmRating::Unknown`], otherwise the carried `1..=255`
+    /// magnitude. Forms a bijection with [`PopmRating::from_wire`] over
+    /// all 256 byte values.
+    pub fn to_wire(self) -> u8 {
+        match self {
+            PopmRating::Unknown => 0,
+            PopmRating::Rated(n) => n,
+        }
+    }
+
+    /// `true` when a concrete rating has been expressed (`$01..=$FF`),
+    /// `false` for the `$00` "unknown" sentinel. Convenience over
+    /// matching [`PopmRating::Rated`].
+    pub fn is_rated(self) -> bool {
+        matches!(self, PopmRating::Rated(_))
+    }
+}
+
 /// Typed view of the `SYTC` "tempo" byte (spec v2.4 §4.7). Each
 /// per-tempo record in a `SYTC` payload opens with a one- or two-byte
 /// tempo descriptor: a single byte for tempos `$00..=$FE`, or `$FF`
@@ -2073,6 +2136,31 @@ impl Id3Frame {
     pub fn equ2_interpolation(&self) -> Option<Equ2Interpolation> {
         match self {
             Id3Frame::Equ2 { interpolation, .. } => Equ2Interpolation::from_wire(*interpolation),
+            _ => None,
+        }
+    }
+
+    /// Typed accessor for the `POPM` "rating" byte (spec v2.3 §4.18 /
+    /// v2.4 §4.17). Returns `Some(rating)` for an
+    /// [`Id3Frame::Popularimeter`] frame and `None` for any other
+    /// variant. The byte is mapped through [`PopmRating::from_wire`]:
+    /// `$00` becomes [`PopmRating::Unknown`] per the spec sentinel
+    /// ("0 is unknown") and every other value becomes
+    /// [`PopmRating::Rated`] carrying the raw `1..=255` magnitude where
+    /// "1 is worst and 255 is best". Because the rating byte has no
+    /// reserved range — all 256 values are meaningful — the inner
+    /// result is `PopmRating` directly rather than `Option<PopmRating>`,
+    /// distinguishing it from the enumerated-variant accessors such as
+    /// [`Id3Frame::equ2_interpolation`] which reject reserved bytes.
+    ///
+    /// The raw `rating: u8` field is untouched, so the exact on-wire
+    /// byte still round-trips through [`write_tag`]. The wording is
+    /// reproduced verbatim in both the v2.3 and v2.4 docs, so the
+    /// accessor is version-independent, matching the cross-version
+    /// posture of [`Id3Frame::etco_event_types`].
+    pub fn popm_rating(&self) -> Option<PopmRating> {
+        match self {
+            Id3Frame::Popularimeter { rating, .. } => Some(PopmRating::from_wire(*rating)),
             _ => None,
         }
     }

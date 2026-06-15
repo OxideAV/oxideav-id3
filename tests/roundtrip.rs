@@ -9,9 +9,9 @@ use oxideav_id3::{
     write_id3v1, write_tag, write_tag_with_options, CommercialDelivery, ContentType,
     Equ2Interpolation, EquaBand, EtcoEventType, FileType, Id3Frame, Id3Tag, Id3Version,
     ImageEncodingRestriction, ImageSizeRestriction, KeyAccidental, MediaType, MusicalKey,
-    Restrictions, Rva2Channel, Rva2ChannelType, RvadBackChannels, RvadChannel, RvadFrontChannels,
-    SyltContentType, SytcTempo, TagSizeRestriction, TextEncodingRestriction, TextFieldsRestriction,
-    TimestampUnit, UnsyncMode, WriteOptions,
+    PopmRating, Restrictions, Rva2Channel, Rva2ChannelType, RvadBackChannels, RvadChannel,
+    RvadFrontChannels, SyltContentType, SytcTempo, TagSizeRestriction, TextEncodingRestriction,
+    TextFieldsRestriction, TimestampUnit, UnsyncMode, WriteOptions,
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
@@ -3355,6 +3355,88 @@ fn equ2_interpolation_preserves_reserved_byte_through_roundtrip() {
         parsed.frames.iter().find_map(Id3Frame::equ2_interpolation),
         None
     );
+}
+
+/// `PopmRating::from_wire` / `to_wire` form a bijection over all 256
+/// byte values: `$00` ↔ `Unknown` and every `$01..=$FF` ↔ `Rated(n)`
+/// carrying that magnitude. Unlike the enumerated-variant accessors the
+/// rating byte has no reserved range, so the decode is total — there is
+/// no `None` arm to exercise here.
+#[test]
+fn popm_rating_wire_bijection() {
+    assert_eq!(PopmRating::from_wire(0), PopmRating::Unknown);
+    assert_eq!(PopmRating::Unknown.to_wire(), 0);
+    assert!(!PopmRating::Unknown.is_rated());
+
+    for n in 1u8..=255 {
+        let typed = PopmRating::from_wire(n);
+        assert_eq!(typed, PopmRating::Rated(n));
+        assert_eq!(typed.to_wire(), n);
+        assert!(typed.is_rated());
+    }
+}
+
+/// `Id3Frame::popm_rating` decodes the rating byte of a `Popularimeter`
+/// frame: `$00` → `Unknown` per the spec sentinel and any other value →
+/// `Rated(n)` where `1` is worst and `255` is best. Any other frame
+/// variant returns `None`.
+#[test]
+fn popm_rating_accessor_decodes_unknown_and_rated() {
+    let unknown = Id3Frame::Popularimeter {
+        email: "nobody@example.com".into(),
+        rating: 0,
+        counter: 0,
+    };
+    assert_eq!(unknown.popm_rating(), Some(PopmRating::Unknown));
+
+    let worst = Id3Frame::Popularimeter {
+        email: "critic@example.com".into(),
+        rating: 1,
+        counter: 3,
+    };
+    assert_eq!(worst.popm_rating(), Some(PopmRating::Rated(1)));
+
+    let best = Id3Frame::Popularimeter {
+        email: "fan@example.com".into(),
+        rating: 255,
+        counter: 9_001,
+    };
+    assert_eq!(best.popm_rating(), Some(PopmRating::Rated(255)));
+
+    // Any other frame variant returns None.
+    let other = Id3Frame::Text {
+        id: "TIT2".into(),
+        values: vec!["Song".into()],
+    };
+    assert_eq!(other.popm_rating(), None);
+}
+
+/// A round-trip writer→parser preserves the POPM rating byte so the
+/// typed accessor sees the same `PopmRating` after re-parsing, across
+/// both v2.3 and v2.4 (the rating semantic is identical in both docs).
+#[test]
+fn popm_rating_roundtrips_v23_and_v24() {
+    for raw in [0u8, 1, 128, 196, 255] {
+        for version in [Id3Version::V2_3, Id3Version::V2_4] {
+            let tag = Id3Tag {
+                version,
+                frames: vec![Id3Frame::Popularimeter {
+                    email: "rater@example.com".into(),
+                    rating: raw,
+                    counter: 7,
+                }],
+            };
+            let bytes = write_tag(&tag, version).expect("write");
+            let (parsed, _) = parse_tag(&bytes).expect("parse");
+            let typed = parsed
+                .frames
+                .iter()
+                .find_map(Id3Frame::popm_rating)
+                .expect("POPM rating surfaces after round-trip");
+            assert_eq!(typed, PopmRating::from_wire(raw));
+            assert_eq!(typed.to_wire(), raw);
+        }
+    }
 }
 
 /// `EtcoEventType::from_wire` covers every spec-named value

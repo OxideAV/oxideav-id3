@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed rating accessor `Id3Frame::popm_rating()` for the `POPM`
+  popularimeter frame (spec v2.3 §4.18 / v2.4 §4.17) plus the
+  `PopmRating` enum. The spec states verbatim "The rating is 1-255 where
+  1 is worst and 255 is best. 0 is unknown"; the accessor maps the raw
+  byte through `PopmRating::from_wire` to `PopmRating::Unknown` for the
+  `$00` sentinel and `PopmRating::Rated(1..=255)` for a concrete rating.
+  The rating byte has no reserved range so the decode is total (returns
+  `PopmRating` not `Option`); `from_wire`/`to_wire` form a bijection over
+  all 256 values, the `is_rated()` helper distinguishes the two states,
+  and the raw `rating: u8` field is untouched so the exact on-wire byte
+  still round-trips through `write_tag`. No star-scale normalisation is
+  performed — the spec defines only the worst/best ordering and the
+  unknown sentinel. Version-independent (the wording is reproduced in
+  both version docs).
 - Typed price accessors `Id3Frame::commercial_prices()` (for `COMR`,
   spec v2.3 §4.25 / v2.4 §4.24) and `Id3Frame::ownership_price()` (for
   `OWNE`, spec v2.3 §4.24 / v2.4 §4.23) plus the `Price` enum. The spec
