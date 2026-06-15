@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-id3/compare/v0.0.5...v0.0.6) - 2026-06-15
+
+### Other
+
+- TKEY initial-key typed accessor (spec §4.2.1 / §4.2.3)
+- ID3v2.2 write support — frame-id demotion + 6-byte header + PIC layout (spec id3v2-00 §3.2/§4.15)
+- typed TFLT file-type accessor file_type() + FileType enum
+- typed language accessor + Language enum for COMM/USLT/USER/SYLT (spec v2.3/v2.4 structure §3)
+- typed TMED media-type accessor + MediaType enum (spec v2.3 §4.6.3 / v2.4 §4.2.3)
+- complete ID3v2.2.0 §4 frame-table read support + §3.1 compression-bit fix
+- add the compression dimension to the write-options matrix
+- frame-level zlib compression both directions + v2.3 format-flag additions (spec v2.3 §3.3 / v2.4 §4.1.2)
+- typed TCON content-type accessor + ContentType enum (v2.3 §4.2.1 / v2.4 §4.2.3)
+- typed SYTC tempo accessor + SytcTempo enum (spec v2.4 §4.7)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- typed ETCO event-type accessor (spec v2.3 §4.6 / v2.4 §4.5)
+- Add typed Equ2Interpolation accessor for EQU2 interpolation method
+- typed RVA2 channel_type accessor (spec v2.4 §4.11)
+- typed SYLT content-type + COMR received-as accessors (spec §4.9 / §4.24)
+- surface v2.4 §4.2 text frames in to_key_value_pairs mapping
+- typed TIPL/TMCL/IPLS pair-list accessors (spec §4.2.2)
+- Round 209: Criterion bench harness for parse/write hot paths
+- surface v2.4 extended-header is_update + restrictions sub-fields
+- structural IPLS involved-people-list frame (spec v2.3 §4.4)
+- structural EQUA equalisation frame (spec v2.3 §4.13)
+- structural RVAD relative volume adjustment frame (spec v2.3 §4.12)
+- Add structured RVRB reverb frame (spec v2.3 §4.13 / v2.4 §4.13)
+- structural MLLT MPEG location lookup table frame
+- ID3v2.4 footer emission + parse validation (spec §3.4)
+- cover extended-header CRC × unsync combinations
+- extended-header CRC-32 verification + emission (spec §3.2)
+- drop enumerated reader names from fuzz.yml comment
+- daily CI workflow + curated ID3 seed corpus for parse target
+- writer-side unsynchronisation (WholeTag + v2.4 PerFrame)
+- cargo-fuzz target driving panic-freedom over the ID3 parser
+- typed TimestampUnit accessor for ETCO/SYTC/SYLT/POSS
+- add ASPI audio seek point index frame (v2.4 §4.30)
+- add ENCR encryption method registration frame
+- add GRID group identification registration frame
+- structural MCDI/ETCO/SYLT/POSS/RBUF/SEEK/SIGN/AENC/LINK frames
+- structural USER/OWNE/COMR/SYTC/RVA2/EQU2 frames
+- structural POPM / PCNT / PRIV / GEOB / UFID frames
+- replace never-match regex with semver_check = false
+- drop enable_miri input (miri now manual-only via workflow_dispatch)
+- grant release-plz shim contents+pull-requests write
+- migrate to OxideAV/.github reusable workflows
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - Typed `TKEY` initial-key accessor `Id3Frame::initial_key()` + the
