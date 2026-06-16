@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed position accessors `Id3Frame::track_number()` (for `TRCK`, spec
+  v2.3 §4.2.1 / v2.4 §4.2.1) and `Id3Frame::part_of_set()` (for `TPOS`)
+  plus the `TrackPosition` enum. Both frames share the spec grammar "a
+  numeric string … MAY be extended with a `/` character and a numeric
+  string containing the total number" (E.g. `4/9` for `TRCK`, `1/2` for
+  `TPOS`); the accessors decode a conforming value to
+  `TrackPosition::Numbered { number, total: Option<u32> }`. A
+  non-numeric segment, an empty number, more than one `/`, a `+`/`-`
+  sign, embedded whitespace, or a `u32` overflow surfaces as
+  `TrackPosition::Malformed` with the raw string preserved, matching the
+  forward-compatible posture of `MusicalKey`/`FileType`. The accessors
+  route by frame id (`track_number()` is `None` on `TPOS` and vice
+  versa) and an empty-`values` frame decodes to `Malformed("")` rather
+  than panicking. Version-independent (the grammar is reproduced
+  verbatim across v2.2 `TRK`/`TPA`, v2.3, and v2.4); the raw
+  `Id3Frame::Text::values` is untouched so the exact on-wire string
+  still round-trips through `write_tag`. Five new lib tests (spec
+  examples; malformed cases; accessor routing; empty-values; write →
+  parse round-trip under both envelopes).
 - Typed rating accessor `Id3Frame::popm_rating()` for the `POPM`
   popularimeter frame (spec v2.3 §4.18 / v2.4 §4.17) plus the
   `PopmRating` enum. The spec states verbatim "The rating is 1-255 where

@@ -640,6 +640,24 @@ never silently drops data.
   reproduced verbatim across v2.2 (`TKE`), v2.3, and v2.4, so the accessor
   is version-independent; the raw `Id3Frame::Text::values` is unchanged
   and round-trips losslessly through `write_tag`.
+- `Id3Frame::track_number()` / `Id3Frame::part_of_set()` return a typed
+  `TrackPosition` for the `TRCK` track-number and `TPOS` part-of-set
+  frames (spec v2.3 §4.2.1 / v2.4 §4.2.1). Both frames share the spec
+  grammar — "a numeric string … MAY be extended with a `/` character and
+  a numeric string containing the total number" (`4/9` for `TRCK`, `1/2`
+  for `TPOS`) — so they decode through the same view:
+  `TrackPosition::Numbered { number, total: Option<u32> }` for a
+  conforming value (a bare number leaves `total: None`). A value that
+  violates the grammar — a non-numeric segment, an empty number, more
+  than one `/`, a `+`/`-` sign, embedded whitespace, or a `u32` overflow
+  — surfaces as `TrackPosition::Malformed(String)` with the raw string
+  preserved, matching the forward-compatible posture of `initial_key()`
+  / `file_type()`. The accessors route by frame id (`track_number()`
+  returns `None` on `TPOS` and vice versa) and an empty-`values` frame
+  decodes to `Malformed("")` rather than panicking. The wire grammar is
+  reproduced verbatim across v2.2 (`TRK` / `TPA`), v2.3, and v2.4, so the
+  accessors are version-independent; the raw `Id3Frame::Text::values` is
+  unchanged and round-trips losslessly through `write_tag`.
 - `Id3Frame::language()` returns a typed `Language` for the three-byte
   language field carried by the language-tagged frames (`COMM`, `USLT`,
   `USER`, `SYLT`), per the structure doc's "three byte language field …

@@ -1648,6 +1648,88 @@ fn parse_tkey_value(value: &str) -> MusicalKey {
     }
 }
 
+/// Typed view of the `TRCK` "Track number/Position in set" and `TPOS`
+/// "Part of a set" frames (spec v2.3 §4.2.1 / v2.4 §4.2.1). Both frames
+/// share an identical grammar: "a numeric string … This MAY be extended
+/// with a `"/"` character and a numeric string containing the total
+/// number" — e.g. `"4/9"` for `TRCK` (track 4 of 9) and `"1/2"` for
+/// `TPOS` (part 1 of 2).
+///
+/// Surfaced via [`Id3Frame::track_number`] (for `TRCK`) and
+/// [`Id3Frame::part_of_set`] (for `TPOS`). The wire grammar is identical
+/// across v2.2 (`TRK` / `TPA`), v2.3, and v2.4, so the accessors are
+/// version-independent, matching the cross-version posture of
+/// [`Id3Frame::content_types`] and [`Id3Frame::initial_key`].
+///
+/// A value that matches the grammar — a numeric `number`, optionally
+/// followed by `/` and a numeric `total` — decodes to
+/// [`TrackPosition::Numbered`]. Anything else (a non-numeric segment, a
+/// leading/empty number, more than one `/`, or a value that overflows a
+/// `u32`) surfaces as [`TrackPosition::Malformed`] with the raw string
+/// preserved, so a forward-compatible or non-conforming source surfaces
+/// structurally rather than being dropped — matching the posture of
+/// [`MusicalKey::Custom`] and [`FileType::Custom`]. The raw
+/// [`Id3Frame::Text::values`] is unchanged and round-trips losslessly
+/// through [`write_tag`], so the typed view never costs a caller the
+/// ability to preserve the exact on-wire string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrackPosition {
+    /// A spec-conforming numeric position with an optional total.
+    Numbered {
+        /// The order number (`4` for `"4/9"`), the leading numeric
+        /// string per spec.
+        number: u32,
+        /// The total after the `"/"` (`Some(9)` for `"4/9"`), or `None`
+        /// when the value carried only the number.
+        total: Option<u32>,
+    },
+    /// A value that does not match the spec grammar — preserved verbatim
+    /// so a non-conforming or forward-compatible source surfaces
+    /// structurally rather than being dropped.
+    Malformed(String),
+}
+
+/// Parse a single `TRCK` / `TPOS` value string into a [`TrackPosition`]
+/// per the spec grammar (a numeric string optionally extended with a
+/// `"/"` and a second numeric string). Any value that violates the
+/// grammar — a non-numeric segment, an empty number, more than one `"/"`,
+/// or a number that overflows a `u32` — surfaces as
+/// [`TrackPosition::Malformed`].
+fn parse_track_position(value: &str) -> TrackPosition {
+    let mut parts = value.split('/');
+    let number_str = parts.next().unwrap_or("");
+    let total_str = parts.next();
+    // The grammar allows at most one `/`; a second separator means the
+    // value is not a conforming track/total pair.
+    if parts.next().is_some() {
+        return TrackPosition::Malformed(value.to_string());
+    }
+    let number = match parse_decimal_u32(number_str) {
+        Some(n) => n,
+        None => return TrackPosition::Malformed(value.to_string()),
+    };
+    let total = match total_str {
+        None => None,
+        Some(s) => match parse_decimal_u32(s) {
+            Some(t) => Some(t),
+            None => return TrackPosition::Malformed(value.to_string()),
+        },
+    };
+    TrackPosition::Numbered { number, total }
+}
+
+/// Parse a non-empty ASCII-decimal string into a `u32`, returning `None`
+/// for an empty string, a non-digit character, or an overflow. Used by
+/// [`parse_track_position`] to enforce the spec's "numeric string"
+/// requirement without accepting `+`/`-` signs or whitespace that a
+/// permissive integer parser would tolerate.
+fn parse_decimal_u32(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u32>().ok()
+}
+
 /// Typed view of the `ETCO` "type of event" byte (spec v2.3 §4.6 /
 /// v2.4 §4.5). The byte sits at the start of each per-event record in
 /// an `ETCO` payload — one event-type byte followed by a 32-bit
@@ -2386,6 +2468,55 @@ impl Id3Frame {
             Id3Frame::Text { id, values } if id == "TKEY" => {
                 Some(values.iter().map(|v| parse_tkey_value(v)).collect())
             }
+            _ => None,
+        }
+    }
+
+    /// Typed view of the `TRCK` "Track number/Position in set" frame (spec
+    /// v2.3 §4.2.1 / v2.4 §4.2.1). The frame is "a numeric string
+    /// containing the order number of the audio-file on its original
+    /// recording", which "MAY be extended with a `"/"` character and a
+    /// numeric string containing the total number of tracks/elements on
+    /// the original recording. E.g. `"4/9"`".
+    ///
+    /// Returns `None` for any frame other than `TRCK`. For `TRCK` it
+    /// returns the parsed [`TrackPosition`] for the frame's first value (a
+    /// conformant tag carries a single value). A value that does not match
+    /// the spec grammar surfaces as [`TrackPosition::Malformed`] so a
+    /// forward-compatible or non-conforming source is preserved rather
+    /// than dropped. The wire grammar is identical across v2.2 (`TRK`),
+    /// v2.3, and v2.4 so the accessor is version-independent, matching the
+    /// posture of [`Id3Frame::initial_key`]. The raw
+    /// [`Id3Frame::Text::values`] is unchanged and round-trips losslessly
+    /// through [`write_tag`].
+    pub fn track_number(&self) -> Option<TrackPosition> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TRCK" => Some(parse_track_position(
+                values.first().map(String::as_str).unwrap_or(""),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Typed view of the `TPOS` "Part of a set" frame (spec v2.3 §4.2.1 /
+    /// v2.4 §4.2.1). The frame is "a numeric string that describes which
+    /// part of a set the audio came from", whose value "MAY be extended
+    /// with a `"/"` character and a numeric string containing the total
+    /// number of parts in the set. E.g. `"1/2"`".
+    ///
+    /// Returns `None` for any frame other than `TPOS`. For `TPOS` it
+    /// returns the parsed [`TrackPosition`] for the frame's first value.
+    /// `TPOS` shares the `TRCK` grammar verbatim, so it decodes through the
+    /// same [`TrackPosition`] view; a non-conforming value surfaces as
+    /// [`TrackPosition::Malformed`]. Version-independent (wire grammar
+    /// identical across v2.2 `TPA`, v2.3, and v2.4), matching
+    /// [`Id3Frame::track_number`]. The raw [`Id3Frame::Text::values`] is
+    /// unchanged and round-trips losslessly through [`write_tag`].
+    pub fn part_of_set(&self) -> Option<TrackPosition> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TPOS" => Some(parse_track_position(
+                values.first().map(String::as_str).unwrap_or(""),
+            )),
             _ => None,
         }
     }
@@ -11315,6 +11446,203 @@ mod tests {
                     accidental: Some(KeyAccidental::Sharp),
                     minor: true
                 }])
+            );
+        }
+    }
+
+    #[test]
+    fn track_position_grammar_covers_spec_examples() {
+        // Spec §4.2.1: "a numeric string … MAY be extended with a "/"
+        // character and a numeric string … E.g. "4/9"" (TRCK) and
+        // "1/2" (TPOS).
+        assert_eq!(
+            parse_track_position("4/9"),
+            TrackPosition::Numbered {
+                number: 4,
+                total: Some(9)
+            }
+        );
+        assert_eq!(
+            parse_track_position("1/2"),
+            TrackPosition::Numbered {
+                number: 1,
+                total: Some(2)
+            }
+        );
+        // Bare number with no total.
+        assert_eq!(
+            parse_track_position("7"),
+            TrackPosition::Numbered {
+                number: 7,
+                total: None
+            }
+        );
+        // Multi-digit number and total.
+        assert_eq!(
+            parse_track_position("12/150"),
+            TrackPosition::Numbered {
+                number: 12,
+                total: Some(150)
+            }
+        );
+        // Leading zeros are still a valid numeric string.
+        assert_eq!(
+            parse_track_position("03/12"),
+            TrackPosition::Numbered {
+                number: 3,
+                total: Some(12)
+            }
+        );
+    }
+
+    #[test]
+    fn track_position_non_conforming_surfaces_malformed() {
+        // Empty value (e.g. a TRCK frame the parser left with no value).
+        assert_eq!(
+            parse_track_position(""),
+            TrackPosition::Malformed(String::new())
+        );
+        // Non-numeric number segment.
+        assert_eq!(
+            parse_track_position("A"),
+            TrackPosition::Malformed("A".to_string())
+        );
+        // Non-numeric total segment.
+        assert_eq!(
+            parse_track_position("4/B"),
+            TrackPosition::Malformed("4/B".to_string())
+        );
+        // Empty number before the separator.
+        assert_eq!(
+            parse_track_position("/9"),
+            TrackPosition::Malformed("/9".to_string())
+        );
+        // Empty total after the separator.
+        assert_eq!(
+            parse_track_position("4/"),
+            TrackPosition::Malformed("4/".to_string())
+        );
+        // More than one separator is not the spec's number/total pair.
+        assert_eq!(
+            parse_track_position("1/2/3"),
+            TrackPosition::Malformed("1/2/3".to_string())
+        );
+        // A sign is not part of the "numeric string" grammar.
+        assert_eq!(
+            parse_track_position("+4"),
+            TrackPosition::Malformed("+4".to_string())
+        );
+        // Whitespace is not a digit.
+        assert_eq!(
+            parse_track_position("4 / 9"),
+            TrackPosition::Malformed("4 / 9".to_string())
+        );
+        // A value that overflows a u32 is preserved verbatim.
+        assert_eq!(
+            parse_track_position("4294967296"),
+            TrackPosition::Malformed("4294967296".to_string())
+        );
+    }
+
+    #[test]
+    fn track_position_accessors_route_by_frame_id() {
+        let trck = Id3Frame::Text {
+            id: "TRCK".into(),
+            values: vec!["4/9".into()],
+        };
+        assert_eq!(
+            trck.track_number(),
+            Some(TrackPosition::Numbered {
+                number: 4,
+                total: Some(9)
+            })
+        );
+        // TRCK is not TPOS and vice versa.
+        assert_eq!(trck.part_of_set(), None);
+
+        let tpos = Id3Frame::Text {
+            id: "TPOS".into(),
+            values: vec!["1/2".into()],
+        };
+        assert_eq!(
+            tpos.part_of_set(),
+            Some(TrackPosition::Numbered {
+                number: 1,
+                total: Some(2)
+            })
+        );
+        assert_eq!(tpos.track_number(), None);
+
+        // Any other text frame yields None on both accessors.
+        let tit2 = Id3Frame::Text {
+            id: "TIT2".into(),
+            values: vec!["4/9".into()],
+        };
+        assert_eq!(tit2.track_number(), None);
+        assert_eq!(tit2.part_of_set(), None);
+        // A non-text variant yields None.
+        assert_eq!(Id3Frame::PlayCounter { count: 1 }.track_number(), None);
+        assert_eq!(Id3Frame::PlayCounter { count: 1 }.part_of_set(), None);
+    }
+
+    #[test]
+    fn track_position_empty_values_is_malformed() {
+        // A TRCK frame whose parser left it with no value at all decodes
+        // to Malformed("") rather than panicking on the missing first().
+        let trck = Id3Frame::Text {
+            id: "TRCK".into(),
+            values: vec![],
+        };
+        assert_eq!(
+            trck.track_number(),
+            Some(TrackPosition::Malformed(String::new()))
+        );
+    }
+
+    #[test]
+    fn track_position_survives_roundtrip() {
+        // Serialise TRCK + TPOS frames, re-parse the whole tag under both
+        // envelopes, and confirm the typed views survive (the raw value
+        // round-trips so the typed view is reconstructed identically).
+        for version in [Id3Version::V2_3, Id3Version::V2_4] {
+            let tag = Id3Tag {
+                version,
+                frames: vec![
+                    Id3Frame::Text {
+                        id: "TRCK".into(),
+                        values: vec!["4/9".into()],
+                    },
+                    Id3Frame::Text {
+                        id: "TPOS".into(),
+                        values: vec!["1/2".into()],
+                    },
+                ],
+            };
+            let bytes = write_tag(&tag, version).unwrap();
+            let (parsed, _) = parse_tag(&bytes).unwrap();
+            let trck = parsed
+                .frames
+                .iter()
+                .find(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TRCK"))
+                .unwrap();
+            assert_eq!(
+                trck.track_number(),
+                Some(TrackPosition::Numbered {
+                    number: 4,
+                    total: Some(9)
+                })
+            );
+            let tpos = parsed
+                .frames
+                .iter()
+                .find(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TPOS"))
+                .unwrap();
+            assert_eq!(
+                tpos.part_of_set(),
+                Some(TrackPosition::Numbered {
+                    number: 1,
+                    total: Some(2)
+                })
             );
         }
     }
