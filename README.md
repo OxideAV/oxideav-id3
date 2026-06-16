@@ -694,6 +694,25 @@ never silently drops data.
   source surfaces both elements rather than dropping data). The raw
   `price` strings are untouched, so the exact on-wire bytes still
   round-trip through `write_tag`.
+- `Id3Frame::ownership_date()` / `Id3Frame::commercial_valid_until()`
+  return a typed `Id3Date` for the `OWNE` "Date of purch." field (spec
+  v2.3 §4.24 / v2.4 §4.23) and the `COMR` "Valid until" field (spec v2.3
+  §4.25 / v2.4 §4.24). Both frames carry the spec's "8 character date
+  string (YYYYMMDD)"; the accessors decode it via `Id3Date::from_field`
+  into `Id3Date::Ymd { year, month, day }` when the value is exactly
+  eight ASCII digits, splitting positionally. The split is **not**
+  calendar-validated — the spec defines the field as a fixed `YYYYMMDD`
+  digit string with no validity constraint, so a `"20241340"` source
+  surfaces `month: 13, day: 40` rather than being rejected, preserving a
+  forward-compatible-but-odd source. A value that is not eight digits —
+  short, long, empty (the spec's absent form), or carrying a non-digit
+  byte — surfaces as `Id3Date::Malformed` with the raw string preserved,
+  matching the forward-compatible posture of `Price` / `TrackPosition`.
+  The accessors route strictly by variant (`ownership_date()` is `None`
+  on a `Commercial` frame and vice versa); the underlying `date` /
+  `valid_until` strings are untouched so the exact on-wire bytes still
+  round-trip through `write_tag`. The wire grammar is reproduced verbatim
+  across v2.3 and v2.4 so the accessors are version-independent.
 
 ## Fuzzing
 

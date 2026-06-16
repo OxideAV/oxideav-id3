@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed date accessors `Id3Frame::ownership_date()` (for the `OWNE`
+  "Date of purch." field, spec v2.3 §4.24 / v2.4 §4.23) and
+  `Id3Frame::commercial_valid_until()` (for the `COMR` "Valid until"
+  field, spec v2.3 §4.25 / v2.4 §4.24) plus the `Id3Date` enum. Both
+  frames carry the spec's "8 character date string (YYYYMMDD)" field;
+  the accessors decode it via `Id3Date::from_field` into
+  `Id3Date::Ymd { year, month, day }` when the value is exactly eight
+  ASCII digits, splitting positionally without calendar-validating the
+  month/day so a forward-compatible-but-odd source is preserved. A
+  value that is not eight digits — short, long, empty, or carrying a
+  non-digit byte — surfaces as `Id3Date::Malformed` with the raw string
+  preserved, matching the forward-compatible posture of `Price` /
+  `TrackPosition`. The accessors route strictly by variant
+  (`ownership_date()` is `None` on a `Commercial` frame and vice versa)
+  and the underlying `date` / `valid_until` strings are untouched so the
+  exact on-wire bytes still round-trip through `write_tag`. The wire
+  grammar is reproduced verbatim across v2.3 and v2.4 so the accessors
+  are version-independent.
 - Typed position accessors `Id3Frame::track_number()` (for `TRCK`, spec
   v2.3 §4.2.1 / v2.4 §4.2.1) and `Id3Frame::part_of_set()` (for `TPOS`)
   plus the `TrackPosition` enum. Both frames share the spec grammar "a

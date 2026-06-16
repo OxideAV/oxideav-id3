@@ -1999,6 +1999,105 @@ impl Price {
     }
 }
 
+/// Typed view of an ID3v2 `YYYYMMDD` date string.
+///
+/// Two structural frames carry an 8-character date string in this exact
+/// format: the `OWNE` "Date of purch." field (spec v2.3 §4.24 / v2.4
+/// §4.23 — "an 8 character date string (YYYYMMDD)") and the `COMR`
+/// "Valid until" field (spec v2.3 §4.25 / v2.4 §4.24 — "an 8 character
+/// date string in the format YYYYMMDD, describing for how long the price
+/// is valid"). The same `YYYYMMDD` shape is the leading component of the
+/// v2.3-only timestamp text frames (`TDAT` carries `DDMM`, not this
+/// field) but those are surfaced as plain text; this typed view is for
+/// the two structural frames whose date field is spec-fixed at eight
+/// characters.
+///
+/// A well-formed value — exactly eight ASCII digits — surfaces as
+/// [`Id3Date::Ymd`] with the year / month / day split out as numbers
+/// (`"20240615"` → `year: 2024, month: 6, day: 15`). The split is purely
+/// positional per the spec grammar: the parser does **not** range-check
+/// the month or day (a `"20241300"` source surfaces `month: 13` rather
+/// than being rejected) because the spec defines the field as a fixed
+/// `YYYYMMDD` digit string with no validity constraint, and forcing
+/// calendar validity here would drop a forward-compatible-but-odd
+/// source. Anything that is not exactly eight ASCII digits — a short
+/// or long string, an empty field (the spec's absent form), or a value
+/// with a non-digit byte — surfaces as [`Id3Date::Malformed`] with the
+/// raw string preserved verbatim.
+///
+/// The raw date `String` on the frame is left untouched, so the exact
+/// on-wire bytes still round-trip through [`write_tag`]; this mirrors the
+/// forward-compatible, non-destructive posture of [`Price`] and
+/// [`TrackPosition`]. The wire grammar is reproduced verbatim across
+/// v2.3 and v2.4, so the accessors are version-independent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Id3Date {
+    /// A spec-shaped `YYYYMMDD` value: exactly eight ASCII digits, split
+    /// positionally. The fields are not calendar-validated — `month` and
+    /// `day` carry whatever the eight digits encode so a non-conforming
+    /// source is preserved structurally rather than dropped.
+    Ymd {
+        /// Four-digit year (`0000..=9999`).
+        year: u16,
+        /// Two-digit month component (`00..=99`, not range-checked).
+        month: u8,
+        /// Two-digit day component (`00..=99`, not range-checked).
+        day: u8,
+    },
+    /// A value that is not exactly eight ASCII digits — too short, too
+    /// long, empty, or containing a non-digit byte. The raw string is
+    /// preserved so the caller can still inspect it.
+    Malformed(String),
+}
+
+impl Id3Date {
+    /// Decode an 8-character `YYYYMMDD` date string into the typed view.
+    /// A value of exactly eight ASCII digits is split positionally into
+    /// [`Id3Date::Ymd`]; anything else maps to [`Id3Date::Malformed`]
+    /// with the raw string preserved.
+    pub fn from_field(date: &str) -> Id3Date {
+        let bytes = date.as_bytes();
+        if bytes.len() == 8 && bytes.iter().all(|b| b.is_ascii_digit()) {
+            let d = |i: usize| (bytes[i] - b'0') as u16;
+            let year = d(0) * 1000 + d(1) * 100 + d(2) * 10 + d(3);
+            let month = (d(4) * 10 + d(5)) as u8;
+            let day = (d(6) * 10 + d(7)) as u8;
+            Id3Date::Ymd { year, month, day }
+        } else {
+            Id3Date::Malformed(date.to_string())
+        }
+    }
+
+    /// The year for a well-formed [`Id3Date::Ymd`]; `None` for
+    /// [`Id3Date::Malformed`].
+    pub fn year(&self) -> Option<u16> {
+        match self {
+            Id3Date::Ymd { year, .. } => Some(*year),
+            Id3Date::Malformed(_) => None,
+        }
+    }
+
+    /// The month component for a well-formed [`Id3Date::Ymd`]; `None` for
+    /// [`Id3Date::Malformed`]. Not calendar-validated — may be `00` or
+    /// `>12` if the source carried such digits.
+    pub fn month(&self) -> Option<u8> {
+        match self {
+            Id3Date::Ymd { month, .. } => Some(*month),
+            Id3Date::Malformed(_) => None,
+        }
+    }
+
+    /// The day component for a well-formed [`Id3Date::Ymd`]; `None` for
+    /// [`Id3Date::Malformed`]. Not calendar-validated — may be `00` or
+    /// `>31` if the source carried such digits.
+    pub fn day(&self) -> Option<u8> {
+        match self {
+            Id3Date::Ymd { day, .. } => Some(*day),
+            Id3Date::Malformed(_) => None,
+        }
+    }
+}
+
 impl Id3Frame {
     /// Typed accessor for the `time_stamp_format` byte carried by the
     /// frames whose spec layout opens with one (`ETCO`, `SYTC`, `SYLT`,
@@ -2199,6 +2298,49 @@ impl Id3Frame {
     pub fn ownership_price(&self) -> Option<Price> {
         match self {
             Id3Frame::Ownership { price, .. } => Some(Price::from_element(price)),
+            _ => None,
+        }
+    }
+
+    /// Typed accessor for the `OWNE` "Date of purch." field (spec v2.3
+    /// §4.24 / v2.4 §4.23). Returns `Some(date)` for an
+    /// [`Id3Frame::Ownership`] frame and `None` for any other variant.
+    ///
+    /// Spec wording: the price-paid field is "followed by an 8 character
+    /// date string (YYYYMMDD)". This accessor decodes that field via
+    /// [`Id3Date::from_field`]: a well-formed eight-digit value splits into
+    /// [`Id3Date::Ymd`] and anything else surfaces as
+    /// [`Id3Date::Malformed`] with the raw string preserved. The wire
+    /// grammar is identical between v2.3 and v2.4 so the accessor is
+    /// version-independent, and the underlying `date` string is untouched
+    /// so the exact on-wire bytes still round-trip through [`write_tag`],
+    /// matching the forward-compatible posture of
+    /// [`Id3Frame::ownership_price`].
+    pub fn ownership_date(&self) -> Option<Id3Date> {
+        match self {
+            Id3Frame::Ownership { date, .. } => Some(Id3Date::from_field(date)),
+            _ => None,
+        }
+    }
+
+    /// Typed accessor for the `COMR` "Valid until" field (spec v2.3
+    /// §4.25 / v2.4 §4.24). Returns `Some(date)` for an
+    /// [`Id3Frame::Commercial`] frame and `None` for any other variant.
+    ///
+    /// Spec wording: the price string is "followed by an 8 character date
+    /// string in the format YYYYMMDD, describing for how long the price
+    /// is valid". This accessor decodes that field via
+    /// [`Id3Date::from_field`] with the same eight-digit grammar as
+    /// [`Id3Frame::ownership_date`] — a well-formed value splits into
+    /// [`Id3Date::Ymd`] and anything else surfaces as
+    /// [`Id3Date::Malformed`]. The wire grammar is identical between v2.3
+    /// and v2.4 so the accessor is version-independent, and the
+    /// underlying `valid_until` string is untouched so the exact on-wire
+    /// bytes still round-trip through [`write_tag`], matching the
+    /// forward-compatible posture of [`Id3Frame::commercial_prices`].
+    pub fn commercial_valid_until(&self) -> Option<Id3Date> {
+        match self {
+            Id3Frame::Commercial { valid_until, .. } => Some(Id3Date::from_field(valid_until)),
             _ => None,
         }
     }
@@ -11313,6 +11455,184 @@ mod tests {
                 amount: "4.00".into(),
             })
         );
+    }
+
+    #[test]
+    fn id3date_splits_eight_digit_string() {
+        // Spec OWNE §4.23 / COMR §4.24: "an 8 character date string
+        // (YYYYMMDD)". Eight ASCII digits split positionally.
+        assert_eq!(
+            Id3Date::from_field("20240615"),
+            Id3Date::Ymd {
+                year: 2024,
+                month: 6,
+                day: 15,
+            }
+        );
+        // Leading zeros in every component.
+        assert_eq!(
+            Id3Date::from_field("00010203"),
+            Id3Date::Ymd {
+                year: 1,
+                month: 2,
+                day: 3,
+            }
+        );
+        // The split is purely positional: the spec defines the field as
+        // a fixed YYYYMMDD digit string with no validity constraint, so
+        // an out-of-range month/day surfaces structurally rather than
+        // being rejected.
+        assert_eq!(
+            Id3Date::from_field("20241340"),
+            Id3Date::Ymd {
+                year: 2024,
+                month: 13,
+                day: 40,
+            }
+        );
+    }
+
+    #[test]
+    fn id3date_rejects_non_eight_digit() {
+        // Too short / too long / empty / a non-digit byte all surface as
+        // Malformed with the raw string preserved.
+        for s in ["2024061", "202406155", "", "2024-615", "2024061x"] {
+            assert_eq!(Id3Date::from_field(s), Id3Date::Malformed(s.to_string()));
+            assert_eq!(Id3Date::from_field(s).year(), None);
+            assert_eq!(Id3Date::from_field(s).month(), None);
+            assert_eq!(Id3Date::from_field(s).day(), None);
+        }
+    }
+
+    #[test]
+    fn id3date_component_accessors() {
+        let d = Id3Date::from_field("20240615");
+        assert_eq!(d.year(), Some(2024));
+        assert_eq!(d.month(), Some(6));
+        assert_eq!(d.day(), Some(15));
+    }
+
+    #[test]
+    fn ownership_and_commercial_date_accessors() {
+        let owne = Id3Frame::Ownership {
+            price: "USD8.99".into(),
+            date: "20251231".into(),
+            seller: "Acme".into(),
+        };
+        assert_eq!(
+            owne.ownership_date(),
+            Some(Id3Date::Ymd {
+                year: 2025,
+                month: 12,
+                day: 31,
+            })
+        );
+        // commercial_valid_until is None on an Ownership frame and vice
+        // versa — the accessors route strictly by variant.
+        assert_eq!(owne.commercial_valid_until(), None);
+
+        let comr = Id3Frame::Commercial {
+            price: "USD8.99".into(),
+            valid_until: "20260101".into(),
+            contact_url: "http://x".into(),
+            received_as: 0,
+            seller: String::new(),
+            description: String::new(),
+            logo_mime: String::new(),
+            logo_data: Vec::new(),
+        };
+        assert_eq!(
+            comr.commercial_valid_until(),
+            Some(Id3Date::Ymd {
+                year: 2026,
+                month: 1,
+                day: 1,
+            })
+        );
+        assert_eq!(comr.ownership_date(), None);
+
+        // A non-matching variant yields None for both accessors.
+        assert_eq!(Id3Frame::PlayCounter { count: 1 }.ownership_date(), None);
+        assert_eq!(
+            Id3Frame::PlayCounter { count: 1 }.commercial_valid_until(),
+            None
+        );
+
+        // An empty / absent date field surfaces as Malformed, preserving
+        // the raw string rather than guessing a value.
+        let owne_empty = Id3Frame::Ownership {
+            price: "USD8.99".into(),
+            date: String::new(),
+            seller: "Acme".into(),
+        };
+        assert_eq!(
+            owne_empty.ownership_date(),
+            Some(Id3Date::Malformed(String::new()))
+        );
+    }
+
+    #[test]
+    fn id3date_accessors_survive_wire_roundtrip() {
+        // Serialise + re-parse a tag carrying OWNE + COMR, and confirm
+        // the typed dates survive and the raw date strings are untouched.
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![
+                Id3Frame::Ownership {
+                    price: "GBP4.00".into(),
+                    date: "20251231".into(),
+                    seller: "Owner".into(),
+                },
+                Id3Frame::Commercial {
+                    price: "USD8.99".into(),
+                    valid_until: "20260101".into(),
+                    contact_url: "http://x".into(),
+                    received_as: 3,
+                    seller: "Store".into(),
+                    description: "Offer".into(),
+                    logo_mime: String::new(),
+                    logo_data: Vec::new(),
+                },
+            ],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+
+        let owne = parsed
+            .frames
+            .iter()
+            .find(|f| matches!(f, Id3Frame::Ownership { .. }))
+            .unwrap();
+        assert_eq!(
+            owne.ownership_date(),
+            Some(Id3Date::Ymd {
+                year: 2025,
+                month: 12,
+                day: 31,
+            })
+        );
+        match owne {
+            Id3Frame::Ownership { date, .. } => assert_eq!(date, "20251231"),
+            _ => unreachable!(),
+        }
+
+        let comr = parsed
+            .frames
+            .iter()
+            .find(|f| matches!(f, Id3Frame::Commercial { .. }))
+            .unwrap();
+        assert_eq!(
+            comr.commercial_valid_until(),
+            Some(Id3Date::Ymd {
+                year: 2026,
+                month: 1,
+                day: 1,
+            })
+        );
+        match comr {
+            Id3Frame::Commercial { valid_until, .. } => assert_eq!(valid_until, "20260101"),
+            _ => unreachable!(),
+        }
     }
 
     #[test]
