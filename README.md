@@ -658,6 +658,21 @@ never silently drops data.
   reproduced verbatim across v2.2 (`TRK` / `TPA`), v2.3, and v2.4, so the
   accessors are version-independent; the raw `Id3Frame::Text::values` is
   unchanged and round-trips losslessly through `write_tag`.
+- `Id3Frame::isrc()` returns a typed `Isrc` for the `TSRC` ISRC frame
+  (spec v2.3 §4.2.1 / v2.4 §4.2.1). The frame "should contain the
+  International Standard Recording Code [ISRC] (12 characters)"; the spec
+  body fixes only the length and cites `[ISRC]` (ISO 3901) for the code's
+  meaning without reproducing its internal field layout, so the view
+  validates exactly the constraint the ID3 spec itself states. A value of
+  exactly twelve ASCII characters decodes to `Isrc::Code(String)`; any
+  other length, an empty value, or a non-ASCII byte surfaces as
+  `Isrc::Malformed(String)` with the raw string preserved, so a
+  forward-compatible or non-conforming source surfaces structurally
+  rather than being dropped — matching the posture of `track_number()` /
+  `initial_key()`. The wire form is a plain text-frame value, identical
+  across v2.2 (`TRC`), v2.3, and v2.4, so the accessor is
+  version-independent; the raw `Id3Frame::Text::values` is unchanged and
+  round-trips losslessly through `write_tag`.
 - `Id3Frame::language()` returns a typed `Language` for the three-byte
   language field carried by the language-tagged frames (`COMM`, `USLT`,
   `USER`, `SYLT`), per the structure doc's "three byte language field …

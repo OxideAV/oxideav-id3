@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed accessor `Id3Frame::isrc()` plus the `Isrc` enum for the `TSRC`
+  ISRC frame (spec v2.3 §4.2.1 / v2.4 §4.2.1). The frame "should contain
+  the International Standard Recording Code [ISRC] (12 characters)"; the
+  spec body fixes only the length and cites `[ISRC]` (ISO 3901) for the
+  code's meaning without reproducing its field layout, so the view
+  validates exactly that constraint. A twelve-ASCII-character value
+  decodes to `Isrc::Code`; any other length, an empty value, or a
+  non-ASCII byte surfaces as `Isrc::Malformed` with the raw string
+  preserved. The wire form is a plain text-frame value identical across
+  v2.2 (`TRC`), v2.3, and v2.4, so the accessor is version-independent;
+  the raw `Id3Frame::Text::values` round-trips losslessly through
+  `write_tag`.
 - Typed date accessors `Id3Frame::ownership_date()` (for the `OWNE`
   "Date of purch." field, spec v2.3 §4.24 / v2.4 §4.23) and
   `Id3Frame::commercial_valid_until()` (for the `COMR` "Valid until"

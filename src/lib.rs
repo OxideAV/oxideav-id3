@@ -1730,6 +1730,54 @@ fn parse_decimal_u32(s: &str) -> Option<u32> {
     s.parse::<u32>().ok()
 }
 
+/// Typed view of the `TSRC` "ISRC" frame (spec v2.3 §4.2.1 / v2.4
+/// §4.2.1). The frame "should contain the International Standard
+/// Recording Code [ISRC] (12 characters)". The spec body fixes only the
+/// length — twelve characters — and cites `[ISRC]` (ISO 3901) for the
+/// code's meaning without reproducing its internal field layout, so this
+/// view validates exactly the constraint the ID3 spec itself states: a
+/// twelve-character ASCII value.
+///
+/// Surfaced via [`Id3Frame::isrc`]. The wire form is a plain text-frame
+/// value, identical across v2.2 (`TRC`), v2.3, and v2.4, so the accessor
+/// is version-independent — matching the cross-version posture of
+/// [`Id3Frame::track_number`] and [`Id3Frame::initial_key`].
+///
+/// A value that is exactly twelve ASCII characters decodes to
+/// [`Isrc::Code`]; anything else — a value of the wrong length, an empty
+/// value, or one carrying a non-ASCII byte — surfaces as
+/// [`Isrc::Malformed`] with the raw string preserved, so a
+/// forward-compatible or non-conforming source surfaces structurally
+/// rather than being dropped (matching [`TrackPosition::Malformed`] and
+/// [`MusicalKey::Custom`]). The raw [`Id3Frame::Text::values`] is
+/// unchanged and round-trips losslessly through [`write_tag`], so the
+/// typed view never costs a caller the ability to preserve the exact
+/// on-wire string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Isrc {
+    /// A spec-conforming twelve-character ASCII ISRC value.
+    Code(String),
+    /// A value that does not match the spec's twelve-ASCII-character
+    /// constraint — preserved verbatim so a non-conforming or
+    /// forward-compatible source surfaces structurally rather than being
+    /// dropped.
+    Malformed(String),
+}
+
+/// Parse a single `TSRC` value string into an [`Isrc`] per the spec's
+/// "12 characters" constraint. A value of exactly twelve ASCII
+/// characters is [`Isrc::Code`]; anything else (wrong length, empty, or a
+/// non-ASCII byte) surfaces as [`Isrc::Malformed`]. "Twelve characters"
+/// is counted as twelve `char`s; since a conforming value is ASCII, the
+/// `is_ascii` guard makes the `char` count equal the byte count.
+fn parse_tsrc_value(value: &str) -> Isrc {
+    if value.is_ascii() && value.len() == 12 {
+        Isrc::Code(value.to_string())
+    } else {
+        Isrc::Malformed(value.to_string())
+    }
+}
+
 /// Typed view of the `ETCO` "type of event" byte (spec v2.3 §4.6 /
 /// v2.4 §4.5). The byte sits at the start of each per-event record in
 /// an `ETCO` payload — one event-type byte followed by a 32-bit
@@ -2657,6 +2705,30 @@ impl Id3Frame {
     pub fn part_of_set(&self) -> Option<TrackPosition> {
         match self {
             Id3Frame::Text { id, values } if id == "TPOS" => Some(parse_track_position(
+                values.first().map(String::as_str).unwrap_or(""),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Typed view of the `TSRC` "ISRC" frame (spec v2.3 §4.2.1 / v2.4
+    /// §4.2.1). The frame "should contain the International Standard
+    /// Recording Code [ISRC] (12 characters)".
+    ///
+    /// Returns `None` for any frame other than `TSRC`. For `TSRC` it
+    /// returns the parsed [`Isrc`] for the frame's first value (a
+    /// conformant tag carries a single value). A value of exactly twelve
+    /// ASCII characters decodes to [`Isrc::Code`]; any other length, an
+    /// empty value, or a non-ASCII byte surfaces as [`Isrc::Malformed`]
+    /// so a forward-compatible or non-conforming source is preserved
+    /// rather than dropped. The wire form is identical across v2.2
+    /// (`TRC`), v2.3, and v2.4 so the accessor is version-independent,
+    /// matching the posture of [`Id3Frame::track_number`]. The raw
+    /// [`Id3Frame::Text::values`] is unchanged and round-trips losslessly
+    /// through [`write_tag`].
+    pub fn isrc(&self) -> Option<Isrc> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TSRC" => Some(parse_tsrc_value(
                 values.first().map(String::as_str).unwrap_or(""),
             )),
             _ => None,
@@ -11964,6 +12036,82 @@ mod tests {
                     total: Some(2)
                 })
             );
+        }
+    }
+
+    #[test]
+    fn isrc_accepts_twelve_ascii_characters() {
+        // The spec fixes the field at "12 characters"; a twelve-ASCII-char
+        // value decodes to a Code carrying the verbatim string.
+        let frame = Id3Frame::Text {
+            id: "TSRC".into(),
+            values: vec!["USRC17607839".into()],
+        };
+        assert_eq!(frame.isrc(), Some(Isrc::Code("USRC17607839".into())));
+    }
+
+    #[test]
+    fn isrc_non_twelve_or_non_ascii_is_malformed() {
+        // Wrong length (short, long), empty, and a non-ASCII byte all
+        // surface structurally as Malformed with the raw value preserved.
+        for raw in ["USRC1760783", "USRC176078390", "", "USRC1760783é"] {
+            let frame = Id3Frame::Text {
+                id: "TSRC".into(),
+                values: vec![raw.into()],
+            };
+            assert_eq!(
+                frame.isrc(),
+                Some(Isrc::Malformed(raw.to_string())),
+                "value {raw:?} should be Malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn isrc_accessor_only_on_tsrc() {
+        // Routes strictly by frame id: a non-TSRC text frame and a
+        // non-text frame both return None.
+        let other_text = Id3Frame::Text {
+            id: "TIT2".into(),
+            values: vec!["USRC17607839".into()],
+        };
+        assert_eq!(other_text.isrc(), None);
+        let non_text = Id3Frame::PlayCounter { count: 1 };
+        assert_eq!(non_text.isrc(), None);
+    }
+
+    #[test]
+    fn isrc_empty_values_is_malformed() {
+        // A TSRC frame with no values decodes to Malformed("") rather than
+        // panicking — matching the track-position empty-values contract.
+        let frame = Id3Frame::Text {
+            id: "TSRC".into(),
+            values: vec![],
+        };
+        assert_eq!(frame.isrc(), Some(Isrc::Malformed(String::new())));
+    }
+
+    #[test]
+    fn isrc_survives_roundtrip() {
+        // Serialise a TSRC frame, re-parse under both envelopes, and
+        // confirm the typed view is reconstructed identically (the raw
+        // value round-trips losslessly).
+        for version in [Id3Version::V2_3, Id3Version::V2_4] {
+            let tag = Id3Tag {
+                version,
+                frames: vec![Id3Frame::Text {
+                    id: "TSRC".into(),
+                    values: vec!["GBAYE6800001".into()],
+                }],
+            };
+            let bytes = write_tag(&tag, version).unwrap();
+            let (parsed, _) = parse_tag(&bytes).unwrap();
+            let tsrc = parsed
+                .frames
+                .iter()
+                .find(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TSRC"))
+                .unwrap();
+            assert_eq!(tsrc.isrc(), Some(Isrc::Code("GBAYE6800001".into())));
         }
     }
 }
