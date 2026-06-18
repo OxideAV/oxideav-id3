@@ -2146,6 +2146,276 @@ impl Id3Date {
     }
 }
 
+/// Typed view of an ID3v2.4 timestamp string.
+///
+/// The v2.4 "TDxx" date frames — `TDEN` (encoding time), `TDOR` (original
+/// release time), `TDRC` (recording time), `TDRL` (release time), and
+/// `TDTG` (tagging time) — all carry a timestamp "based on a subset of
+/// ISO 8601" defined once in the structure document
+/// (`id3v2.4.0-structure.html`): "When being as precise as possible the
+/// format of a time string is `yyyy-MM-ddTHH:mm:ss` … but the precision
+/// may be reduced by removing as many time indicators as wanted. Hence
+/// valid timestamps are `yyyy`, `yyyy-MM`, `yyyy-MM-dd`,
+/// `yyyy-MM-ddTHH`, `yyyy-MM-ddTHH:mm` and `yyyy-MM-ddTHH:mm:ss`. All
+/// time stamps are UTC."
+///
+/// The six precision levels collapse onto one [`Id3Timestamp::DateTime`]
+/// variant whose `month`/`day`/`hour`/`minute`/`second` are `Option`s,
+/// each present exactly when the corresponding indicator survived the
+/// precision reduction. The split is purely positional and structural:
+/// the parser checks the separator grammar (`-` between date components,
+/// `T` before the time, `:` between time components) and that every
+/// numeric field is the right number of ASCII digits, but it does **not**
+/// calendar-validate (a `"2024-13-40"` source surfaces `month: 13,
+/// day: 40` rather than being rejected) because the spec fixes the
+/// digit grammar with no validity constraint and forcing calendar
+/// validity here would drop a forward-compatible-but-odd source. This
+/// matches the positional, non-range-checking posture of [`Id3Date`].
+///
+/// The spec also allows a duration (the slash character "as described in
+/// 8601") and multiple non-contiguous dates ("use multiple strings, if
+/// allowed by the frame definition"). A duration carried in a single
+/// value string contains a `/` which does not match the point-in-time
+/// grammar, so it surfaces as [`Id3Timestamp::Malformed`] with the raw
+/// string preserved; multiple non-contiguous dates arrive as separate
+/// text-frame values, so the frame-level accessors return a
+/// `Vec<Id3Timestamp>` over every value in wire order. Anything that
+/// does not match one of the six precision forms — wrong separators,
+/// wrong digit counts, trailing bytes, an embedded duration slash, or
+/// an empty value — surfaces as [`Id3Timestamp::Malformed`] with the raw
+/// string preserved verbatim.
+///
+/// The raw [`Id3Frame::Text::values`] is left untouched, so the exact
+/// on-wire bytes still round-trip through [`write_tag`]; this mirrors the
+/// forward-compatible, non-destructive posture of [`Id3Date`] and
+/// [`TrackPosition`]. The "TDxx" timestamp frames are v2.4-only (v2.3
+/// carried `TYER`/`TDAT`/`TIME`/`TRDA` instead), so these accessors are
+/// version-locked to v2.4 by virtue of their source frame ids.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Id3Timestamp {
+    /// A spec-shaped timestamp at one of the six precision levels. `year`
+    /// is always present (it is the least-precise valid form); each
+    /// finer component is `Some` exactly when its indicator was present
+    /// in the source and `None` otherwise. A component is never `Some`
+    /// while a coarser one is `None` — the precision reduction only ever
+    /// removes trailing indicators — so e.g. `hour` implies `day` and
+    /// `month` are `Some`.
+    DateTime {
+        /// Four-digit year (`0000..=9999`). Always present.
+        year: u16,
+        /// Two-digit month (`00..=99`, not range-checked); `None` if the
+        /// source stopped at `yyyy`.
+        month: Option<u8>,
+        /// Two-digit day (`00..=99`, not range-checked); `None` if the
+        /// source stopped at `yyyy-MM` or coarser.
+        day: Option<u8>,
+        /// Two-digit hour out of 24 (`00..=99`, not range-checked);
+        /// `None` if the source stopped at `yyyy-MM-dd` or coarser.
+        hour: Option<u8>,
+        /// Two-digit minute (`00..=99`, not range-checked); `None` if the
+        /// source stopped at `yyyy-MM-ddTHH` or coarser.
+        minute: Option<u8>,
+        /// Two-digit second (`00..=99`, not range-checked); `None` unless
+        /// the source carried the full `yyyy-MM-ddTHH:mm:ss` form.
+        second: Option<u8>,
+    },
+    /// A value that does not match any of the six precision forms — wrong
+    /// separators, wrong digit counts, trailing bytes, an embedded
+    /// duration slash, or an empty value. The raw string is preserved so
+    /// the caller can still inspect it.
+    Malformed(String),
+}
+
+impl Id3Timestamp {
+    /// Decode one timestamp value string into the typed view per the
+    /// structure-doc ISO 8601 subset. A value matching one of the six
+    /// precision forms is [`Id3Timestamp::DateTime`]; anything else maps
+    /// to [`Id3Timestamp::Malformed`] with the raw string preserved.
+    pub fn from_field(value: &str) -> Id3Timestamp {
+        match parse_iso8601_subset(value) {
+            Some(ts) => ts,
+            None => Id3Timestamp::Malformed(value.to_string()),
+        }
+    }
+
+    /// The year for a well-formed [`Id3Timestamp::DateTime`]; `None` for
+    /// [`Id3Timestamp::Malformed`].
+    pub fn year(&self) -> Option<u16> {
+        match self {
+            Id3Timestamp::DateTime { year, .. } => Some(*year),
+            Id3Timestamp::Malformed(_) => None,
+        }
+    }
+
+    /// The month for a well-formed [`Id3Timestamp::DateTime`] that carried
+    /// month precision; `None` otherwise. Not calendar-validated.
+    pub fn month(&self) -> Option<u8> {
+        match self {
+            Id3Timestamp::DateTime { month, .. } => *month,
+            Id3Timestamp::Malformed(_) => None,
+        }
+    }
+
+    /// The day for a well-formed [`Id3Timestamp::DateTime`] that carried
+    /// day precision; `None` otherwise. Not calendar-validated.
+    pub fn day(&self) -> Option<u8> {
+        match self {
+            Id3Timestamp::DateTime { day, .. } => *day,
+            Id3Timestamp::Malformed(_) => None,
+        }
+    }
+
+    /// The hour for a well-formed [`Id3Timestamp::DateTime`] that carried
+    /// hour precision; `None` otherwise. Not range-validated.
+    pub fn hour(&self) -> Option<u8> {
+        match self {
+            Id3Timestamp::DateTime { hour, .. } => *hour,
+            Id3Timestamp::Malformed(_) => None,
+        }
+    }
+
+    /// The minute for a well-formed [`Id3Timestamp::DateTime`] that
+    /// carried minute precision; `None` otherwise. Not range-validated.
+    pub fn minute(&self) -> Option<u8> {
+        match self {
+            Id3Timestamp::DateTime { minute, .. } => *minute,
+            Id3Timestamp::Malformed(_) => None,
+        }
+    }
+
+    /// The second for a well-formed [`Id3Timestamp::DateTime`] that
+    /// carried full second precision; `None` otherwise. Not
+    /// range-validated.
+    pub fn second(&self) -> Option<u8> {
+        match self {
+            Id3Timestamp::DateTime { second, .. } => *second,
+            Id3Timestamp::Malformed(_) => None,
+        }
+    }
+}
+
+/// Parse the structure-doc ISO 8601 subset for a single point-in-time
+/// timestamp. Returns `Some(Id3Timestamp::DateTime { .. })` for one of
+/// the six valid precision forms and `None` for anything else (so the
+/// caller folds it into [`Id3Timestamp::Malformed`]). Validates the
+/// separator grammar and per-field digit counts but does not
+/// calendar-validate the numeric components.
+fn parse_iso8601_subset(value: &str) -> Option<Id3Timestamp> {
+    // Read exactly `n` ASCII digits from `b` starting at `pos`, returning
+    // the parsed value and the new position. Fails if fewer than `n`
+    // digits are available or a non-digit is encountered.
+    fn take_digits(b: &[u8], pos: usize, n: usize) -> Option<(u32, usize)> {
+        if pos + n > b.len() {
+            return None;
+        }
+        let mut acc: u32 = 0;
+        for &byte in &b[pos..pos + n] {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            acc = acc * 10 + (byte - b'0') as u32;
+        }
+        Some((acc, pos + n))
+    }
+    // Require literal byte `sep` at `pos`, returning the next position.
+    fn take_sep(b: &[u8], pos: usize, sep: u8) -> Option<usize> {
+        if b.get(pos) == Some(&sep) {
+            Some(pos + 1)
+        } else {
+            None
+        }
+    }
+
+    let b = value.as_bytes();
+    // year (always required, exactly 4 digits)
+    let (year, p) = take_digits(b, 0, 4)?;
+    let year = year as u16;
+    if p == b.len() {
+        return Some(Id3Timestamp::DateTime {
+            year,
+            month: None,
+            day: None,
+            hour: None,
+            minute: None,
+            second: None,
+        });
+    }
+    // "-MM"
+    let p = take_sep(b, p, b'-')?;
+    let (month, p) = take_digits(b, p, 2)?;
+    let month = month as u8;
+    if p == b.len() {
+        return Some(Id3Timestamp::DateTime {
+            year,
+            month: Some(month),
+            day: None,
+            hour: None,
+            minute: None,
+            second: None,
+        });
+    }
+    // "-dd"
+    let p = take_sep(b, p, b'-')?;
+    let (day, p) = take_digits(b, p, 2)?;
+    let day = day as u8;
+    if p == b.len() {
+        return Some(Id3Timestamp::DateTime {
+            year,
+            month: Some(month),
+            day: Some(day),
+            hour: None,
+            minute: None,
+            second: None,
+        });
+    }
+    // "THH"
+    let p = take_sep(b, p, b'T')?;
+    let (hour, p) = take_digits(b, p, 2)?;
+    let hour = hour as u8;
+    if p == b.len() {
+        return Some(Id3Timestamp::DateTime {
+            year,
+            month: Some(month),
+            day: Some(day),
+            hour: Some(hour),
+            minute: None,
+            second: None,
+        });
+    }
+    // ":mm"
+    let p = take_sep(b, p, b':')?;
+    let (minute, p) = take_digits(b, p, 2)?;
+    let minute = minute as u8;
+    if p == b.len() {
+        return Some(Id3Timestamp::DateTime {
+            year,
+            month: Some(month),
+            day: Some(day),
+            hour: Some(hour),
+            minute: Some(minute),
+            second: None,
+        });
+    }
+    // ":ss"
+    let p = take_sep(b, p, b':')?;
+    let (second, p) = take_digits(b, p, 2)?;
+    let second = second as u8;
+    // Any trailing bytes (e.g. a duration slash, a timezone suffix, or a
+    // fractional-second part the subset does not define) make this not a
+    // valid point-in-time timestamp.
+    if p != b.len() {
+        return None;
+    }
+    Some(Id3Timestamp::DateTime {
+        year,
+        month: Some(month),
+        day: Some(day),
+        hour: Some(hour),
+        minute: Some(minute),
+        second: Some(second),
+    })
+}
+
 impl Id3Frame {
     /// Typed accessor for the `time_stamp_format` byte carried by the
     /// frames whose spec layout opens with one (`ETCO`, `SYTC`, `SYLT`,
@@ -2731,6 +3001,87 @@ impl Id3Frame {
             Id3Frame::Text { id, values } if id == "TSRC" => Some(parse_tsrc_value(
                 values.first().map(String::as_str).unwrap_or(""),
             )),
+            _ => None,
+        }
+    }
+
+    /// Typed view of the v2.4 "TDxx" timestamp date frames (spec v2.4 §4.2.5).
+    ///
+    /// Returns `Some(Vec<Id3Timestamp>)` for the five timestamp frames —
+    /// `TDEN` encoding time, `TDOR` original release time, `TDRC` recording
+    /// time, `TDRL` release time, `TDTG` tagging time — and `None` for every
+    /// other frame, including the timestamp-class frame ids when carried
+    /// under a non-`Text` variant. Each frame value is decoded through
+    /// [`Id3Timestamp::from_field`] per the structure-doc ISO 8601 subset; the
+    /// returned vector matches the source `values` positionally so the spec's
+    /// "for multiple non-contiguous dates, use multiple strings" arrives as
+    /// one `Id3Timestamp` per value in wire order. An empty-`values` frame
+    /// yields an empty vector. A value that does not match one of the six
+    /// precision forms surfaces as [`Id3Timestamp::Malformed`] so a
+    /// forward-compatible or non-conforming source is preserved rather than
+    /// dropped, matching the posture of [`Id3Frame::ownership_date`]. The raw
+    /// [`Id3Frame::Text::values`] is unchanged and round-trips losslessly
+    /// through [`write_tag`]. The TDxx frames are v2.4-only — v2.3 split the
+    /// same information across `TYER`/`TDAT`/`TIME`/`TRDA` text frames — so the
+    /// accessor is version-locked to v2.4 by virtue of its source frame ids.
+    pub fn timestamps(&self) -> Option<Vec<Id3Timestamp>> {
+        match self {
+            Id3Frame::Text { id, values }
+                if matches!(id.as_str(), "TDEN" | "TDOR" | "TDRC" | "TDRL" | "TDTG") =>
+            {
+                Some(values.iter().map(|v| Id3Timestamp::from_field(v)).collect())
+            }
+            _ => None,
+        }
+    }
+
+    /// Typed view of the `TDRC` "Recording time" frame (spec v2.4 §4.2.5).
+    /// Returns the parsed [`Id3Timestamp`] list for `TDRC` and `None` for
+    /// every other frame, routing by frame id over the shared
+    /// [`Id3Frame::timestamps`] decoder.
+    pub fn recording_time(&self) -> Option<Vec<Id3Timestamp>> {
+        match self {
+            Id3Frame::Text { id, .. } if id == "TDRC" => self.timestamps(),
+            _ => None,
+        }
+    }
+
+    /// Typed view of the `TDRL` "Release time" frame (spec v2.4 §4.2.5).
+    /// Returns the parsed [`Id3Timestamp`] list for `TDRL` and `None`
+    /// otherwise.
+    pub fn release_time(&self) -> Option<Vec<Id3Timestamp>> {
+        match self {
+            Id3Frame::Text { id, .. } if id == "TDRL" => self.timestamps(),
+            _ => None,
+        }
+    }
+
+    /// Typed view of the `TDOR` "Original release time" frame (spec v2.4
+    /// §4.2.5). Returns the parsed [`Id3Timestamp`] list for `TDOR` and
+    /// `None` otherwise.
+    pub fn original_release_time(&self) -> Option<Vec<Id3Timestamp>> {
+        match self {
+            Id3Frame::Text { id, .. } if id == "TDOR" => self.timestamps(),
+            _ => None,
+        }
+    }
+
+    /// Typed view of the `TDEN` "Encoding time" frame (spec v2.4 §4.2.5).
+    /// Returns the parsed [`Id3Timestamp`] list for `TDEN` and `None`
+    /// otherwise.
+    pub fn encoding_time(&self) -> Option<Vec<Id3Timestamp>> {
+        match self {
+            Id3Frame::Text { id, .. } if id == "TDEN" => self.timestamps(),
+            _ => None,
+        }
+    }
+
+    /// Typed view of the `TDTG` "Tagging time" frame (spec v2.4 §4.2.5).
+    /// Returns the parsed [`Id3Timestamp`] list for `TDTG` and `None`
+    /// otherwise.
+    pub fn tagging_time(&self) -> Option<Vec<Id3Timestamp>> {
+        match self {
+            Id3Frame::Text { id, .. } if id == "TDTG" => self.timestamps(),
             _ => None,
         }
     }
@@ -12113,5 +12464,255 @@ mod tests {
                 .unwrap();
             assert_eq!(tsrc.isrc(), Some(Isrc::Code("GBAYE6800001".into())));
         }
+    }
+
+    #[test]
+    fn timestamp_all_six_precision_levels() {
+        // The structure-doc ISO 8601 subset lists exactly six valid forms;
+        // each decodes with the right components Some and the rest None.
+        let cases: [(&str, Id3Timestamp); 6] = [
+            (
+                "2024",
+                Id3Timestamp::DateTime {
+                    year: 2024,
+                    month: None,
+                    day: None,
+                    hour: None,
+                    minute: None,
+                    second: None,
+                },
+            ),
+            (
+                "2024-06",
+                Id3Timestamp::DateTime {
+                    year: 2024,
+                    month: Some(6),
+                    day: None,
+                    hour: None,
+                    minute: None,
+                    second: None,
+                },
+            ),
+            (
+                "2024-06-18",
+                Id3Timestamp::DateTime {
+                    year: 2024,
+                    month: Some(6),
+                    day: Some(18),
+                    hour: None,
+                    minute: None,
+                    second: None,
+                },
+            ),
+            (
+                "2024-06-18T13",
+                Id3Timestamp::DateTime {
+                    year: 2024,
+                    month: Some(6),
+                    day: Some(18),
+                    hour: Some(13),
+                    minute: None,
+                    second: None,
+                },
+            ),
+            (
+                "2024-06-18T13:45",
+                Id3Timestamp::DateTime {
+                    year: 2024,
+                    month: Some(6),
+                    day: Some(18),
+                    hour: Some(13),
+                    minute: Some(45),
+                    second: None,
+                },
+            ),
+            (
+                "2024-06-18T13:45:09",
+                Id3Timestamp::DateTime {
+                    year: 2024,
+                    month: Some(6),
+                    day: Some(18),
+                    hour: Some(13),
+                    minute: Some(45),
+                    second: Some(9),
+                },
+            ),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                Id3Timestamp::from_field(raw),
+                expected,
+                "value {raw:?} should decode to the expected precision"
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_component_accessors() {
+        // The per-component accessors expose Some/None matching the
+        // precision of the source string.
+        let ts = Id3Timestamp::from_field("2024-06-18T13:45");
+        assert_eq!(ts.year(), Some(2024));
+        assert_eq!(ts.month(), Some(6));
+        assert_eq!(ts.day(), Some(18));
+        assert_eq!(ts.hour(), Some(13));
+        assert_eq!(ts.minute(), Some(45));
+        assert_eq!(ts.second(), None);
+        let coarse = Id3Timestamp::from_field("2024");
+        assert_eq!(coarse.year(), Some(2024));
+        assert_eq!(coarse.month(), None);
+        assert_eq!(coarse.second(), None);
+    }
+
+    #[test]
+    fn timestamp_not_calendar_validated() {
+        // The split is positional: an out-of-range month/day/time is
+        // preserved structurally rather than rejected, matching Id3Date.
+        assert_eq!(
+            Id3Timestamp::from_field("2024-13-40T25:61:99"),
+            Id3Timestamp::DateTime {
+                year: 2024,
+                month: Some(13),
+                day: Some(40),
+                hour: Some(25),
+                minute: Some(61),
+                second: Some(99),
+            }
+        );
+    }
+
+    #[test]
+    fn timestamp_malformed_inputs() {
+        // Wrong separators, wrong digit counts, an embedded duration
+        // slash, trailing bytes, and an empty value all surface as
+        // Malformed with the raw string preserved.
+        for raw in [
+            "",
+            "24",                    // year too short
+            "2024-6",                // month not two digits
+            "2024/06",               // wrong separator
+            "2024-06-18 13:45",      // space instead of T
+            "2024-06-18T13:45:09Z",  // trailing timezone byte
+            "2024-06-18T13:45:09.5", // fractional second (not in subset)
+            "2024-06-18/2024-06-20", // duration slash (multi-value, not a point)
+            "2024-06-18T13:45:",     // trailing separator, no seconds
+            "abcd",                  // non-digit year
+        ] {
+            assert_eq!(
+                Id3Timestamp::from_field(raw),
+                Id3Timestamp::Malformed(raw.to_string()),
+                "value {raw:?} should be Malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_frame_accessor_routes_by_id() {
+        // timestamps() fires on the five TDxx frames and the specific
+        // accessors route by their own id; everything else is None.
+        for id in ["TDEN", "TDOR", "TDRC", "TDRL", "TDTG"] {
+            let frame = Id3Frame::Text {
+                id: id.into(),
+                values: vec!["2024-06-18".into()],
+            };
+            assert_eq!(
+                frame.timestamps(),
+                Some(vec![Id3Timestamp::DateTime {
+                    year: 2024,
+                    month: Some(6),
+                    day: Some(18),
+                    hour: None,
+                    minute: None,
+                    second: None,
+                }])
+            );
+        }
+        let tdrc = Id3Frame::Text {
+            id: "TDRC".into(),
+            values: vec!["2024".into()],
+        };
+        assert!(tdrc.recording_time().is_some());
+        assert_eq!(tdrc.release_time(), None);
+        assert_eq!(tdrc.encoding_time(), None);
+        assert_eq!(tdrc.original_release_time(), None);
+        assert_eq!(tdrc.tagging_time(), None);
+
+        // A non-timestamp text frame and a non-text frame both yield None.
+        let other = Id3Frame::Text {
+            id: "TIT2".into(),
+            values: vec!["2024".into()],
+        };
+        assert_eq!(other.timestamps(), None);
+        assert_eq!(Id3Frame::PlayCounter { count: 1 }.timestamps(), None);
+    }
+
+    #[test]
+    fn timestamp_multiple_non_contiguous_values() {
+        // The spec's "use multiple strings" for non-contiguous dates
+        // arrives as one Id3Timestamp per value in wire order; a
+        // malformed value among them is preserved positionally.
+        let frame = Id3Frame::Text {
+            id: "TDRC".into(),
+            values: vec!["2024-06".into(), "bogus".into(), "1999".into()],
+        };
+        assert_eq!(
+            frame.timestamps(),
+            Some(vec![
+                Id3Timestamp::DateTime {
+                    year: 2024,
+                    month: Some(6),
+                    day: None,
+                    hour: None,
+                    minute: None,
+                    second: None,
+                },
+                Id3Timestamp::Malformed("bogus".into()),
+                Id3Timestamp::DateTime {
+                    year: 1999,
+                    month: None,
+                    day: None,
+                    hour: None,
+                    minute: None,
+                    second: None,
+                },
+            ])
+        );
+        // An empty-values TDxx frame yields an empty vec, not a panic.
+        let empty = Id3Frame::Text {
+            id: "TDTG".into(),
+            values: vec![],
+        };
+        assert_eq!(empty.timestamps(), Some(vec![]));
+    }
+
+    #[test]
+    fn timestamp_survives_roundtrip() {
+        // Serialise a TDRC frame under the v2.4 envelope, re-parse, and
+        // confirm the typed view is reconstructed identically.
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TDRC".into(),
+                values: vec!["2024-06-18T13:45:09".into()],
+            }],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        let tdrc = parsed
+            .frames
+            .iter()
+            .find(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TDRC"))
+            .unwrap();
+        assert_eq!(
+            tdrc.recording_time(),
+            Some(vec![Id3Timestamp::DateTime {
+                year: 2024,
+                month: Some(6),
+                day: Some(18),
+                hour: Some(13),
+                minute: Some(45),
+                second: Some(9),
+            }])
+        );
     }
 }

@@ -728,6 +728,31 @@ never silently drops data.
   `valid_until` strings are untouched so the exact on-wire bytes still
   round-trip through `write_tag`. The wire grammar is reproduced verbatim
   across v2.3 and v2.4 so the accessors are version-independent.
+- `Id3Frame::timestamps()` — plus the per-frame `recording_time()`
+  (`TDRC`), `release_time()` (`TDRL`), `original_release_time()`
+  (`TDOR`), `encoding_time()` (`TDEN`), and `tagging_time()` (`TDTG`) —
+  returns a typed `Vec<Id3Timestamp>` for the v2.4 §4.2.5 timestamp date
+  frames. The structure doc defines the field once as a "subset of ISO
+  8601": six precision levels from `yyyy` through `yyyy-MM-ddTHH:mm:ss`,
+  the precision reduced "by removing as many time indicators as wanted",
+  all UTC. The view collapses them onto `Id3Timestamp::DateTime { year,
+  month, day, hour, minute, second }` where `year` is always present and
+  each finer component is `Some` exactly when its indicator survived the
+  reduction (so `hour` implies `day` and `month` are `Some`). Like
+  `Id3Date`, the split is positional and **not** calendar-validated — a
+  `"2024-13-40T25:61:99"` source surfaces those components verbatim rather
+  than being rejected. A value that violates the separator grammar, has
+  the wrong digit counts, embeds a duration `/`, carries a timezone or
+  fractional-second suffix the subset does not define, or has any trailing
+  byte surfaces as `Id3Timestamp::Malformed` with the raw string
+  preserved. The accessors return one `Id3Timestamp` per text-frame value
+  in wire order, so the spec's "for multiple non-contiguous dates, use
+  multiple strings" is preserved positionally (a malformed value among
+  conforming ones keeps its slot). The TDxx frames are v2.4-only — v2.3
+  split the same information across `TYER`/`TDAT`/`TIME`/`TRDA` — so the
+  accessors are version-locked to v2.4 by their source frame ids; the raw
+  `Id3Frame::Text::values` is unchanged and round-trips losslessly through
+  `write_tag`, matching the posture of `ownership_date()`.
 
 ## Fuzzing
 

@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed accessors `Id3Frame::timestamps()` plus the per-frame
+  `recording_time()` / `release_time()` / `original_release_time()` /
+  `encoding_time()` / `tagging_time()` and the `Id3Timestamp` enum for
+  the v2.4 "TDxx" date frames (`TDRC`, `TDRL`, `TDOR`, `TDEN`, `TDTG`;
+  spec v2.4 §4.2.5). The frames carry a timestamp "based on a subset of
+  ISO 8601" defined once in the structure document: six precision levels
+  from `yyyy` through `yyyy-MM-ddTHH:mm:ss`. The view collapses them onto
+  `Id3Timestamp::DateTime { year, month, day, hour, minute, second }`
+  where each finer component is `Some` exactly when its indicator
+  survived the precision reduction. The split is positional and not
+  calendar-validated (matching `Id3Date`); a value that violates the
+  separator grammar, carries the wrong digit counts, embeds a duration
+  slash, or has trailing bytes surfaces as `Id3Timestamp::Malformed` with
+  the raw string preserved. The accessors return one `Id3Timestamp` per
+  text-frame value in wire order so the spec's "multiple non-contiguous
+  dates, use multiple strings" is preserved. The TDxx frames are
+  v2.4-only, so the accessors are version-locked to v2.4 by their source
+  frame ids; the raw `Id3Frame::Text::values` round-trips losslessly
+  through `write_tag`.
 - Typed accessor `Id3Frame::isrc()` plus the `Isrc` enum for the `TSRC`
   ISRC frame (spec v2.3 §4.2.1 / v2.4 §4.2.1). The frame "should contain
   the International Standard Recording Code [ISRC] (12 characters)"; the
