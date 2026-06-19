@@ -753,6 +753,36 @@ never silently drops data.
   accessors are version-locked to v2.4 by their source frame ids; the raw
   `Id3Frame::Text::values` is unchanged and round-trips losslessly through
   `write_tag`, matching the posture of `ownership_date()`.
+- `Id3Frame::length_ms()` (`TLEN`) and `Id3Frame::playlist_delay_ms()`
+  (`TDLY`) return a typed `DurationMs` for the spec's millisecond
+  numeric-string fields (spec v2.3 §4.2.1 / v2.4 §4.2.1). `TLEN` is "the
+  length of the audio file in milliseconds, represented as a numeric
+  string"; `TDLY` is "the numbers of milliseconds of silence that should
+  be inserted before this audio … represented as a numeric string". A
+  non-empty ASCII-decimal value decodes to `DurationMs::Millis(u64)` —
+  a `u64` holds any physical duration (`u64::MAX` ms ≈ 584 million
+  years); anything else (empty, sign, decimal point, whitespace,
+  non-digit byte, or `u64` overflow) surfaces as `DurationMs::Malformed`
+  with the raw string preserved, matching the forward-compatible posture
+  of `track_number()` / `isrc()`. `TDLY`'s spec note "the value zero
+  indicates that this is a part of a multifile audio track that should be
+  played continuously" surfaces as `Millis(0)`, leaving the semantic to
+  the caller. The accessors route strictly by frame id (`length_ms()` is
+  `None` on `TDLY` and vice versa). The wire form is identical across
+  v2.2 (`TLE` / `TDY`), v2.3, and v2.4 so the accessors are
+  version-independent; the raw `Id3Frame::Text::values` is unchanged and
+  round-trips losslessly through `write_tag`.
+- `Id3Frame::bpm()` (`TBPM`) returns a typed `Bpm` for the
+  beats-per-minute frame (spec v2.3 §4.2.1 / v2.4 §4.2.1), "the number of
+  beats per minute in the main part of the audio. The BPM is an integer
+  and represented as a numerical string." A non-empty ASCII-decimal value
+  decodes to `Bpm::Beats(u32)`; a fractional value such as `128.5`
+  violates the spec's "integer" requirement and surfaces as
+  `Bpm::Malformed`, as does any sign, whitespace, non-digit byte, or
+  empty value. The wire form is identical across v2.2 (`TBP`), v2.3, and
+  v2.4 so the accessor is version-independent; the raw
+  `Id3Frame::Text::values` is unchanged and round-trips losslessly through
+  `write_tag`, matching the posture of `length_ms()`.
 
 ## Fuzzing
 

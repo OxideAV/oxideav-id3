@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed accessors `Id3Frame::length_ms()` (`TLEN`) and
+  `Id3Frame::playlist_delay_ms()` (`TDLY`) returning a `DurationMs`
+  (`Millis(u64)` / `Malformed(String)`) for the spec's "milliseconds …
+  represented as a numeric string" duration fields (spec v2.3 §4.2.1 /
+  v2.4 §4.2.1). `TDLY`'s "value zero ⇒ multifile continuous" semantic
+  surfaces as `Millis(0)`. Plus `Id3Frame::bpm()` (`TBPM`) returning a
+  `Bpm` (`Beats(u32)` / `Malformed(String)`) for the spec's "integer …
+  numerical string" beats-per-minute field — a fractional value violates
+  the "integer" requirement and surfaces as `Malformed`. All three reject
+  signs, decimal points, whitespace, and non-digit bytes; an empty or
+  overflowing value surfaces structurally as `Malformed` with the raw
+  string preserved. Version-independent (wire form identical across v2.2
+  `TLE`/`TDY`/`TBP`, v2.3, v2.4); the raw `Id3Frame::Text::values` is
+  untouched and round-trips losslessly through `write_tag`.
 - Typed accessors `Id3Frame::timestamps()` plus the per-frame
   `recording_time()` / `release_time()` / `original_release_time()` /
   `encoding_time()` / `tagging_time()` and the `Id3Timestamp` enum for

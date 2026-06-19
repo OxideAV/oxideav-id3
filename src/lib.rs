@@ -1778,6 +1778,100 @@ fn parse_tsrc_value(value: &str) -> Isrc {
     }
 }
 
+/// Typed view of a numeric-string duration in milliseconds, carried by
+/// the `TLEN` "Length" frame (spec v2.3 §4.2.1 / v2.4 §4.2.1) and the
+/// `TDLY` "Playlist delay" frame (same sections). The spec defines
+/// `TLEN` as "the length of the audio file in milliseconds, represented
+/// as a numeric string" and `TDLY` as "the numbers of milliseconds of
+/// silence that should be inserted before this audio … represented as a
+/// numeric string".
+///
+/// Surfaced via [`Id3Frame::length_ms`] and [`Id3Frame::playlist_delay_ms`].
+/// The wire form is a plain text-frame value, identical across v2.2
+/// (`TLE` / `TDY`), v2.3, and v2.4, so the accessors are
+/// version-independent — matching the cross-version posture of
+/// [`Id3Frame::track_number`] and [`Id3Frame::isrc`].
+///
+/// A value that is a non-empty ASCII-decimal string decodes to
+/// [`DurationMs::Millis`]; anything else — an empty value, a sign, a
+/// decimal point, embedded whitespace, a non-digit byte, or a value that
+/// overflows a `u64` — surfaces as [`DurationMs::Malformed`] with the raw
+/// string preserved, so a forward-compatible or non-conforming source
+/// surfaces structurally rather than being dropped (matching
+/// [`TrackPosition::Malformed`] and [`Isrc::Malformed`]). The raw
+/// [`Id3Frame::Text::values`] is unchanged and round-trips losslessly
+/// through [`write_tag`], so the typed view never costs a caller the
+/// ability to preserve the exact on-wire string. A `u64` holds any
+/// physically meaningful duration (`u64::MAX` ms is ~584 million years).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurationMs {
+    /// A spec-conforming numeric-string duration in milliseconds.
+    Millis(u64),
+    /// A value that does not match the spec's "numeric string"
+    /// constraint — preserved verbatim so a non-conforming or
+    /// forward-compatible source surfaces structurally rather than being
+    /// dropped.
+    Malformed(String),
+}
+
+/// Parse a single `TLEN` / `TDLY` value string into a [`DurationMs`] per
+/// the spec's "numeric string" requirement. A non-empty ASCII-decimal
+/// string is [`DurationMs::Millis`]; anything else (empty, sign, decimal
+/// point, whitespace, non-digit byte, or `u64` overflow) surfaces as
+/// [`DurationMs::Malformed`]. The decimal guard rejects `+`/`-` signs and
+/// surrounding whitespace that a permissive integer parser would
+/// tolerate, matching [`parse_decimal_u32`].
+fn parse_duration_ms(value: &str) -> DurationMs {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return DurationMs::Malformed(value.to_string());
+    }
+    match value.parse::<u64>() {
+        Ok(n) => DurationMs::Millis(n),
+        Err(_) => DurationMs::Malformed(value.to_string()),
+    }
+}
+
+/// Typed view of the `TBPM` "BPM (beats per minute)" frame (spec v2.3
+/// §4.2.1 / v2.4 §4.2.1). The spec defines the frame as "the number of
+/// beats per minute in the main part of the audio. The BPM is an integer
+/// and represented as a numerical string."
+///
+/// Surfaced via [`Id3Frame::bpm`]. The wire form is a plain text-frame
+/// value, identical across v2.2 (`TBP`), v2.3, and v2.4, so the accessor
+/// is version-independent — matching the cross-version posture of
+/// [`Id3Frame::length_ms`].
+///
+/// A non-empty ASCII-decimal string decodes to [`Bpm::Beats`]; anything
+/// else — an empty value, a sign, a decimal point, embedded whitespace, a
+/// non-digit byte, or a value that overflows a `u32` — surfaces as
+/// [`Bpm::Malformed`] with the raw string preserved, so a
+/// forward-compatible or non-conforming source surfaces structurally
+/// rather than being dropped. The spec mandates an integer ("the BPM is
+/// an integer"), so a fractional value such as `"128.5"` is *not*
+/// conforming and surfaces as [`Bpm::Malformed`]. The raw
+/// [`Id3Frame::Text::values`] is unchanged and round-trips losslessly
+/// through [`write_tag`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Bpm {
+    /// A spec-conforming integer beats-per-minute value.
+    Beats(u32),
+    /// A value that does not match the spec's "integer … numerical
+    /// string" constraint — preserved verbatim.
+    Malformed(String),
+}
+
+/// Parse a single `TBPM` value string into a [`Bpm`] per the spec's
+/// "integer … numerical string" requirement. Reuses [`parse_decimal_u32`]
+/// so the decimal guard is identical to the track/position grammar — a
+/// sign, decimal point, whitespace, or non-digit byte yields
+/// [`Bpm::Malformed`].
+fn parse_bpm_value(value: &str) -> Bpm {
+    match parse_decimal_u32(value) {
+        Some(n) => Bpm::Beats(n),
+        None => Bpm::Malformed(value.to_string()),
+    }
+}
+
 /// Typed view of the `ETCO` "type of event" byte (spec v2.3 §4.6 /
 /// v2.4 §4.5). The byte sits at the start of each per-event record in
 /// an `ETCO` payload — one event-type byte followed by a 32-bit
@@ -2999,6 +3093,80 @@ impl Id3Frame {
     pub fn isrc(&self) -> Option<Isrc> {
         match self {
             Id3Frame::Text { id, values } if id == "TSRC" => Some(parse_tsrc_value(
+                values.first().map(String::as_str).unwrap_or(""),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Typed view of the `TLEN` "Length" frame (spec v2.3 §4.2.1 / v2.4
+    /// §4.2.1), "the length of the audio file in milliseconds, represented
+    /// as a numeric string".
+    ///
+    /// Returns `None` for any frame other than `TLEN`. For `TLEN` it
+    /// returns the parsed [`DurationMs`] for the frame's first value (a
+    /// conformant tag carries a single value); an empty-`values` frame
+    /// decodes to [`DurationMs::Malformed`]`("")` rather than panicking. A
+    /// non-empty ASCII-decimal value decodes to [`DurationMs::Millis`];
+    /// anything else surfaces as [`DurationMs::Malformed`] with the raw
+    /// string preserved so a forward-compatible or non-conforming source
+    /// is preserved rather than dropped. The wire form is identical across
+    /// v2.2 (`TLE`), v2.3, and v2.4 so the accessor is version-independent,
+    /// matching the posture of [`Id3Frame::isrc`]. The raw
+    /// [`Id3Frame::Text::values`] is unchanged and round-trips losslessly
+    /// through [`write_tag`].
+    pub fn length_ms(&self) -> Option<DurationMs> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TLEN" => Some(parse_duration_ms(
+                values.first().map(String::as_str).unwrap_or(""),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Typed view of the `TDLY` "Playlist delay" frame (spec v2.3 §4.2.1 /
+    /// v2.4 §4.2.1), "the numbers of milliseconds of silence that should
+    /// be inserted before this audio … represented as a numeric string".
+    /// Per spec, "the value zero indicates that this is a part of a
+    /// multifile audio track that should be played continuously"; that
+    /// semantic surfaces as [`DurationMs::Millis`]`(0)`, leaving the
+    /// interpretation to the caller.
+    ///
+    /// Returns `None` for any frame other than `TDLY`. `TDLY` shares the
+    /// `TLEN` numeric-string-milliseconds grammar verbatim, so it decodes
+    /// through the same [`DurationMs`] view; a non-conforming value
+    /// surfaces as [`DurationMs::Malformed`]. Version-independent (wire
+    /// grammar identical across v2.2 `TDY`, v2.3, and v2.4), matching
+    /// [`Id3Frame::length_ms`]. The raw [`Id3Frame::Text::values`] is
+    /// unchanged and round-trips losslessly through [`write_tag`].
+    pub fn playlist_delay_ms(&self) -> Option<DurationMs> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TDLY" => Some(parse_duration_ms(
+                values.first().map(String::as_str).unwrap_or(""),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Typed view of the `TBPM` "BPM (beats per minute)" frame (spec v2.3
+    /// §4.2.1 / v2.4 §4.2.1), "the number of beats per minute in the main
+    /// part of the audio. The BPM is an integer and represented as a
+    /// numerical string."
+    ///
+    /// Returns `None` for any frame other than `TBPM`. For `TBPM` it
+    /// returns the parsed [`Bpm`] for the frame's first value; an
+    /// empty-`values` frame decodes to [`Bpm::Malformed`]`("")`. A
+    /// non-empty ASCII-decimal value decodes to [`Bpm::Beats`]; a
+    /// fractional value violates the spec's "integer" requirement and
+    /// surfaces as [`Bpm::Malformed`], as does any sign, whitespace, or
+    /// non-digit byte. The wire form is identical across v2.2 (`TBP`),
+    /// v2.3, and v2.4 so the accessor is version-independent, matching the
+    /// posture of [`Id3Frame::length_ms`]. The raw
+    /// [`Id3Frame::Text::values`] is unchanged and round-trips losslessly
+    /// through [`write_tag`].
+    pub fn bpm(&self) -> Option<Bpm> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TBPM" => Some(parse_bpm_value(
                 values.first().map(String::as_str).unwrap_or(""),
             )),
             _ => None,
@@ -12463,6 +12631,195 @@ mod tests {
                 .find(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TSRC"))
                 .unwrap();
             assert_eq!(tsrc.isrc(), Some(Isrc::Code("GBAYE6800001".into())));
+        }
+    }
+
+    #[test]
+    fn length_ms_accepts_numeric_string() {
+        // The spec defines TLEN as a millisecond count in a numeric string;
+        // a plain decimal value decodes to Millis carrying the integer.
+        let frame = Id3Frame::Text {
+            id: "TLEN".into(),
+            values: vec!["215000".into()],
+        };
+        assert_eq!(frame.length_ms(), Some(DurationMs::Millis(215_000)));
+    }
+
+    #[test]
+    fn length_ms_non_numeric_is_malformed() {
+        // A sign, decimal point, whitespace, non-digit byte, and empty
+        // value all violate the "numeric string" requirement and surface
+        // structurally as Malformed with the raw value preserved.
+        for raw in ["+5", "-5", "21.5", " 5", "5 ", "5s", "", "abc"] {
+            let frame = Id3Frame::Text {
+                id: "TLEN".into(),
+                values: vec![raw.into()],
+            };
+            assert_eq!(
+                frame.length_ms(),
+                Some(DurationMs::Malformed(raw.to_string())),
+                "value {raw:?} should be Malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn length_ms_overflow_is_malformed() {
+        // A value past u64::MAX cannot be represented; it surfaces as
+        // Malformed rather than wrapping or panicking.
+        let raw = "99999999999999999999999999";
+        let frame = Id3Frame::Text {
+            id: "TLEN".into(),
+            values: vec![raw.into()],
+        };
+        assert_eq!(
+            frame.length_ms(),
+            Some(DurationMs::Malformed(raw.to_string()))
+        );
+    }
+
+    #[test]
+    fn length_ms_empty_values_is_malformed() {
+        // A TLEN frame with no values decodes to Malformed("") rather than
+        // panicking, matching the isrc/track-position empty-values contract.
+        let frame = Id3Frame::Text {
+            id: "TLEN".into(),
+            values: vec![],
+        };
+        assert_eq!(
+            frame.length_ms(),
+            Some(DurationMs::Malformed(String::new()))
+        );
+    }
+
+    #[test]
+    fn playlist_delay_ms_shares_grammar_and_zero_is_continuous() {
+        // TDLY shares the TLEN numeric-string-milliseconds grammar; the
+        // spec's "value zero ⇒ multifile continuous" surfaces as Millis(0)
+        // rather than a distinct sentinel, leaving the semantic to the
+        // caller.
+        let zero = Id3Frame::Text {
+            id: "TDLY".into(),
+            values: vec!["0".into()],
+        };
+        assert_eq!(zero.playlist_delay_ms(), Some(DurationMs::Millis(0)));
+        let delayed = Id3Frame::Text {
+            id: "TDLY".into(),
+            values: vec!["500".into()],
+        };
+        assert_eq!(delayed.playlist_delay_ms(), Some(DurationMs::Millis(500)));
+        // Non-conforming surfaces as Malformed.
+        let bad = Id3Frame::Text {
+            id: "TDLY".into(),
+            values: vec!["x".into()],
+        };
+        assert_eq!(
+            bad.playlist_delay_ms(),
+            Some(DurationMs::Malformed("x".into()))
+        );
+    }
+
+    #[test]
+    fn duration_accessors_route_by_frame_id() {
+        // length_ms is None on TDLY and vice versa; both are None on a
+        // non-text frame.
+        let tlen = Id3Frame::Text {
+            id: "TLEN".into(),
+            values: vec!["1".into()],
+        };
+        let tdly = Id3Frame::Text {
+            id: "TDLY".into(),
+            values: vec!["1".into()],
+        };
+        assert_eq!(tlen.playlist_delay_ms(), None);
+        assert_eq!(tdly.length_ms(), None);
+        let non_text = Id3Frame::PlayCounter { count: 1 };
+        assert_eq!(non_text.length_ms(), None);
+        assert_eq!(non_text.playlist_delay_ms(), None);
+    }
+
+    #[test]
+    fn length_ms_survives_roundtrip() {
+        // Serialise a TLEN frame, re-parse under v2.3 and v2.4, and confirm
+        // the typed view is reconstructed identically.
+        for version in [Id3Version::V2_3, Id3Version::V2_4] {
+            let tag = Id3Tag {
+                version,
+                frames: vec![Id3Frame::Text {
+                    id: "TLEN".into(),
+                    values: vec!["180000".into()],
+                }],
+            };
+            let bytes = write_tag(&tag, version).unwrap();
+            let (parsed, _) = parse_tag(&bytes).unwrap();
+            let tlen = parsed
+                .frames
+                .iter()
+                .find(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TLEN"))
+                .unwrap();
+            assert_eq!(tlen.length_ms(), Some(DurationMs::Millis(180_000)));
+        }
+    }
+
+    #[test]
+    fn bpm_accepts_integer_numeric_string() {
+        // The spec mandates an integer numerical string; a plain decimal
+        // value decodes to Beats.
+        let frame = Id3Frame::Text {
+            id: "TBPM".into(),
+            values: vec!["128".into()],
+        };
+        assert_eq!(frame.bpm(), Some(Bpm::Beats(128)));
+    }
+
+    #[test]
+    fn bpm_fractional_or_non_numeric_is_malformed() {
+        // The spec says "the BPM is an integer", so a fractional value is
+        // not conforming; a sign, whitespace, non-digit byte, and empty
+        // value are likewise Malformed.
+        for raw in ["128.5", "+128", "-1", " 128", "128 ", "fast", ""] {
+            let frame = Id3Frame::Text {
+                id: "TBPM".into(),
+                values: vec![raw.into()],
+            };
+            assert_eq!(
+                frame.bpm(),
+                Some(Bpm::Malformed(raw.to_string())),
+                "value {raw:?} should be Malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn bpm_accessor_only_on_tbpm() {
+        // Routes strictly by frame id.
+        let other_text = Id3Frame::Text {
+            id: "TIT2".into(),
+            values: vec!["128".into()],
+        };
+        assert_eq!(other_text.bpm(), None);
+        let non_text = Id3Frame::PlayCounter { count: 1 };
+        assert_eq!(non_text.bpm(), None);
+    }
+
+    #[test]
+    fn bpm_survives_roundtrip() {
+        for version in [Id3Version::V2_3, Id3Version::V2_4] {
+            let tag = Id3Tag {
+                version,
+                frames: vec![Id3Frame::Text {
+                    id: "TBPM".into(),
+                    values: vec!["140".into()],
+                }],
+            };
+            let bytes = write_tag(&tag, version).unwrap();
+            let (parsed, _) = parse_tag(&bytes).unwrap();
+            let tbpm = parsed
+                .frames
+                .iter()
+                .find(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TBPM"))
+                .unwrap();
+            assert_eq!(tbpm.bpm(), Some(Bpm::Beats(140)));
         }
     }
 
