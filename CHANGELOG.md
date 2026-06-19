@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed accessors for the four v2.3-only date/time/size split frames that
+  v2.4 folded into the `TDRC` timestamp: `Id3Frame::year()` (`TYER`,
+  four-digit year → `Id3Year`), `Id3Frame::date_ddmm()` (`TDAT`, `DDMM`
+  date → `DayMonth { day, month }`), `Id3Frame::time_hhmm()` (`TIME`,
+  `HHMM` time → `HourMinute { hour, minute }`), and
+  `Id3Frame::size_bytes()` (`TSIZ`, byte count → `SizeBytes`). All per
+  spec v2.3 §4.2.1. The `TDAT`/`TIME` splits are positional and not
+  calendar/range-validated (matching `Id3Date`), so a forward-compatible
+  source like `"3199"` surfaces `day: 31, month: 99` rather than being
+  rejected. Each is version-locked to v2.3 by its source frame id, routes
+  strictly by id, and surfaces a wrong-length / empty / non-digit value
+  as the `Malformed` variant with the raw string preserved. The raw
+  `Id3Frame::Text::values` is untouched and round-trips losslessly through
+  `write_tag`.
 - Typed accessors `Id3Frame::length_ms()` (`TLEN`) and
   `Id3Frame::playlist_delay_ms()` (`TDLY`) returning a `DurationMs`
   (`Millis(u64)` / `Malformed(String)`) for the spec's "milliseconds …

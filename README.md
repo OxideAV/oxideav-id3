@@ -783,6 +783,28 @@ never silently drops data.
   v2.4 so the accessor is version-independent; the raw
   `Id3Frame::Text::values` is unchanged and round-trips losslessly through
   `write_tag`, matching the posture of `length_ms()`.
+- `Id3Frame::year()` (`TYER`), `Id3Frame::date_ddmm()` (`TDAT`),
+  `Id3Frame::time_hhmm()` (`TIME`), and `Id3Frame::size_bytes()` (`TSIZ`)
+  return typed views for the four v2.3-only date/time/size split frames
+  that v2.4 folded into the `TDRC` timestamp (spec v2.3 §4.2.1). `TYER` is
+  "a numeric string with a year of the recording … always four characters
+  long" → `Id3Year::Year(u16)`; `TDAT` is "a numeric string in the DDMM
+  format containing the date … always four characters long" →
+  `DayMonth { day, month }` (note **day first**, distinct from the
+  `YYYYMMDD` `Id3Date`); `TIME` is "a numeric string in the HHMM format
+  containing the time … always four characters long" →
+  `HourMinute { hour, minute }`; `TSIZ` is "the size of the audiofile in
+  bytes, excluding the ID3v2 tag, represented as a numeric string" →
+  `SizeBytes::Bytes(u64)`. The `TDAT`/`TIME` splits are positional and
+  **not** calendar/range-validated (matching `Id3Date` / the v2.4
+  `Id3Timestamp`), so a forward-compatible-but-odd source like `"3199"`
+  surfaces `day: 31, month: 99` rather than being rejected. Each is
+  version-locked to v2.3 by its source frame id, routes strictly by id,
+  and surfaces a wrong-length / empty / non-digit value as the `Malformed`
+  variant with the raw string preserved. The raw `Id3Frame::Text::values`
+  is unchanged and round-trips losslessly through `write_tag`. Together
+  with the v2.4 `timestamps()` family, every documented date/time field is
+  now typed in both version dialects.
 
 ## Fuzzing
 

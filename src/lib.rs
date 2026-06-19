@@ -2240,6 +2240,180 @@ impl Id3Date {
     }
 }
 
+/// Typed view of the v2.3-only `TYER` "Year" frame (spec v2.3 §4.2.1).
+///
+/// The spec defines `TYER` as "a numeric string with a year of the
+/// recording. This frame is always four characters long (until the year
+/// 10000)." v2.4 dropped this frame, folding the year into the `TDRC`
+/// timestamp (see [`Id3Timestamp`]); so this view is **v2.3-only** by
+/// virtue of its source frame id.
+///
+/// Surfaced via [`Id3Frame::year`]. A value of exactly four ASCII digits
+/// decodes to [`Id3Year::Year`]; anything else — a value of the wrong
+/// length, an empty field (the spec's absent form), or one carrying a
+/// non-digit byte — surfaces as [`Id3Year::Malformed`] with the raw
+/// string preserved, so a forward-compatible or non-conforming source
+/// surfaces structurally rather than being dropped (matching
+/// [`Id3Date::Malformed`]). The raw [`Id3Frame::Text::values`] is
+/// unchanged and round-trips losslessly through [`write_tag`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Id3Year {
+    /// A spec-shaped four-digit year (`0000..=9999`).
+    Year(u16),
+    /// A value that is not exactly four ASCII digits — preserved verbatim.
+    Malformed(String),
+}
+
+impl Id3Year {
+    /// Decode a `TYER` value string into the typed view. Exactly four
+    /// ASCII digits is [`Id3Year::Year`]; anything else is
+    /// [`Id3Year::Malformed`] with the raw string preserved.
+    fn from_field(value: &str) -> Id3Year {
+        let bytes = value.as_bytes();
+        if bytes.len() == 4 && bytes.iter().all(|b| b.is_ascii_digit()) {
+            let d = |i: usize| (bytes[i] - b'0') as u16;
+            Id3Year::Year(d(0) * 1000 + d(1) * 100 + d(2) * 10 + d(3))
+        } else {
+            Id3Year::Malformed(value.to_string())
+        }
+    }
+}
+
+/// Typed view of the v2.3-only `TDAT` "Date" frame (spec v2.3 §4.2.1).
+///
+/// The spec defines `TDAT` as "a numeric string in the DDMM format
+/// containing the date for the recording. This field is always four
+/// characters long." v2.4 dropped this frame, folding the date into the
+/// `TDRC` timestamp; so this view is **v2.3-only** by virtue of its
+/// source frame id. Note the field order is **day then month** (`DDMM`,
+/// e.g. `"1506"` = 15 June), distinct from the `YYYYMMDD` [`Id3Date`].
+///
+/// Surfaced via [`Id3Frame::date_ddmm`]. A value of exactly four ASCII
+/// digits decodes to [`DayMonth::DayMonth`], split positionally and
+/// **not** calendar-validated (`"3199"` surfaces `day: 31, month: 99`)
+/// per the same forward-compatible posture as [`Id3Date::Ymd`]. Anything
+/// else surfaces as [`DayMonth::Malformed`] with the raw string
+/// preserved. The raw [`Id3Frame::Text::values`] is unchanged and
+/// round-trips losslessly through [`write_tag`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DayMonth {
+    /// A spec-shaped `DDMM` value, split positionally and not
+    /// calendar-validated.
+    DayMonth {
+        /// Two-digit day component (`00..=99`, not range-checked).
+        day: u8,
+        /// Two-digit month component (`00..=99`, not range-checked).
+        month: u8,
+    },
+    /// A value that is not exactly four ASCII digits — preserved verbatim.
+    Malformed(String),
+}
+
+impl DayMonth {
+    /// Decode a `TDAT` (`DDMM`) value string into the typed view. Exactly
+    /// four ASCII digits splits positionally into [`DayMonth::DayMonth`];
+    /// anything else is [`DayMonth::Malformed`].
+    fn from_field(value: &str) -> DayMonth {
+        let bytes = value.as_bytes();
+        if bytes.len() == 4 && bytes.iter().all(|b| b.is_ascii_digit()) {
+            let d = |i: usize| bytes[i] - b'0';
+            DayMonth::DayMonth {
+                day: d(0) * 10 + d(1),
+                month: d(2) * 10 + d(3),
+            }
+        } else {
+            DayMonth::Malformed(value.to_string())
+        }
+    }
+}
+
+/// Typed view of the v2.3-only `TIME` "Time" frame (spec v2.3 §4.2.1).
+///
+/// The spec defines `TIME` as "a numeric string in the HHMM format
+/// containing the time for the recording. This field is always four
+/// characters long." v2.4 dropped this frame, folding the time into the
+/// `TDRC` timestamp; so this view is **v2.3-only** by virtue of its
+/// source frame id.
+///
+/// Surfaced via [`Id3Frame::time_hhmm`]. A value of exactly four ASCII
+/// digits decodes to [`HourMinute::HourMinute`], split positionally and
+/// **not** range-validated (`"2599"` surfaces `hour: 25, minute: 99`).
+/// Anything else surfaces as [`HourMinute::Malformed`] with the raw
+/// string preserved. The raw [`Id3Frame::Text::values`] is unchanged and
+/// round-trips losslessly through [`write_tag`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HourMinute {
+    /// A spec-shaped `HHMM` value, split positionally and not
+    /// range-validated.
+    HourMinute {
+        /// Two-digit hour component (`00..=99`, not range-checked).
+        hour: u8,
+        /// Two-digit minute component (`00..=99`, not range-checked).
+        minute: u8,
+    },
+    /// A value that is not exactly four ASCII digits — preserved verbatim.
+    Malformed(String),
+}
+
+impl HourMinute {
+    /// Decode a `TIME` (`HHMM`) value string into the typed view. Exactly
+    /// four ASCII digits splits positionally into
+    /// [`HourMinute::HourMinute`]; anything else is
+    /// [`HourMinute::Malformed`].
+    fn from_field(value: &str) -> HourMinute {
+        let bytes = value.as_bytes();
+        if bytes.len() == 4 && bytes.iter().all(|b| b.is_ascii_digit()) {
+            let d = |i: usize| bytes[i] - b'0';
+            HourMinute::HourMinute {
+                hour: d(0) * 10 + d(1),
+                minute: d(2) * 10 + d(3),
+            }
+        } else {
+            HourMinute::Malformed(value.to_string())
+        }
+    }
+}
+
+/// Typed view of the v2.3-only `TSIZ` "Size" frame (spec v2.3 §4.2.1).
+///
+/// The spec defines `TSIZ` as "the size of the audiofile in bytes,
+/// excluding the ID3v2 tag, represented as a numeric string." v2.4
+/// dropped this frame entirely (a parser can determine the audio size
+/// from the file length minus the tag size), so this view is **v2.3-only**
+/// by virtue of its source frame id.
+///
+/// Surfaced via [`Id3Frame::size_bytes`]. A non-empty ASCII-decimal value
+/// decodes to [`SizeBytes::Bytes`]`(u64)`; anything else — an empty value,
+/// a sign, a decimal point, whitespace, a non-digit byte, or a `u64`
+/// overflow — surfaces as [`SizeBytes::Malformed`] with the raw string
+/// preserved (matching the forward-compatible posture of [`DurationMs`]).
+/// The raw [`Id3Frame::Text::values`] is unchanged and round-trips
+/// losslessly through [`write_tag`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SizeBytes {
+    /// A spec-conforming numeric-string byte count.
+    Bytes(u64),
+    /// A value that does not match the spec's "numeric string"
+    /// constraint — preserved verbatim.
+    Malformed(String),
+}
+
+impl SizeBytes {
+    /// Decode a `TSIZ` value string into the typed view. A non-empty
+    /// ASCII-decimal string is [`SizeBytes::Bytes`]; anything else (empty,
+    /// sign, decimal point, whitespace, non-digit byte, or `u64` overflow)
+    /// is [`SizeBytes::Malformed`].
+    fn from_field(value: &str) -> SizeBytes {
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return SizeBytes::Malformed(value.to_string());
+        }
+        match value.parse::<u64>() {
+            Ok(n) => SizeBytes::Bytes(n),
+            Err(_) => SizeBytes::Malformed(value.to_string()),
+        }
+    }
+}
+
 /// Typed view of an ID3v2.4 timestamp string.
 ///
 /// The v2.4 "TDxx" date frames — `TDEN` (encoding time), `TDOR` (original
@@ -3167,6 +3341,94 @@ impl Id3Frame {
     pub fn bpm(&self) -> Option<Bpm> {
         match self {
             Id3Frame::Text { id, values } if id == "TBPM" => Some(parse_bpm_value(
+                values.first().map(String::as_str).unwrap_or(""),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Typed view of the v2.3-only `TYER` "Year" frame (spec v2.3 §4.2.1),
+    /// "a numeric string with a year of the recording … always four
+    /// characters long".
+    ///
+    /// Returns `None` for any frame other than `TYER`. For `TYER` it
+    /// returns the parsed [`Id3Year`] for the frame's first value; an
+    /// empty-`values` frame decodes to [`Id3Year::Malformed`]`("")`. A
+    /// four-ASCII-digit value decodes to [`Id3Year::Year`]; anything else
+    /// surfaces as [`Id3Year::Malformed`] with the raw string preserved.
+    /// `TYER` is **v2.3-only** — v2.4 folded the year into the `TDRC`
+    /// timestamp (see [`Id3Frame::recording_time`]) — so the accessor is
+    /// version-locked to v2.3 by its source frame id. The raw
+    /// [`Id3Frame::Text::values`] is unchanged and round-trips losslessly
+    /// through [`write_tag`].
+    pub fn year(&self) -> Option<Id3Year> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TYER" => Some(Id3Year::from_field(
+                values.first().map(String::as_str).unwrap_or(""),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Typed view of the v2.3-only `TDAT` "Date" frame (spec v2.3 §4.2.1),
+    /// "a numeric string in the DDMM format containing the date for the
+    /// recording … always four characters long".
+    ///
+    /// Returns `None` for any frame other than `TDAT`. For `TDAT` it
+    /// returns the parsed [`DayMonth`] for the frame's first value; a
+    /// four-ASCII-digit value splits positionally into
+    /// [`DayMonth::DayMonth`] (day then month, **not** calendar-validated)
+    /// and anything else surfaces as [`DayMonth::Malformed`]. `TDAT` is
+    /// **v2.3-only** — v2.4 folded the date into the `TDRC` timestamp — so
+    /// the accessor is version-locked to v2.3. The raw
+    /// [`Id3Frame::Text::values`] is unchanged and round-trips losslessly
+    /// through [`write_tag`].
+    pub fn date_ddmm(&self) -> Option<DayMonth> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TDAT" => Some(DayMonth::from_field(
+                values.first().map(String::as_str).unwrap_or(""),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Typed view of the v2.3-only `TIME` "Time" frame (spec v2.3 §4.2.1),
+    /// "a numeric string in the HHMM format containing the time for the
+    /// recording … always four characters long".
+    ///
+    /// Returns `None` for any frame other than `TIME`. For `TIME` it
+    /// returns the parsed [`HourMinute`] for the frame's first value; a
+    /// four-ASCII-digit value splits positionally into
+    /// [`HourMinute::HourMinute`] (**not** range-validated) and anything
+    /// else surfaces as [`HourMinute::Malformed`]. `TIME` is **v2.3-only**
+    /// — v2.4 folded the time into the `TDRC` timestamp — so the accessor
+    /// is version-locked to v2.3. The raw [`Id3Frame::Text::values`] is
+    /// unchanged and round-trips losslessly through [`write_tag`].
+    pub fn time_hhmm(&self) -> Option<HourMinute> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TIME" => Some(HourMinute::from_field(
+                values.first().map(String::as_str).unwrap_or(""),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Typed view of the v2.3-only `TSIZ` "Size" frame (spec v2.3 §4.2.1),
+    /// "the size of the audiofile in bytes, excluding the ID3v2 tag,
+    /// represented as a numeric string".
+    ///
+    /// Returns `None` for any frame other than `TSIZ`. For `TSIZ` it
+    /// returns the parsed [`SizeBytes`] for the frame's first value; a
+    /// non-empty ASCII-decimal value decodes to [`SizeBytes::Bytes`] and
+    /// anything else (empty, sign, decimal point, whitespace, non-digit
+    /// byte, or `u64` overflow) surfaces as [`SizeBytes::Malformed`].
+    /// `TSIZ` is **v2.3-only** — v2.4 dropped it (the audio size is the
+    /// file length minus the tag size) — so the accessor is
+    /// version-locked to v2.3. The raw [`Id3Frame::Text::values`] is
+    /// unchanged and round-trips losslessly through [`write_tag`].
+    pub fn size_bytes(&self) -> Option<SizeBytes> {
+        match self {
+            Id3Frame::Text { id, values } if id == "TSIZ" => Some(SizeBytes::from_field(
                 values.first().map(String::as_str).unwrap_or(""),
             )),
             _ => None,
@@ -12821,6 +13083,189 @@ mod tests {
                 .unwrap();
             assert_eq!(tbpm.bpm(), Some(Bpm::Beats(140)));
         }
+    }
+
+    #[test]
+    fn tyer_accepts_four_digit_year() {
+        // The spec fixes TYER at four numeric characters; a four-digit
+        // value decodes to Year carrying the integer.
+        let frame = Id3Frame::Text {
+            id: "TYER".into(),
+            values: vec!["2024".into()],
+        };
+        assert_eq!(frame.year(), Some(Id3Year::Year(2024)));
+    }
+
+    #[test]
+    fn tyer_non_four_digit_is_malformed() {
+        // Wrong length (short, long), empty, and a non-digit byte all
+        // surface structurally as Malformed with the raw value preserved.
+        for raw in ["202", "20245", "", "20x4", "abcd"] {
+            let frame = Id3Frame::Text {
+                id: "TYER".into(),
+                values: vec![raw.into()],
+            };
+            assert_eq!(
+                frame.year(),
+                Some(Id3Year::Malformed(raw.to_string())),
+                "value {raw:?} should be Malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn tdat_splits_ddmm_positionally() {
+        // TDAT is DDMM (day first): "1506" = 15 June. The split is not
+        // calendar-validated — "3199" surfaces day:31, month:99.
+        let frame = Id3Frame::Text {
+            id: "TDAT".into(),
+            values: vec!["1506".into()],
+        };
+        assert_eq!(
+            frame.date_ddmm(),
+            Some(DayMonth::DayMonth { day: 15, month: 6 })
+        );
+        let odd = Id3Frame::Text {
+            id: "TDAT".into(),
+            values: vec!["3199".into()],
+        };
+        assert_eq!(
+            odd.date_ddmm(),
+            Some(DayMonth::DayMonth { day: 31, month: 99 })
+        );
+        for raw in ["150", "15066", "", "15x6"] {
+            let bad = Id3Frame::Text {
+                id: "TDAT".into(),
+                values: vec![raw.into()],
+            };
+            assert_eq!(bad.date_ddmm(), Some(DayMonth::Malformed(raw.to_string())));
+        }
+    }
+
+    #[test]
+    fn time_splits_hhmm_positionally() {
+        // TIME is HHMM: "0930" = 09:30. Not range-validated — "2599"
+        // surfaces hour:25, minute:99.
+        let frame = Id3Frame::Text {
+            id: "TIME".into(),
+            values: vec!["0930".into()],
+        };
+        assert_eq!(
+            frame.time_hhmm(),
+            Some(HourMinute::HourMinute {
+                hour: 9,
+                minute: 30
+            })
+        );
+        let odd = Id3Frame::Text {
+            id: "TIME".into(),
+            values: vec!["2599".into()],
+        };
+        assert_eq!(
+            odd.time_hhmm(),
+            Some(HourMinute::HourMinute {
+                hour: 25,
+                minute: 99
+            })
+        );
+        for raw in ["093", "09300", "", "09x0"] {
+            let bad = Id3Frame::Text {
+                id: "TIME".into(),
+                values: vec![raw.into()],
+            };
+            assert_eq!(
+                bad.time_hhmm(),
+                Some(HourMinute::Malformed(raw.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn tsiz_accepts_numeric_byte_count() {
+        // TSIZ is a byte count as a numeric string.
+        let frame = Id3Frame::Text {
+            id: "TSIZ".into(),
+            values: vec!["5242880".into()],
+        };
+        assert_eq!(frame.size_bytes(), Some(SizeBytes::Bytes(5_242_880)));
+        for raw in ["+5", "5.0", " 5", "5 ", "", "5kb"] {
+            let bad = Id3Frame::Text {
+                id: "TSIZ".into(),
+                values: vec![raw.into()],
+            };
+            assert_eq!(
+                bad.size_bytes(),
+                Some(SizeBytes::Malformed(raw.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn v23_date_accessors_route_by_frame_id() {
+        // Each accessor is None on the other frames and on a non-text
+        // frame; they are version-locked to v2.3 by frame id (a v2.4 tag
+        // never carries these ids, but the accessor itself is id-keyed).
+        let tyer = Id3Frame::Text {
+            id: "TYER".into(),
+            values: vec!["2024".into()],
+        };
+        assert_eq!(tyer.date_ddmm(), None);
+        assert_eq!(tyer.time_hhmm(), None);
+        assert_eq!(tyer.size_bytes(), None);
+        let non_text = Id3Frame::PlayCounter { count: 1 };
+        assert_eq!(non_text.year(), None);
+        assert_eq!(non_text.date_ddmm(), None);
+        assert_eq!(non_text.time_hhmm(), None);
+        assert_eq!(non_text.size_bytes(), None);
+    }
+
+    #[test]
+    fn v23_date_frames_survive_roundtrip() {
+        // Serialise the four v2.3 split frames, re-parse under v2.3, and
+        // confirm each typed view is reconstructed identically.
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![
+                Id3Frame::Text {
+                    id: "TYER".into(),
+                    values: vec!["1999".into()],
+                },
+                Id3Frame::Text {
+                    id: "TDAT".into(),
+                    values: vec!["2412".into()],
+                },
+                Id3Frame::Text {
+                    id: "TIME".into(),
+                    values: vec!["2359".into()],
+                },
+                Id3Frame::Text {
+                    id: "TSIZ".into(),
+                    values: vec!["1048576".into()],
+                },
+            ],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        let find = |id: &str| {
+            parsed
+                .frames
+                .iter()
+                .find(|f| matches!(f, Id3Frame::Text { id: i, .. } if i == id))
+                .unwrap()
+        };
+        assert_eq!(find("TYER").year(), Some(Id3Year::Year(1999)));
+        assert_eq!(
+            find("TDAT").date_ddmm(),
+            Some(DayMonth::DayMonth { day: 24, month: 12 })
+        );
+        assert_eq!(
+            find("TIME").time_hhmm(),
+            Some(HourMinute::HourMinute {
+                hour: 23,
+                minute: 59
+            })
+        );
+        assert_eq!(find("TSIZ").size_bytes(), Some(SizeBytes::Bytes(1_048_576)));
     }
 
     #[test]
