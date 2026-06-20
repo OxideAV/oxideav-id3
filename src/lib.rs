@@ -9312,6 +9312,112 @@ mod tests {
         (id, payload)
     }
 
+    /// A CRM whose payload omits the second NUL terminator: per the
+    /// structural parser, everything after the owner terminator folds
+    /// into `content` and the encrypted block is empty rather than the
+    /// frame erroring. The owner is still recovered correctly.
+    #[test]
+    fn v22_crm_missing_second_terminator() {
+        let crm = b"owner@x\0just a description with no second NUL";
+        let tag = build_v22_tag(0, &[(b"CRM", &crm[..])]);
+        let (parsed, _) = parse_tag(&tag).unwrap();
+        match &parsed.frames[0] {
+            Id3Frame::EncryptedMeta {
+                owner,
+                content,
+                encrypted,
+            } => {
+                assert_eq!(owner, "owner@x");
+                assert_eq!(content, "just a description with no second NUL");
+                assert!(encrypted.is_empty());
+            }
+            other => panic!("expected EncryptedMeta, got {other:?}"),
+        }
+    }
+
+    /// Empty owner and content with a non-empty encrypted block survive
+    /// a byte-exact v2.2 round-trip (the two leading bytes are bare
+    /// NULs).
+    #[test]
+    fn v22_crm_empty_strings_roundtrip() {
+        let frame = Id3Frame::EncryptedMeta {
+            owner: String::new(),
+            content: String::new(),
+            encrypted: vec![0xAA, 0xBB, 0xCC],
+        };
+        let (id, payload) = encode_frame_v22_only(&frame);
+        assert_eq!(id, "CRM");
+        assert_eq!(payload, vec![0u8, 0u8, 0xAA, 0xBB, 0xCC]);
+        // Re-parse the body to confirm symmetry.
+        match parse_v22_frame_body("CRM", &payload) {
+            Id3Frame::EncryptedMeta {
+                owner,
+                content,
+                encrypted,
+            } => {
+                assert!(owner.is_empty());
+                assert!(content.is_empty());
+                assert_eq!(encrypted, vec![0xAA, 0xBB, 0xCC]);
+            }
+            other => panic!("expected EncryptedMeta, got {other:?}"),
+        }
+    }
+
+    /// The encrypted block may contain `$FF $00` byte pairs; a CRM frame
+    /// composes with whole-tag unsynchronisation so those bytes survive
+    /// the write → parse round-trip unmodified.
+    #[test]
+    fn v22_crm_unsync_roundtrip() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_2,
+            frames: vec![Id3Frame::EncryptedMeta {
+                owner: "o@e".to_string(),
+                content: "c".to_string(),
+                encrypted: vec![0xFF, 0x00, 0xFF, 0xFB, 0x90],
+            }],
+        };
+        let opts = WriteOptions::new().with_unsync(UnsyncMode::WholeTag);
+        let bytes = write_tag_with_options(&tag, Id3Version::V2_2, &opts).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        assert_eq!(parsed.frames.len(), 1);
+        match &parsed.frames[0] {
+            Id3Frame::EncryptedMeta {
+                owner,
+                content,
+                encrypted,
+            } => {
+                assert_eq!(owner, "o@e");
+                assert_eq!(content, "c");
+                assert_eq!(encrypted, &vec![0xFF, 0x00, 0xFF, 0xFB, 0x90]);
+            }
+            other => panic!("expected EncryptedMeta, got {other:?}"),
+        }
+    }
+
+    /// Test-only shim: route a payload through the v2.2 frame-body
+    /// dispatcher so the round-trip assertions above can re-parse a
+    /// payload they just encoded.
+    fn parse_v22_frame_body(id: &str, payload: &[u8]) -> Id3Frame {
+        let mut tag = build_v22_tag(0, &[]);
+        // Splice a frame of `id` + payload in before the padding.
+        let header_len = ID3V2_HEADER_SIZE;
+        let mut body = Vec::new();
+        body.extend_from_slice(id.as_bytes());
+        body.push(((payload.len() >> 16) & 0xFF) as u8);
+        body.push(((payload.len() >> 8) & 0xFF) as u8);
+        body.push((payload.len() & 0xFF) as u8);
+        body.extend_from_slice(payload);
+        let s = body.len() as u32;
+        tag.truncate(header_len);
+        tag[6] = ((s >> 21) & 0x7F) as u8;
+        tag[7] = ((s >> 14) & 0x7F) as u8;
+        tag[8] = ((s >> 7) & 0x7F) as u8;
+        tag[9] = (s & 0x7F) as u8;
+        tag.extend_from_slice(&body);
+        let (parsed, _) = parse_tag(&tag).unwrap();
+        parsed.frames.into_iter().next().unwrap()
+    }
+
     /// v2.2 §3.1: a set compression bit (header flag bit 6) means the
     /// decoder "should just ignore the entire tag" — no frames, but
     /// the consumed size still spans the whole tag so a container
