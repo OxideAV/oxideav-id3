@@ -317,8 +317,15 @@ never silently drops data.
   — presence is not keyed on the inc/dec sign bits the way v2.3
   `RVAD` gates its front block — and `LNK` (§4.22) always carries a
   3-byte linked-frame id, so no 3-vs-4-byte heuristic applies. `CRM`
-  (encrypted meta frame, §4.20) has no v2.3/v2.4 descendant and is
-  preserved verbatim via `Id3Frame::Unknown`. The v2.2 header
+  (encrypted meta frame, §4.20) has no v2.3/v2.4 descendant but its
+  structure is fully specified, so it parses into a typed
+  `Id3Frame::EncryptedMeta { owner, content, encrypted }` (two
+  ISO-8859-1 NUL-terminated strings + an opaque encrypted block kept
+  verbatim — no decryption is attempted, matching the spec's deferral
+  of the cipher to an owner-keyed plugin). It serialises back to a CRM
+  body under a v2.2 target and is rejected under v2.3/v2.4 (no on-wire
+  slot — v2.3+ replaced it with `ENCR` + per-frame encryption). The
+  v2.2 header
   compression bit (§3.1 flag bit 6, a tag-wide scheme the spec never
   defined: "the ID3 decoder (for now) should just ignore the entire
   tag") yields an empty frame list while still reporting the correct
