@@ -542,6 +542,27 @@ pub enum Id3Frame {
     /// pair with an empty involvee, surfacing the truncation without
     /// crashing.
     Ipls { pairs: Vec<(String, String)> },
+    /// `CRM` encrypted meta frame (ID3v2.2 §4.20). A v2.2-only frame
+    /// that wraps one or more encrypted ID3v2 frames. It has no
+    /// v2.3/v2.4 descendant — v2.3+ split its responsibilities across
+    /// `ENCR` (encryption-method registration) and `AENC`/per-frame
+    /// encryption flags. The structural fields are exposed verbatim:
+    ///
+    /// * `owner` — NUL-terminated ISO-8859-1 owner identifier. Per spec
+    ///   this is "a terminated string with a URL containing an email
+    ///   address" identifying the organisation responsible for the
+    ///   encrypted block, so questions can be directed to it.
+    /// * `content` — NUL-terminated ISO-8859-1 content/explanation
+    ///   describing what is encrypted and why.
+    /// * `encrypted` — the opaque encrypted datablock. It is preserved
+    ///   verbatim; this crate carries no decryption plugins, so the
+    ///   block is never interpreted (the spec defers the cipher to the
+    ///   plugin keyed by `owner`).
+    EncryptedMeta {
+        owner: String,
+        content: String,
+        encrypted: Vec<u8>,
+    },
     /// Any frame whose id we don't parse structurally (RGAD, CHAP,
     /// ...). The payload is preserved verbatim so callers or later
     /// versions can recognise it without needing to reparse.
@@ -4277,6 +4298,7 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
             | Id3Frame::Rvad { .. }
             | Id3Frame::Equa { .. }
             | Id3Frame::Ipls { .. }
+            | Id3Frame::EncryptedMeta { .. }
             | Id3Frame::Unknown { .. } => {}
         }
     }
@@ -4938,10 +4960,12 @@ fn dispatch_v22(id: &str, payload: &[u8]) -> Id3Frame {
         // exactly 3 bytes (no 3-vs-4 heuristic applies).
         "RVA" => parse_rva_v22(payload),
         "LNK" => parse_link_v22(payload),
-        // CRM (encrypted meta frame, §4.20) has no v2.3/v2.4 descendant
-        // and we carry no decryption plugins, so it falls through to
-        // Unknown with the payload preserved verbatim — same posture as
-        // the v2.3/v2.4 encrypted-frame flag.
+        // CRM (encrypted meta frame, §4.20) has no v2.3/v2.4 descendant.
+        // We carry no decryption plugins, but the frame's *structure*
+        // (owner id + content/explanation + encrypted block) is defined
+        // by the spec independently of the cipher, so we expose those
+        // fields and preserve the encrypted block verbatim.
+        "CRM" => parse_crm(payload),
         _ => Id3Frame::Unknown {
             id: id.to_string(),
             raw: payload.to_vec(),
@@ -5325,6 +5349,30 @@ fn parse_priv(payload: &[u8]) -> Id3Frame {
     Id3Frame::Private {
         owner: latin1_to_string(owner_bytes),
         data: data.to_vec(),
+    }
+}
+
+/// Parse a `CRM` encrypted-meta payload (ID3v2.2 §4.20). Layout is:
+///
+/// ```text
+/// Owner identifier      <ISO-8859-1 string> $00
+/// Content/explanation   <ISO-8859-1 string> $00
+/// Encrypted datablock   <binary data>
+/// ```
+///
+/// Both leading strings are ISO-8859-1 (the frame predates any
+/// per-frame encoding byte — v2.2 §4.20 lists no text-encoding field).
+/// The encrypted block is opaque and preserved verbatim; this parser is
+/// structural and never attempts decryption. A payload missing the
+/// second terminator folds the remainder into `content` with an empty
+/// `encrypted` block rather than erroring.
+fn parse_crm(payload: &[u8]) -> Id3Frame {
+    let (owner_bytes, after_owner) = split_once_nul_bytes(payload);
+    let (content_bytes, encrypted) = split_once_nul_bytes(after_owner);
+    Id3Frame::EncryptedMeta {
+        owner: latin1_to_string(owner_bytes),
+        content: latin1_to_string(content_bytes),
+        encrypted: encrypted.to_vec(),
     }
 }
 
@@ -7554,6 +7602,23 @@ fn write_v22_frame(frame: &Id3Frame, out: &mut Vec<u8>) -> Result<()> {
             payload.extend_from_slice(&pic.data);
             ("PIC", payload)
         }
+        Id3Frame::EncryptedMeta {
+            owner,
+            content,
+            encrypted,
+        } => {
+            // v2.2 §4.20 CRM: owner identifier (ISO-8859-1, NUL) +
+            // content/explanation (ISO-8859-1, NUL) + encrypted block.
+            // No encoding byte — the frame predates one. This is the
+            // serialiser counterpart of `parse_crm`.
+            let mut payload = Vec::new();
+            encode_latin1(&mut payload, owner);
+            payload.push(0);
+            encode_latin1(&mut payload, content);
+            payload.push(0);
+            payload.extend_from_slice(encrypted);
+            ("CRM", payload)
+        }
         Id3Frame::Unknown { id, raw } => {
             // An Unknown frame round-trips verbatim, but only if its id
             // is already a valid three-character v2.2 identifier. A
@@ -8512,6 +8577,18 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
             }
             Ok(("IPLS".to_string(), payload))
         }
+        Id3Frame::EncryptedMeta { .. } => {
+            // CRM (§4.20) exists only in ID3v2.2 — v2.3 replaced it with
+            // ENCR + per-frame encryption flags, and v2.4 kept that
+            // model. Emitting CRM under a v2.3/v2.4 envelope would be a
+            // malformed frame, so refuse here. The v2.2 writer
+            // (`write_v22_frame`) handles this variant directly; this
+            // arm is only ever hit for a non-v2.2 target (matching the
+            // RVAD-under-v2.4 rejection pattern).
+            Err(Error::unsupported(
+                "CRM (encrypted meta) frame is ID3v2.2-only; v2.3+ uses ENCR + per-frame encryption",
+            ))
+        }
         Id3Frame::Unknown { id, raw } => {
             // Promote v2.2 ids (3 chars) to their v2.3 equivalents on
             // write so the output is always a well-formed v2.3/v2.4
@@ -9148,20 +9225,91 @@ mod tests {
         }
     }
 
-    /// v2.2 §4.20 CRM has no v2.3/v2.4 descendant — preserved verbatim
-    /// as an Unknown frame.
+    /// v2.2 §4.20 CRM has no v2.3/v2.4 descendant but its structure is
+    /// fully specified: owner identifier + content/explanation + the
+    /// encrypted datablock. The parser types those fields and preserves
+    /// the encrypted block verbatim (no decryption attempted).
     #[test]
-    fn v22_crm_preserved_as_unknown() {
+    fn v22_crm_typed_decode() {
         let crm = b"plugin@example\0why it is locked\0CIPHERTEXT";
         let tag = build_v22_tag(0, &[(b"CRM", &crm[..])]);
         let (parsed, _) = parse_tag(&tag).unwrap();
         match &parsed.frames[0] {
-            Id3Frame::Unknown { id, raw } => {
-                assert_eq!(id, "CRM");
-                assert_eq!(raw, &crm[..]);
+            Id3Frame::EncryptedMeta {
+                owner,
+                content,
+                encrypted,
+            } => {
+                assert_eq!(owner, "plugin@example");
+                assert_eq!(content, "why it is locked");
+                assert_eq!(encrypted, b"CIPHERTEXT");
             }
-            other => panic!("expected Unknown from v2.2 CRM, got {other:?}"),
+            other => panic!("expected EncryptedMeta from v2.2 CRM, got {other:?}"),
         }
+    }
+
+    /// A CRM frame round-trips through the v2.2 writer byte-for-byte:
+    /// decode → re-encode → decode yields identical structural fields,
+    /// and the serialised bytes match the original frame payload.
+    #[test]
+    fn v22_crm_roundtrip() {
+        let crm = b"owner@org.example\0protected artwork\0\x01\x02\x00\xFF\x00data";
+        let tag = build_v22_tag(0, &[(b"CRM", &crm[..])]);
+        let (parsed, _) = parse_tag(&tag).unwrap();
+        // Re-encode under a v2.2 target and re-parse.
+        let written = write_tag(&parsed, Id3Version::V2_2).unwrap();
+        let (reparsed, _) = parse_tag(&written).unwrap();
+        assert_eq!(reparsed.frames.len(), 1);
+        match (&parsed.frames[0], &reparsed.frames[0]) {
+            (
+                Id3Frame::EncryptedMeta {
+                    owner: o1,
+                    content: c1,
+                    encrypted: e1,
+                },
+                Id3Frame::EncryptedMeta {
+                    owner: o2,
+                    content: c2,
+                    encrypted: e2,
+                },
+            ) => {
+                assert_eq!(o1, o2);
+                assert_eq!(c1, c2);
+                assert_eq!(e1, e2);
+                assert_eq!(o2, "owner@org.example");
+                assert_eq!(c2, "protected artwork");
+                assert_eq!(e2, b"\x01\x02\x00\xFF\x00data");
+            }
+            other => panic!("expected matching EncryptedMeta pair, got {other:?}"),
+        }
+    }
+
+    /// CRM is ID3v2.2-only: writing an `EncryptedMeta` frame under a
+    /// v2.3 or v2.4 target is rejected (no on-wire slot), mirroring the
+    /// RVAD-under-v2.4 rejection.
+    #[test]
+    fn crm_rejected_under_v23_v24() {
+        let frame = Id3Frame::EncryptedMeta {
+            owner: "x@y".to_string(),
+            content: "c".to_string(),
+            encrypted: vec![1, 2, 3],
+        };
+        assert!(encode_frame(Id3Version::V2_3, &frame).is_err());
+        assert!(encode_frame(Id3Version::V2_4, &frame).is_err());
+        // The v2.2 encoder accepts it.
+        let (id, payload) = encode_frame_v22_only(&frame);
+        assert_eq!(id, "CRM");
+        assert_eq!(payload, b"x@y\0c\0\x01\x02\x03");
+    }
+
+    /// Helper: exercise the v2.2 CRM serialiser directly.
+    fn encode_frame_v22_only(frame: &Id3Frame) -> (String, Vec<u8>) {
+        let mut buf = Vec::new();
+        write_v22_frame(frame, &mut buf).unwrap();
+        // buf = 3-char id + 3-byte size + payload
+        let id = String::from_utf8(buf[0..3].to_vec()).unwrap();
+        let payload = buf[6..].to_vec();
+        (id, payload)
     }
 
     /// v2.2 §3.1: a set compression bit (header flag bit 6) means the
