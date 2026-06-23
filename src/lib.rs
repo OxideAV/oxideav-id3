@@ -8712,6 +8712,283 @@ fn id3v1_genre_index(name: &str) -> Option<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// v2.3 <-> v2.4 frame-level conversion
+// ---------------------------------------------------------------------------
+
+/// Convert an [`Id3Tag`] between the ID3v2.3 and ID3v2.4 frame
+/// vocabularies, rewriting the handful of frames whose *identity* (not
+/// just their on-wire encoding) changed between the two versions.
+///
+/// `write_tag` already re-encodes a frame body for the target version —
+/// it switches text encodings, picks the right multi-value separator,
+/// emits the right frame-header layout. What it does **not** do is
+/// rename or restructure a frame whose entire *meaning* moved to a
+/// different frame id across the version boundary. The date frames are
+/// the canonical example: ID3v2.3 splits the recording date across the
+/// separate `TYER` / `TDAT` / `TIME` numeric-string frames (spec v2.3
+/// §4.2.1), while ID3v2.4 folds all three into a single `TDRC`
+/// "Recording time" ISO 8601 timestamp (spec v2.4 §4.2.5, format defined
+/// in the structure document). A v2.3 tag handed straight to
+/// `write_tag(_, V2_4)` would keep emitting `TYER`/`TDAT`/`TIME` ids — a
+/// conformant v2.4 reader does not recognise those. `convert_tag`
+/// bridges that gap.
+///
+/// The conversion is a pure re-encoding of spec-defined fields into
+/// other spec-defined fields; no frame is invented and nothing outside
+/// the staged ID3 spec informs the mapping. The frames it rewrites:
+///
+/// **v2.3 → v2.4**
+/// * `TYER` (year, `yyyy`) — optionally combined with `TDAT` (`DDMM`)
+///   and `TIME` (`HHMM`) — folds into one `TDRC` timestamp at the
+///   highest precision the source provides. A bare `TYER` yields a
+///   `yyyy` timestamp; adding `TDAT` extends to `yyyy-MM-dd`; adding
+///   `TIME` extends to `yyyy-MM-ddTHH:mm`. The day/month/time parts are
+///   only folded in when the year itself is a well-formed four-digit
+///   value, since the timestamp grammar is anchored on the year; a
+///   malformed `TYER` is preserved verbatim and the `TDAT`/`TIME`
+///   companions are dropped (they have no standalone v2.4 home).
+/// * `TORY` (original release year, formatted as `TYER`) → `TDOR`
+///   (original release time) at year precision.
+/// * `IPLS` (involved people list) → `TIPL` text frame carrying the
+///   same `(role, name)` pairs as alternating NUL-separated values.
+/// * `TRDA` (recording dates, a free-text complement to the numeric
+///   date frames) and `TSIZ` (audio size in bytes) have no v2.4
+///   successor — the spec dropped both — so they are removed.
+///
+/// **v2.4 → v2.3**
+/// * `TDRC` → `TYER` plus `TDAT`/`TIME` for whatever precision the
+///   timestamp carried (a year-only timestamp yields just `TYER`; a
+///   day-precision one adds `TDAT`; a minute-or-finer one adds `TIME`).
+/// * `TDOR` → `TORY` (year only — `TORY` cannot carry finer precision).
+/// * `TIPL` → `IPLS` carrying the same pairs.
+/// * `TDEN` / `TDRL` / `TDTG` (encoding / release / tagging time) and
+///   `TMCL` (musician credits) have no v2.3 successor and are removed.
+///
+/// Every other frame is carried through unchanged (the version-specific
+/// body re-encoding is `write_tag`'s job). Converting to the version a
+/// tag already declares returns a clone with `version` set to the
+/// target. A v2.2 or v1 source/target is rejected with
+/// [`Error::unsupported`]: this bridge is specifically the v2.3↔v2.4
+/// frame-vocabulary delta. (v2.2→v2.3 promotion already happens on
+/// parse, where three-char ids are lifted to their four-char
+/// descendants.)
+pub fn convert_tag(tag: &Id3Tag, target_version: Id3Version) -> Result<Id3Tag> {
+    match (tag.version, target_version) {
+        (Id3Version::V2_3, Id3Version::V2_4) => Ok(Id3Tag {
+            version: Id3Version::V2_4,
+            frames: convert_frames_v23_to_v24(&tag.frames),
+        }),
+        (Id3Version::V2_4, Id3Version::V2_3) => Ok(Id3Tag {
+            version: Id3Version::V2_3,
+            frames: convert_frames_v24_to_v23(&tag.frames),
+        }),
+        (Id3Version::V2_3, Id3Version::V2_3) | (Id3Version::V2_4, Id3Version::V2_4) => Ok(Id3Tag {
+            version: target_version,
+            frames: tag.frames.clone(),
+        }),
+        _ => Err(Error::unsupported(
+            "convert_tag bridges ID3v2.3 <-> ID3v2.4 only",
+        )),
+    }
+}
+
+/// Find the single value of a `T***` text frame by id, if present and
+/// non-empty. Returns the first value of the first matching frame.
+fn first_text_value<'a>(frames: &'a [Id3Frame], id: &str) -> Option<&'a str> {
+    frames.iter().find_map(|f| match f {
+        Id3Frame::Text { id: fid, values } if fid == id => values.first().map(|s| s.as_str()),
+        _ => None,
+    })
+}
+
+/// Build the `TDRC`/`TDOR` ISO 8601 timestamp string for the precision
+/// the components provide. `year` is mandatory; each finer field is
+/// appended only when the coarser ones are all present (the grammar
+/// never skips a level). `second` is included only when the source
+/// carried it. Two-digit zero padding throughout.
+fn format_timestamp(
+    year: u16,
+    month: Option<u8>,
+    day: Option<u8>,
+    hour: Option<u8>,
+    minute: Option<u8>,
+    second: Option<u8>,
+) -> String {
+    let mut out = format!("{year:04}");
+    if let Some(mo) = month {
+        out.push_str(&format!("-{mo:02}"));
+        if let Some(d) = day {
+            out.push_str(&format!("-{d:02}"));
+            if let Some(h) = hour {
+                out.push_str(&format!("T{h:02}"));
+                if let Some(mi) = minute {
+                    out.push_str(&format!(":{mi:02}"));
+                    if let Some(s) = second {
+                        out.push_str(&format!(":{s:02}"));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Rewrite a v2.3 frame list into the v2.4 vocabulary per the
+/// `convert_tag` mapping.
+fn convert_frames_v23_to_v24(frames: &[Id3Frame]) -> Vec<Id3Frame> {
+    // Pre-scan the date companions so the TYER fold can reach them.
+    let tdat = first_text_value(frames, "TDAT").map(DayMonth::from_field);
+    let time = first_text_value(frames, "TIME").map(HourMinute::from_field);
+
+    let mut out = Vec::with_capacity(frames.len());
+    for frame in frames {
+        match frame {
+            Id3Frame::Text { id, values } if id == "TYER" => {
+                // Fold TYER (+ TDAT + TIME) into a single TDRC timestamp.
+                match values.first().map(|v| Id3Year::from_field(v)) {
+                    Some(Id3Year::Year(year)) => {
+                        let (month, day) = match &tdat {
+                            Some(DayMonth::DayMonth { day, month }) => (Some(*month), Some(*day)),
+                            _ => (None, None),
+                        };
+                        // Time only applies when a date is present (the
+                        // timestamp grammar requires day precision before
+                        // a time component can appear).
+                        let (hour, minute) = match (&day, &time) {
+                            (Some(_), Some(HourMinute::HourMinute { hour, minute })) => {
+                                (Some(*hour), Some(*minute))
+                            }
+                            _ => (None, None),
+                        };
+                        let ts = format_timestamp(year, month, day, hour, minute, None);
+                        out.push(Id3Frame::Text {
+                            id: "TDRC".to_string(),
+                            values: vec![ts],
+                        });
+                    }
+                    // A malformed or absent year cannot anchor a
+                    // timestamp; preserve the raw TYER under its own id so
+                    // no data is silently dropped.
+                    _ => out.push(frame.clone()),
+                }
+            }
+            // TDAT / TIME were consumed into TDRC above when TYER was a
+            // valid year; otherwise they have no v2.4 home. Drop them
+            // here regardless — a standalone TDAT/TIME with no parseable
+            // TYER cannot form a valid timestamp.
+            Id3Frame::Text { id, .. } if id == "TDAT" || id == "TIME" => {}
+            Id3Frame::Text { id, values } if id == "TORY" => {
+                match values.first().map(|v| Id3Year::from_field(v)) {
+                    Some(Id3Year::Year(year)) => out.push(Id3Frame::Text {
+                        id: "TDOR".to_string(),
+                        values: vec![format!("{year:04}")],
+                    }),
+                    _ => out.push(frame.clone()),
+                }
+            }
+            // TRDA (free-text recording-dates complement) and TSIZ
+            // (audio size) were dropped in v2.4 with no successor frame.
+            Id3Frame::Text { id, .. } if id == "TRDA" || id == "TSIZ" => {}
+            Id3Frame::Ipls { pairs } => {
+                // IPLS -> TIPL: same (role, name) pairs as a text frame's
+                // alternating NUL-separated values.
+                out.push(Id3Frame::Text {
+                    id: "TIPL".to_string(),
+                    values: flatten_pairs(pairs),
+                });
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
+
+/// Rewrite a v2.4 frame list into the v2.3 vocabulary per the
+/// `convert_tag` mapping.
+fn convert_frames_v24_to_v23(frames: &[Id3Frame]) -> Vec<Id3Frame> {
+    let mut out = Vec::with_capacity(frames.len());
+    for frame in frames {
+        match frame {
+            Id3Frame::Text { id, values } if id == "TDRC" => {
+                // Split the TDRC timestamp back into TYER (+ TDAT + TIME).
+                match values.first().map(|v| Id3Timestamp::from_field(v)) {
+                    Some(Id3Timestamp::DateTime {
+                        year,
+                        month,
+                        day,
+                        hour,
+                        minute,
+                        ..
+                    }) => {
+                        out.push(Id3Frame::Text {
+                            id: "TYER".to_string(),
+                            values: vec![format!("{year:04}")],
+                        });
+                        if let (Some(mo), Some(d)) = (month, day) {
+                            out.push(Id3Frame::Text {
+                                id: "TDAT".to_string(),
+                                values: vec![format!("{d:02}{mo:02}")],
+                            });
+                        }
+                        if let (Some(h), Some(mi)) = (hour, minute) {
+                            out.push(Id3Frame::Text {
+                                id: "TIME".to_string(),
+                                values: vec![format!("{h:02}{mi:02}")],
+                            });
+                        }
+                    }
+                    // A malformed timestamp has no clean v2.3 split;
+                    // preserve the raw TDRC so no data is dropped.
+                    _ => out.push(frame.clone()),
+                }
+            }
+            Id3Frame::Text { id, values } if id == "TDOR" => {
+                match values.first().map(|v| Id3Timestamp::from_field(v)) {
+                    Some(Id3Timestamp::DateTime { year, .. }) => out.push(Id3Frame::Text {
+                        id: "TORY".to_string(),
+                        values: vec![format!("{year:04}")],
+                    }),
+                    _ => out.push(frame.clone()),
+                }
+            }
+            // Encoding / release / tagging time and musician credits have
+            // no v2.3 successor frame.
+            Id3Frame::Text { id, .. }
+                if id == "TDEN" || id == "TDRL" || id == "TDTG" || id == "TMCL" => {}
+            Id3Frame::Text { id, values } if id == "TIPL" => {
+                // TIPL -> IPLS: same (role, name) pairs.
+                out.push(Id3Frame::Ipls {
+                    pairs: pair_alternating(values),
+                });
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
+
+/// Flatten `(a, b)` pairs into the alternating `[a0, b0, a1, b1, ...]`
+/// value list a `TIPL`/`TMCL` text frame stores. The inverse of
+/// [`pair_alternating`].
+fn flatten_pairs(pairs: &[(String, String)]) -> Vec<String> {
+    let mut out = Vec::with_capacity(pairs.len() * 2);
+    for (a, b) in pairs {
+        out.push(a.clone());
+        out.push(b.clone());
+    }
+    out
+}
+
+impl Id3Tag {
+    /// Ergonomic wrapper over [`convert_tag`]: returns a copy of this tag
+    /// rewritten into the `target_version` frame vocabulary. See
+    /// [`convert_tag`] for the exact frame mapping and version support.
+    pub fn to_version(&self, target_version: Id3Version) -> Result<Id3Tag> {
+        convert_tag(self, target_version)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -13770,5 +14047,342 @@ mod tests {
                 second: Some(9),
             }])
         );
+    }
+
+    // ------------------------------------------------------------------
+    // v2.3 <-> v2.4 conversion (convert_tag / Id3Tag::to_version)
+    // ------------------------------------------------------------------
+
+    fn text(id: &str, value: &str) -> Id3Frame {
+        Id3Frame::Text {
+            id: id.to_string(),
+            values: vec![value.to_string()],
+        }
+    }
+
+    fn find_text<'a>(tag: &'a Id3Tag, id: &str) -> Option<&'a Vec<String>> {
+        tag.frames.iter().find_map(|f| match f {
+            Id3Frame::Text { id: fid, values } if fid == id => Some(values),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn convert_v23_tyer_tdat_time_folds_into_tdrc() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![
+                text("TIT2", "Song"),
+                text("TYER", "2024"),
+                text("TDAT", "1806"), // 18 June (DDMM)
+                text("TIME", "1345"), // 13:45 (HHMM)
+            ],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_4).unwrap();
+        assert_eq!(out.version, Id3Version::V2_4);
+        // TYER/TDAT/TIME collapse to a single TDRC; none of the v2.3 ids
+        // survive.
+        assert!(find_text(&out, "TYER").is_none());
+        assert!(find_text(&out, "TDAT").is_none());
+        assert!(find_text(&out, "TIME").is_none());
+        assert_eq!(
+            find_text(&out, "TDRC"),
+            Some(&vec!["2024-06-18T13:45".to_string()])
+        );
+        // Untouched frames survive.
+        assert_eq!(find_text(&out, "TIT2"), Some(&vec!["Song".to_string()]));
+    }
+
+    #[test]
+    fn convert_v23_bare_tyer_yields_year_only_tdrc() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![text("TYER", "1999")],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_4).unwrap();
+        assert_eq!(find_text(&out, "TDRC"), Some(&vec!["1999".to_string()]));
+    }
+
+    #[test]
+    fn convert_v23_tyer_with_date_no_time() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![text("TYER", "2001"), text("TDAT", "0203")],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_4).unwrap();
+        assert_eq!(
+            find_text(&out, "TDRC"),
+            Some(&vec!["2001-03-02".to_string()])
+        );
+    }
+
+    #[test]
+    fn convert_v23_time_without_date_is_dropped() {
+        // A TIME with no TDAT cannot extend a year-only timestamp (the
+        // grammar needs day precision first); the time is dropped.
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![text("TYER", "2002"), text("TIME", "0930")],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_4).unwrap();
+        assert_eq!(find_text(&out, "TDRC"), Some(&vec!["2002".to_string()]));
+        assert!(find_text(&out, "TIME").is_none());
+    }
+
+    #[test]
+    fn convert_v23_malformed_tyer_preserved_companions_dropped() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![text("TYER", "20xx"), text("TDAT", "0102")],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_4).unwrap();
+        // Malformed year can't anchor a timestamp: TYER survives verbatim,
+        // its orphaned date companion is dropped (no standalone v2.4 home).
+        assert_eq!(find_text(&out, "TYER"), Some(&vec!["20xx".to_string()]));
+        assert!(find_text(&out, "TDRC").is_none());
+        assert!(find_text(&out, "TDAT").is_none());
+    }
+
+    #[test]
+    fn convert_v23_tory_to_tdor() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![text("TORY", "1985")],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_4).unwrap();
+        assert!(find_text(&out, "TORY").is_none());
+        assert_eq!(find_text(&out, "TDOR"), Some(&vec!["1985".to_string()]));
+    }
+
+    #[test]
+    fn convert_v23_trda_and_tsiz_dropped() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![
+                text("TRDA", "4th-7th June"),
+                text("TSIZ", "1048576"),
+                text("TIT2", "keep"),
+            ],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_4).unwrap();
+        assert!(find_text(&out, "TRDA").is_none());
+        assert!(find_text(&out, "TSIZ").is_none());
+        assert_eq!(find_text(&out, "TIT2"), Some(&vec!["keep".to_string()]));
+    }
+
+    #[test]
+    fn convert_v23_ipls_to_tipl() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![Id3Frame::Ipls {
+                pairs: vec![
+                    ("producer".to_string(), "Alice".to_string()),
+                    ("engineer".to_string(), "Bob".to_string()),
+                ],
+            }],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_4).unwrap();
+        assert!(!out
+            .frames
+            .iter()
+            .any(|f| matches!(f, Id3Frame::Ipls { .. })));
+        let tipl = out
+            .frames
+            .iter()
+            .find(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TIPL"))
+            .unwrap();
+        // Round-trips through the typed accessor as the same pairs.
+        assert_eq!(
+            tipl.involved_people(),
+            Some(vec![
+                ("producer".to_string(), "Alice".to_string()),
+                ("engineer".to_string(), "Bob".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn convert_v24_tdrc_splits_to_tyer_tdat_time() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![text("TDRC", "2024-06-18T13:45")],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_3).unwrap();
+        assert_eq!(out.version, Id3Version::V2_3);
+        assert_eq!(find_text(&out, "TYER"), Some(&vec!["2024".to_string()]));
+        assert_eq!(find_text(&out, "TDAT"), Some(&vec!["1806".to_string()]));
+        assert_eq!(find_text(&out, "TIME"), Some(&vec!["1345".to_string()]));
+        assert!(find_text(&out, "TDRC").is_none());
+    }
+
+    #[test]
+    fn convert_v24_year_only_tdrc_yields_only_tyer() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![text("TDRC", "1999")],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_3).unwrap();
+        assert_eq!(find_text(&out, "TYER"), Some(&vec!["1999".to_string()]));
+        assert!(find_text(&out, "TDAT").is_none());
+        assert!(find_text(&out, "TIME").is_none());
+    }
+
+    #[test]
+    fn convert_v24_date_precision_tdrc_no_time() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![text("TDRC", "2001-03-02")],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_3).unwrap();
+        assert_eq!(find_text(&out, "TYER"), Some(&vec!["2001".to_string()]));
+        assert_eq!(find_text(&out, "TDAT"), Some(&vec!["0203".to_string()]));
+        assert!(find_text(&out, "TIME").is_none());
+    }
+
+    #[test]
+    fn convert_v24_tdor_to_tory() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![text("TDOR", "1985-12")],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_3).unwrap();
+        // TORY is year-only; the month is discarded.
+        assert_eq!(find_text(&out, "TORY"), Some(&vec!["1985".to_string()]));
+        assert!(find_text(&out, "TDOR").is_none());
+    }
+
+    #[test]
+    fn convert_v24_drops_tden_tdrl_tdtg_tmcl() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![
+                text("TDEN", "2024"),
+                text("TDRL", "2024"),
+                text("TDTG", "2024"),
+                Id3Frame::Text {
+                    id: "TMCL".to_string(),
+                    values: vec!["Guitar".to_string(), "Jimi".to_string()],
+                },
+                text("TIT2", "keep"),
+            ],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_3).unwrap();
+        for id in ["TDEN", "TDRL", "TDTG", "TMCL"] {
+            assert!(find_text(&out, id).is_none(), "{id} should be dropped");
+        }
+        assert_eq!(find_text(&out, "TIT2"), Some(&vec!["keep".to_string()]));
+    }
+
+    #[test]
+    fn convert_v24_tipl_to_ipls() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TIPL".to_string(),
+                values: vec![
+                    "producer".to_string(),
+                    "Alice".to_string(),
+                    "engineer".to_string(),
+                    "Bob".to_string(),
+                ],
+            }],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_3).unwrap();
+        let ipls = out
+            .frames
+            .iter()
+            .find(|f| matches!(f, Id3Frame::Ipls { .. }))
+            .unwrap();
+        match ipls {
+            Id3Frame::Ipls { pairs } => assert_eq!(
+                pairs,
+                &vec![
+                    ("producer".to_string(), "Alice".to_string()),
+                    ("engineer".to_string(), "Bob".to_string()),
+                ]
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn convert_roundtrip_v23_to_v24_to_v23_is_stable() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![
+                text("TIT2", "Song"),
+                text("TYER", "2024"),
+                text("TDAT", "1806"),
+                text("TIME", "1345"),
+                text("TORY", "1985"),
+            ],
+        };
+        let v24 = convert_tag(&tag, Id3Version::V2_4).unwrap();
+        let back = convert_tag(&v24, Id3Version::V2_3).unwrap();
+        assert_eq!(find_text(&back, "TYER"), Some(&vec!["2024".to_string()]));
+        assert_eq!(find_text(&back, "TDAT"), Some(&vec!["1806".to_string()]));
+        assert_eq!(find_text(&back, "TIME"), Some(&vec!["1345".to_string()]));
+        assert_eq!(find_text(&back, "TORY"), Some(&vec!["1985".to_string()]));
+        assert_eq!(find_text(&back, "TIT2"), Some(&vec!["Song".to_string()]));
+    }
+
+    #[test]
+    fn convert_same_version_is_clone_with_version_set() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![text("TYER", "2024"), text("TIT2", "Song")],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_3).unwrap();
+        assert_eq!(out.version, Id3Version::V2_3);
+        // No folding happens when source == target.
+        assert_eq!(find_text(&out, "TYER"), Some(&vec!["2024".to_string()]));
+        assert!(find_text(&out, "TDRC").is_none());
+    }
+
+    #[test]
+    fn convert_to_version_method_matches_free_fn() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![text("TYER", "2024")],
+        };
+        let via_method = tag.to_version(Id3Version::V2_4).unwrap();
+        let via_fn = convert_tag(&tag, Id3Version::V2_4).unwrap();
+        assert_eq!(find_text(&via_method, "TDRC"), find_text(&via_fn, "TDRC"));
+    }
+
+    #[test]
+    fn convert_rejects_v22_and_v1() {
+        let v22 = Id3Tag {
+            version: Id3Version::V2_2,
+            frames: vec![],
+        };
+        assert!(convert_tag(&v22, Id3Version::V2_4).is_err());
+        let v24 = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![],
+        };
+        assert!(convert_tag(&v24, Id3Version::V2_2).is_err());
+        assert!(convert_tag(&v24, Id3Version::V1).is_err());
+    }
+
+    #[test]
+    fn convert_then_write_emits_v24_ids() {
+        // End-to-end: convert a v2.3 tag, write it as v2.4, re-parse, and
+        // confirm the date landed as TDRC on the wire.
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![text("TYER", "2024"), text("TDAT", "1806")],
+        };
+        let v24 = convert_tag(&tag, Id3Version::V2_4).unwrap();
+        let bytes = write_tag(&v24, Id3Version::V2_4).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        assert!(parsed
+            .frames
+            .iter()
+            .any(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TDRC")));
+        assert!(!parsed
+            .frames
+            .iter()
+            .any(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TYER")));
     }
 }

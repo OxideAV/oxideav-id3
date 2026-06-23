@@ -302,6 +302,58 @@ that v2.4 folded into `TDRC` or removed. Unknown `T???` frames
 still fall through to the lowercased frame id so a Vorbis consumer
 never silently drops data.
 
+## ID3v2.3 ↔ ID3v2.4 frame conversion
+
+`write_tag` already re-encodes a frame *body* for the target version —
+text encoding, multi-value separator, frame-header layout. It does not
+rename or restructure the handful of frames whose entire *meaning* moved
+to a different frame id between v2.3 and v2.4. `convert_tag` (and the
+ergonomic `Id3Tag::to_version`) bridges that delta:
+
+```rust
+use oxideav_id3::{convert_tag, Id3Frame, Id3Tag, Id3Version};
+
+let v23 = Id3Tag {
+    version: Id3Version::V2_3,
+    frames: vec![
+        Id3Frame::Text { id: "TYER".into(), values: vec!["2024".into()] },
+        Id3Frame::Text { id: "TDAT".into(), values: vec!["1806".into()] }, // DDMM
+        Id3Frame::Text { id: "TIME".into(), values: vec!["1345".into()] }, // HHMM
+    ],
+};
+// TYER + TDAT + TIME fold into one TDRC ISO-8601 timestamp.
+let v24 = convert_tag(&v23, Id3Version::V2_4)?;       // or v23.to_version(...)
+assert!(v24.frames.iter().any(|f|
+    matches!(f, Id3Frame::Text { id, values } if id == "TDRC" && values[0] == "2024-06-18T13:45")));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The mapping (a pure re-encoding of spec-defined fields into other
+spec-defined fields):
+
+| Direction      | Source (spec)                          | Target (spec)                  |
+| -------------- | -------------------------------------- | ------------------------------ |
+| v2.3 → v2.4    | `TYER`(+`TDAT`+`TIME`) v2.3 §4.2.1      | `TDRC` v2.4 §4.2.5 timestamp   |
+| v2.3 → v2.4    | `TORY` v2.3 §4.2.1                      | `TDOR` (year) v2.4 §4.2.5      |
+| v2.3 → v2.4    | `IPLS` v2.3 §4.4                        | `TIPL` text frame v2.4 §4.2.2  |
+| v2.3 → v2.4    | `TRDA`, `TSIZ` v2.3 §4.2.1              | *(dropped — no v2.4 successor)*|
+| v2.4 → v2.3    | `TDRC` v2.4 §4.2.5                      | `TYER`(+`TDAT`+`TIME`) v2.3    |
+| v2.4 → v2.3    | `TDOR` v2.4 §4.2.5                      | `TORY` (year) v2.3 §4.2.1      |
+| v2.4 → v2.3    | `TIPL` v2.4 §4.2.2                      | `IPLS` v2.3 §4.4               |
+| v2.4 → v2.3    | `TDEN`, `TDRL`, `TDTG`, `TMCL`          | *(dropped — no v2.3 successor)*|
+
+The timestamp fold/split honours precision: a bare `TYER` yields a
+`yyyy` `TDRC` and back; adding `TDAT` extends to `yyyy-MM-dd`; adding
+`TIME` (only meaningful once a date is present) extends to
+`yyyy-MM-ddTHH:mm`. A malformed year or timestamp that cannot anchor the
+target form is preserved verbatim under its source id rather than
+dropped, so the conversion never silently loses data. Every other frame
+carries through unchanged. Converting to the version a tag already
+declares returns a clone with `version` set; a v2.2 or v1 source/target
+is rejected with `Error::unsupported` (v2.2 → v2.3 promotion already
+happens on parse, where three-char ids are lifted to their four-char
+descendants).
+
 ## What is supported
 
 - **ID3v1 / ID3v1.1** — parse + write 128-byte trailers, Winamp's

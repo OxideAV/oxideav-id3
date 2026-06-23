@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `convert_tag(&tag, target_version)` (plus the ergonomic
+  `Id3Tag::to_version`) bridges the ID3v2.3 ↔ ID3v2.4 frame-vocabulary
+  delta — the frames whose *identity* (not just their on-wire encoding,
+  which `write_tag` already handles) moved across the version boundary.
+  v2.3 → v2.4: `TYER` (+ optional `TDAT` `DDMM` / `TIME` `HHMM`) folds
+  into one `TDRC` ISO 8601 timestamp at the highest precision the source
+  provides (spec v2.3 §4.2.1 numeric date frames → spec v2.4 §4.2.5
+  timestamp); `TORY` → `TDOR`; `IPLS` → the `TIPL` text frame; the
+  successor-less `TRDA` and `TSIZ` are dropped. v2.4 → v2.3 reverses it:
+  `TDRC` splits back to `TYER` (+ `TDAT` / `TIME` for whatever precision
+  it carried); `TDOR` → `TORY` (year only); `TIPL` → `IPLS`; the
+  successor-less `TDEN` / `TDRL` / `TDTG` / `TMCL` are dropped. A
+  malformed year/timestamp that cannot anchor the target form is
+  preserved verbatim under its source id so no data is silently lost.
+  Every other frame carries through unchanged. Converting to the version
+  a tag already declares returns a clone with `version` set; a v2.2 or
+  v1 source/target is rejected with `Error::unsupported`. The mapping is
+  a pure re-encoding of spec-defined fields into other spec-defined
+  fields. 24 new tests cover both directions, each precision level, the
+  malformed-preservation paths, the round-trip stability, and an
+  end-to-end `convert_tag → write_tag → parse_tag` that confirms `TDRC`
+  lands on the wire.
 - Typed accessors for the four v2.3-only date/time/size split frames that
   v2.4 folded into the `TDRC` timestamp: `Id3Frame::year()` (`TYER`,
   four-digit year → `Id3Year`), `Id3Frame::date_ddmm()` (`TDAT`, `DDMM`
