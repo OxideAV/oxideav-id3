@@ -6796,9 +6796,11 @@ fn push_unique(out: &mut Vec<(String, String)>, key: String, value: String) {
     }
 }
 
-/// Lookup table for ID3v1's genre byte. Covers Winamp's extended
-/// ID3v1.1 set (0..191). Indexes beyond the table (or the sentinel
-/// 0xFF = "no genre") return None.
+/// Lookup table for ID3v1's genre byte. Covers the original
+/// ISO-8859-1 genre set plus Winamp's `0..=147` extension (indices
+/// `0..=79` original, `80..=147` Winamp). Indices `148..=254` are
+/// outside the table and return None, as does the `0xFF` "no genre"
+/// sentinel.
 fn id3v1_genre(b: u8) -> Option<&'static str> {
     const GENRES: &[&str] = &[
         "Blues",
@@ -14555,6 +14557,17 @@ mod tests {
             }
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    /// The ID3v1 genre table spans exactly `0..=147` (original set plus
+    /// Winamp's extension); index 148 and the `0xFF` "no genre"
+    /// sentinel both fall outside it.
+    #[test]
+    fn id3v1_genre_table_bounds() {
+        assert_eq!(id3v1_genre(0), Some("Blues"));
+        assert_eq!(id3v1_genre(147), Some("Synthpop"));
+        assert_eq!(id3v1_genre(148), None);
+        assert_eq!(id3v1_genre(0xFF), None);
     }
 
     /// `to_key_value_pairs` surfaces a multi-value text frame as one
