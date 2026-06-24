@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `to_key_value_pairs` now surfaces a multi-value text frame as one
+  `(key, value)` pair per value under the shared key, instead of
+  collapsing the value list into a single slash-joined string. This
+  matches the Vorbis-comment model the flat view targets (multiple
+  values for one key are distinct entries) and composes with the
+  multi-value-split fix below. Exact-duplicate values still collapse
+  (the existing `(key, value)` dedup) and empty values are skipped.
+
 ### Fixed
 
 - Multi-value text frames now split at the encoding-appropriate NUL

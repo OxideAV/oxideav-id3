@@ -4155,10 +4155,17 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
     for f in &tag.frames {
         match f {
             Id3Frame::Text { id, values } => {
+                // A v2.4 text frame may carry a NUL-separated list of
+                // strings (spec §4.2). Vorbis comments model multiple
+                // values for one key as separate entries, which is the
+                // convention this flat view targets, so emit one pair
+                // per non-empty value under the shared key rather than
+                // collapsing them into a single slash-joined string.
                 let key = text_frame_to_key(id);
-                let value = values.join("/");
-                if !value.is_empty() {
-                    push_unique(&mut out, key, value);
+                for value in values {
+                    if !value.is_empty() {
+                        push_unique(&mut out, key.clone(), value.clone());
+                    }
                 }
             }
             Id3Frame::Comment {
@@ -14548,6 +14555,35 @@ mod tests {
             }
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    /// `to_key_value_pairs` surfaces a multi-value text frame as one
+    /// pair per value under the shared key (Vorbis-comment semantics),
+    /// not a single slash-joined value, and dedups exact duplicates.
+    #[test]
+    fn to_key_value_pairs_multi_value_text_one_pair_each() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TPE1".to_string(),
+                values: vec![
+                    "Artist A".to_string(),
+                    "Artist B".to_string(),
+                    "Artist A".to_string(), // duplicate collapses
+                    String::new(),          // empty is skipped
+                ],
+            }],
+        };
+        let pairs = to_key_value_pairs(&tag);
+        let artists: Vec<&String> = pairs
+            .iter()
+            .filter(|(k, _)| k == "artist")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            artists,
+            vec![&"Artist A".to_string(), &"Artist B".to_string()]
+        );
     }
 
     /// Round-trip a multi-value v2.4 UTF-8 text frame through the
