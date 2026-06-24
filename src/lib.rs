@@ -14559,6 +14559,24 @@ mod tests {
         }
     }
 
+    /// `split_text_values` must not panic on malformed inputs: an
+    /// odd-length UTF-16 body, an all-NUL body, and an empty body.
+    #[test]
+    fn split_text_values_edge_cases_dont_panic() {
+        // Odd-length UTF-16 body (3 bytes): the trailing byte cannot
+        // form a unit; the call returns, surfacing the decodable part.
+        let v = split_text_values(1, &[0xFF, 0xFE, 0x41]);
+        assert!(v.iter().all(|s| !s.starts_with('\u{FEFF}')));
+        // All-NUL UTF-16 body yields no values.
+        assert!(split_text_values(2, &[0x00, 0x00, 0x00, 0x00]).is_empty());
+        // All-NUL Latin-1 body yields no values.
+        assert!(split_text_values(0, &[0x00, 0x00]).is_empty());
+        // Empty body, every encoding, yields no values.
+        for enc in 0u8..=3 {
+            assert!(split_text_values(enc, &[]).is_empty());
+        }
+    }
+
     /// The ID3v1 genre table spans exactly `0..=147` (original set plus
     /// Winamp's extension); index 148 and the `0xFF` "no genre"
     /// sentinel both fall outside it.
