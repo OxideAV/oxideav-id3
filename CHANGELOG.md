@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Multi-value text frames now split at the encoding-appropriate NUL
+  terminator at the byte level and decode each string on its own,
+  instead of decoding the whole concatenation and splitting the
+  resulting `String` on `'\u{0}'`. For the UTF-16-with-BOM encoding
+  (`$01`) this is the structure-spec requirement that each string in a
+  frame carries its own BOM ("All strings in the same frame SHALL have
+  the same byteorder"): previously the second and later values of a
+  multi-string UTF-16 frame retained a literal leading U+FEFF (ZERO
+  WIDTH NO-BREAK SPACE) because only the first BOM was stripped. The
+  separator is a single `$00` for ISO-8859-1 / UTF-8 and an
+  even-aligned `$00 00` for UTF-16 / UTF-16BE, matching the frames-spec
+  §4.2 "null is represented by the termination code for the character
+  encoding". Empty segments (leading / trailing / doubled separator,
+  including a NUL-padded single value) are dropped so they no longer
+  surface as spurious empty values. 6 new tests cover UTF-8, ISO-8859-1
+  trailing-NUL, per-string-BOM UTF-16, UTF-16BE multi-value, UTF-16BE
+  single-value-with-terminator, and a v2.4 multi-value round-trip.
+
 ### Added
 
 - `convert_tag(&tag, target_version)` (plus the ergonomic

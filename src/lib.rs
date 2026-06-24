@@ -5136,15 +5136,15 @@ fn parse_text_frame(id: &str, payload: &[u8]) -> Id3Frame {
         };
     }
     let enc = payload[0];
-    let text = decode_text(enc, &payload[1..]);
-    // v2.4 splits multi-value text frames on NUL; v2.2/v2.3 use '/'.
-    // We split on NUL unconditionally; v2.2/v2.3 frames almost never
-    // have embedded NULs in practice so this is safe.
-    let values: Vec<String> = text
-        .split('\u{0}')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
+    // v2.4 §4.2: multi-value text frames are a NUL-separated list,
+    // where "null is represented by the termination code for the
+    // character encoding" — one byte for ISO-8859-1/UTF-8, two
+    // even-aligned bytes for UTF-16/UTF-16BE. Split at the byte level
+    // and decode each segment on its own so a per-string UTF-16 BOM is
+    // stripped from every value rather than only the first. v2.2/v2.3
+    // single-value frames have no embedded NULs so the split is a
+    // no-op for them.
+    let values = split_text_values(enc, &payload[1..]);
     Id3Frame::Text {
         id: id.to_string(),
         values,
@@ -6565,6 +6565,64 @@ fn split_once_nul(enc: u8, buf: &[u8]) -> (String, &[u8]) {
     } else {
         (decode_text(enc, buf), &[])
     }
+}
+
+/// Split a text-frame body into its constituent strings at the
+/// encoding-appropriate NUL terminator, decoding each segment on its
+/// own. The frames spec (§4.2: "multiple strings, stored as a null
+/// separated list, where null is represented by the termination code
+/// for the character encoding") makes the separator one byte for
+/// ISO-8859-1 (`$00`) and UTF-8 (`$00`) and two even-aligned bytes for
+/// UTF-16 (`$00 00`) / UTF-16BE.
+///
+/// Decoding each segment individually (rather than decoding the whole
+/// concatenation and splitting the resulting `String` on `'\u{0}'`)
+/// matters for the BOM form (`$01`): the structure spec states each
+/// string in a UTF-16 frame carries its own BOM ("All strings in the
+/// same frame SHALL have the same byteorder"), so the second and later
+/// strings each begin with `$FF $FE` / `$FE $FF`. Decoding the
+/// concatenation as one stream would leave every BOM after the first
+/// as a literal U+FEFF (ZERO WIDTH NO-BREAK SPACE) glued to the front
+/// of that value; per-segment decode strips each one through
+/// [`decode_utf16_bom`].
+///
+/// Empty segments (a leading, trailing, or doubled separator) are
+/// dropped so a NUL-padded single value does not surface as a spurious
+/// empty string.
+fn split_text_values(enc: u8, body: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    if enc == 1 || enc == 2 {
+        // UTF-16 family: separator is an even-aligned `$00 00`.
+        let mut start = 0usize;
+        let mut i = 0usize;
+        while i + 1 < body.len() {
+            if body[i] == 0 && body[i + 1] == 0 {
+                if i > start {
+                    out.push(decode_text(enc, &body[start..i]));
+                }
+                i += 2;
+                start = i;
+            } else {
+                i += 2;
+            }
+        }
+        if start < body.len() {
+            let seg = &body[start..];
+            // A trailing odd byte cannot be part of a UTF-16 unit; the
+            // decoder ignores it. Skip an all-NUL tail.
+            if seg.iter().any(|&b| b != 0) {
+                out.push(decode_text(enc, seg));
+            }
+        }
+    } else {
+        // ISO-8859-1 / UTF-8: separator is a single `$00`.
+        for seg in body.split(|&b| b == 0) {
+            if !seg.is_empty() {
+                out.push(decode_text(enc, seg));
+            }
+        }
+    }
+    out
 }
 
 /// Raw-bytes variant of [`split_once_nul`] that doesn't interpret the
@@ -14384,5 +14442,141 @@ mod tests {
             .frames
             .iter()
             .any(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TYER")));
+    }
+
+    // ---- multi-value text-frame splitting (v2.4 §4.2) ----
+
+    /// A UTF-8 (`$03`) text frame carrying two NUL-separated strings
+    /// surfaces as two `values`, with no spurious empty entries.
+    #[test]
+    fn text_frame_utf8_multi_value_split() {
+        let mut payload = vec![3u8];
+        payload.extend_from_slice("Alpha".as_bytes());
+        payload.push(0);
+        payload.extend_from_slice("Beta".as_bytes());
+        let f = parse_text_frame("TPE1", &payload);
+        match f {
+            Id3Frame::Text { values, .. } => {
+                assert_eq!(values, vec!["Alpha".to_string(), "Beta".to_string()]);
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// ISO-8859-1 (`$00`) with a trailing NUL pad must not produce an
+    /// empty second value.
+    #[test]
+    fn text_frame_latin1_trailing_nul_not_a_value() {
+        let mut payload = vec![0u8];
+        payload.extend_from_slice(b"Solo");
+        payload.push(0);
+        let f = parse_text_frame("TIT2", &payload);
+        match f {
+            Id3Frame::Text { values, .. } => {
+                assert_eq!(values, vec!["Solo".to_string()]);
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// UTF-16-with-BOM (`$01`) multi-value frame: per the structure
+    /// spec each string carries its own BOM ("All strings in the same
+    /// frame SHALL have the same byteorder"). Both BOMs must be
+    /// stripped — the second value must NOT begin with a literal
+    /// U+FEFF.
+    #[test]
+    fn text_frame_utf16_bom_multi_value_strips_each_bom() {
+        fn utf16le_with_bom(s: &str) -> Vec<u8> {
+            let mut v = vec![0xFF, 0xFE];
+            for u in s.encode_utf16() {
+                v.extend_from_slice(&u.to_le_bytes());
+            }
+            v
+        }
+        let mut payload = vec![1u8]; // enc = UTF-16 with BOM
+        payload.extend_from_slice(&utf16le_with_bom("First"));
+        payload.extend_from_slice(&[0x00, 0x00]); // $00 00 separator
+        payload.extend_from_slice(&utf16le_with_bom("Second"));
+        let f = parse_text_frame("TCON", &payload);
+        match f {
+            Id3Frame::Text { values, .. } => {
+                assert_eq!(values, vec!["First".to_string(), "Second".to_string()]);
+                // Belt-and-braces: no value retains a leading ZWNBSP.
+                assert!(values.iter().all(|v| !v.starts_with('\u{FEFF}')));
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// UTF-16BE (`$02`, no BOM) multi-value splits on the even-aligned
+    /// `$00 00` terminator and decodes each big-endian segment.
+    #[test]
+    fn text_frame_utf16be_multi_value_split() {
+        fn utf16be(s: &str) -> Vec<u8> {
+            let mut v = Vec::new();
+            for u in s.encode_utf16() {
+                v.extend_from_slice(&u.to_be_bytes());
+            }
+            v
+        }
+        let mut payload = vec![2u8]; // enc = UTF-16BE
+        payload.extend_from_slice(&utf16be("Eins"));
+        payload.extend_from_slice(&[0x00, 0x00]);
+        payload.extend_from_slice(&utf16be("Zwei"));
+        let f = parse_text_frame("TPE1", &payload);
+        match f {
+            Id3Frame::Text { values, .. } => {
+                assert_eq!(values, vec!["Eins".to_string(), "Zwei".to_string()]);
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// A single-value UTF-16BE frame whose payload ends on the
+    /// `$00 00` terminator must not surface a trailing empty value.
+    #[test]
+    fn text_frame_utf16be_single_value_with_terminator() {
+        let mut payload = vec![2u8];
+        for u in "Title".encode_utf16() {
+            payload.extend_from_slice(&u.to_be_bytes());
+        }
+        payload.extend_from_slice(&[0x00, 0x00]);
+        let f = parse_text_frame("TIT2", &payload);
+        match f {
+            Id3Frame::Text { values, .. } => {
+                assert_eq!(values, vec!["Title".to_string()]);
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// Round-trip a multi-value v2.4 UTF-8 text frame through the
+    /// writer and parser: the writer joins on `$00` and the parser
+    /// re-splits, so the value list is preserved exactly.
+    #[test]
+    fn text_frame_v24_multi_value_round_trip() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TPE1".to_string(),
+                values: vec!["One".to_string(), "Two".to_string(), "Three".to_string()],
+            }],
+        };
+        let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        let f = parsed
+            .frames
+            .iter()
+            .find(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TPE1"))
+            .unwrap();
+        match f {
+            Id3Frame::Text { values, .. } => {
+                assert_eq!(
+                    values,
+                    &vec!["One".to_string(), "Two".to_string(), "Three".to_string()]
+                );
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
     }
 }
