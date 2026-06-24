@@ -302,6 +302,21 @@ that v2.4 folded into `TDRC` or removed. Unknown `T???` frames
 still fall through to the lowercased frame id so a Vorbis consumer
 never silently drops data.
 
+A v2.4 text frame may carry a NUL-separated list of strings
+(spec §4.2: "multiple strings, stored as a null separated list,
+where null is represented by the termination code for the character
+encoding"). Each value surfaces as its own `(key, value)` pair under
+the shared key, mirroring how Vorbis comments represent repeated keys
+— so a two-artist `TPE1` yields two `artist` entries rather than one
+slash-joined string. The parser splits the list at the byte level
+(single `$00` for ISO-8859-1 / UTF-8, even-aligned `$00 00` for
+UTF-16 / UTF-16BE) and decodes each segment on its own, so the
+per-string byte-order mark a UTF-16 frame carries on every value
+(structure spec: "All strings in the same frame SHALL have the same
+byteorder") is stripped from each one rather than left as a literal
+U+FEFF on the second and later values. Exact-duplicate and empty
+values are dropped.
+
 ## ID3v2.3 ↔ ID3v2.4 frame conversion
 
 `write_tag` already re-encodes a frame *body* for the target version —
