@@ -317,13 +317,14 @@ byteorder") is stripped from each one rather than left as a literal
 U+FEFF on the second and later values. Exact-duplicate and empty
 values are dropped.
 
-## ID3v2.3 ↔ ID3v2.4 frame conversion
+## ID3v2.2 ↔ ID3v2.3 ↔ ID3v2.4 frame conversion
 
 `write_tag` already re-encodes a frame *body* for the target version —
 text encoding, multi-value separator, frame-header layout. It does not
 rename or restructure the handful of frames whose entire *meaning* moved
-to a different frame id between v2.3 and v2.4. `convert_tag` (and the
-ergonomic `Id3Tag::to_version`) bridges that delta:
+to a different frame id between versions. `convert_tag` (and the
+ergonomic `Id3Tag::to_version`) bridges that delta across the full
+v2.2 / v2.3 / v2.4 matrix:
 
 ```rust
 use oxideav_id3::{convert_tag, Id3Frame, Id3Tag, Id3Version};
@@ -364,10 +365,24 @@ The timestamp fold/split honours precision: a bare `TYER` yields a
 target form is preserved verbatim under its source id rather than
 dropped, so the conversion never silently loses data. Every other frame
 carries through unchanged. Converting to the version a tag already
-declares returns a clone with `version` set; a v2.2 or v1 source/target
-is rejected with `Error::unsupported` (v2.2 → v2.3 promotion already
-happens on parse, where three-char ids are lifted to their four-char
-descendants).
+declares returns a clone with `version` set.
+
+**ID3v2.2 as an endpoint.** A parsed v2.2 tag already stores its frames
+under the promoted four-char v2.3 ids (`TT2 → TIT2`, `PIC → APIC`, …), so
+v2.2 is handled as v2.3-with-a-narrower-frame-set:
+
+| Direction      | Behaviour                                                         |
+| -------------- | ---------------------------------------------------------------- |
+| v2.2 → v2.3    | relabel only (ids are already in v2.3 form)                       |
+| v2.2 → v2.4    | run the v2.3 → v2.4 date/`IPLS` fold                              |
+| v2.3 → v2.2    | drop every frame absent from the ID3v2.2 §4 set                  |
+| v2.4 → v2.2    | split `TDRC` back to `TYER`/`TDAT`/`TIME`, then drop non-v2.2     |
+
+The down-conversion drop set is exactly the one the v2.2 *writer*
+honours (`demote_to_v22` plus the `PIC`/`CRM` special cases), so
+`convert_tag(_, V2_2)` and `write_tag(_, V2_2)` agree byte-for-byte on
+which frames survive. Only ID3v1 — which has no frame vocabulary — is
+rejected with `Error::unsupported`.
 
 ## What is supported
 
