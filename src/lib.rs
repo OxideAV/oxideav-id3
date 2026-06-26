@@ -6331,6 +6331,66 @@ fn parse_rva_v22(payload: &[u8]) -> Id3Frame {
     }
 }
 
+/// Serialise an [`Id3Frame::Rvad`] into the **ID3v2.2 §4.12 `RVA`** body
+/// (the inverse of [`parse_rva_v22`]). This exists separately from the
+/// v2.3 `RVAD` encoder because the two layouts disagree on field
+/// presence: v2.2 lists the front right/left volume-change fields
+/// *unconditionally*, so a both-decrement frame (inc/dec `$00`) still
+/// carries both magnitudes — whereas the v2.3 encoder keys block
+/// presence on the sign bits and would reject that `front`-with-zero-
+/// sign-bits combination. Routing an `Rvad` through the v2.3 encoder on
+/// a v2.2 write therefore broke the `parse_rva_v22 → write_tag(_, V2_2)`
+/// round-trip for the both-decrement case; this encoder fixes it.
+///
+/// v2.2 §4.12 defines only the two front channels (no back/centre/bass),
+/// so `back`/`center`/`bass` are ignored — they have no v2.2 wire form.
+/// Each field is `ceil(bits_used / 8)` bytes; the magnitudes are emitted
+/// at that width (zero-padded / truncated). The peak fields are written
+/// only when both are present and non-empty, matching the parser's
+/// "completely omitted" form (a frame with peaks on one channel only is
+/// not constructible from a v2.2 stream).
+fn encode_rva_v22(
+    increment_decrement: u8,
+    bits_used: u8,
+    front: &RvadFrontChannels,
+) -> Result<Vec<u8>> {
+    if bits_used == 0 {
+        return Err(Error::invalid(
+            "ID3v2.2 RVA bits_used must be non-zero per spec §4.12",
+        ));
+    }
+    let width = (bits_used as usize).div_ceil(8);
+    let mut out = Vec::with_capacity(2 + width * 4);
+    out.push(increment_decrement);
+    out.push(bits_used);
+    // Wire order per §4.12: right delta, left delta, then the peaks.
+    push_fixed_be(&mut out, &front.right.volume_delta, width);
+    push_fixed_be(&mut out, &front.left.volume_delta, width);
+    // Peaks are optional and emitted together; the parser surfaces an
+    // omitted pair as two empty peak vecs, so only write them when both
+    // sides carry data.
+    if !front.right.peak.is_empty() || !front.left.peak.is_empty() {
+        push_fixed_be(&mut out, &front.right.peak, width);
+        push_fixed_be(&mut out, &front.left.peak, width);
+    }
+    Ok(out)
+}
+
+/// Append `src` to `out` as a `width`-byte big-endian field: if `src`
+/// is shorter it is left-zero-padded to `width`; if longer the low
+/// `width` bytes are kept (the high bytes are guaranteed zero for a
+/// well-formed magnitude, since the parser never produces an
+/// over-width field). This matches the fixed-width slot the v2.2 RVA
+/// wire layout uses for every volume/peak field.
+fn push_fixed_be(out: &mut Vec<u8>, src: &[u8], width: usize) {
+    if src.len() >= width {
+        out.extend_from_slice(&src[src.len() - width..]);
+    } else {
+        out.resize(out.len() + (width - src.len()), 0);
+        out.extend_from_slice(src);
+    }
+}
+
 /// Parse an `EQUA` equalisation payload (spec v2.3 §4.13). Layout is:
 ///
 /// ```text
@@ -7686,6 +7746,26 @@ fn write_v22_frame(frame: &Id3Frame, out: &mut Vec<u8>) -> Result<()> {
             payload.extend_from_slice(encrypted);
             ("CRM", payload)
         }
+        Id3Frame::Rvad {
+            increment_decrement,
+            bits_used,
+            front,
+            ..
+        } => {
+            // v2.2 §4.12 RVA has its own layout (front channels only,
+            // fields unconditional) distinct from v2.3 RVAD — use the
+            // dedicated encoder so a both-decrement frame round-trips.
+            // A frame with no front block has no v2.2 wire form (§4.12
+            // always carries the two front channels); skip it rather
+            // than emit a malformed body.
+            match front {
+                Some(front) => {
+                    let payload = encode_rva_v22(*increment_decrement, *bits_used, front)?;
+                    ("RVA", payload)
+                }
+                None => return Ok(()),
+            }
+        }
         Id3Frame::Unknown { id, raw } => {
             // An Unknown frame round-trips verbatim, but only if its id
             // is already a valid three-character v2.2 identifier. A
@@ -8918,6 +8998,11 @@ fn frame_has_v22_home(frame: &Id3Frame) -> bool {
     match frame {
         // Special-cased by the v2.2 writer with a dedicated body.
         Id3Frame::Picture(_) | Id3Frame::EncryptedMeta { .. } => true,
+        // RVAD uses the v2.2-specific RVA encoder, which needs a front
+        // block (v2.2 §4.12 defines only the two front channels). A
+        // front-less RVAD has no v2.2 wire form and is dropped, matching
+        // the writer's `None => return Ok(())` skip.
+        Id3Frame::Rvad { front, .. } => front.is_some(),
         // Verbatim round-trip only when the id is already a valid v2.2
         // three-char id (e.g. a preserved v2.2-only `CRM`) or has a
         // demotion. A four-char Unknown with no demotion is dropped.

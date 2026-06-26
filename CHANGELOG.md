@@ -22,6 +22,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exposure. No non-spec semantics are invented — only the verbatim
   `Unknown` carriage and the spec-defined text-frame structure.
 
+### Fixed
+
+- ID3v2.2 `RVA` (relative volume adjustment, §4.12) now round-trips
+  through the v2.2 writer. Previously `write_tag(_, V2_2)` routed the
+  parsed `Rvad` through the v2.3 `RVAD` encoder, which keys front-channel
+  presence on the inc/dec *sign* bits — so a both-decrement frame
+  (inc/dec `$00`, which §4.12 still carries with both front magnitudes)
+  was rejected with an "inc/dec front bits and `front` channel block
+  disagree" error instead of being written. A new dedicated
+  `encode_rva_v22` mirrors `parse_rva_v22`'s unconditional-field layout
+  (v2.2 lists the two front fields unconditionally and defines no
+  back/centre/bass channels), so the parse → write → parse round trip now
+  holds for every inc/dec combination, including the all-decrement and
+  peaks-omitted forms. `convert_tag(_, V2_2)` was updated in lockstep so
+  it agrees with the writer on `Rvad` survival (kept iff a front block is
+  present). 2 new round-trip tests.
+
 ### Changed
 
 - `to_key_value_pairs` now surfaces a multi-value text frame as one

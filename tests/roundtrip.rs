@@ -4552,6 +4552,157 @@ fn v22_structural_frame_roundtrips() {
     assert_eq!(popm, ("rater@example.com".to_string(), 196, 4242));
 }
 
+/// The `CRM` encrypted-meta frame is ID3v2.2-only (§4.20) — v2.3+
+/// replaced it with `ENCR` + per-frame encryption — so it is the one
+/// structural frame whose parser (`parse_crm`) and serialiser have no
+/// v2.3/v2.4 counterpart. This pins the parse → write → parse symmetry
+/// through the v2.2 envelope: owner id, content/explanation, and the
+/// opaque encrypted block (which may itself contain a NUL) all survive
+/// byte-for-byte, and the writer emits the three-char "CRM" id with no
+/// encoding byte (the frame predates one).
+#[test]
+fn roundtrip_v22_crm_encrypted_meta() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_2,
+        frames: vec![Id3Frame::EncryptedMeta {
+            owner: "owner@example.com".into(),
+            content: "explanation text".into(),
+            // A block whose bytes include a $00 — the parser splits on
+            // exactly two terminators, so an embedded NUL in the
+            // encrypted block must not be treated as a field boundary.
+            encrypted: vec![0xDE, 0xAD, 0x00, 0xBE, 0xEF],
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_2).expect("write v2.2");
+    // Frame header: three-char "CRM" id (no encoding byte in the body).
+    assert_eq!(&bytes[10..13], b"CRM");
+
+    let (parsed, consumed) = parse_tag(&bytes).expect("re-parse v2.2");
+    assert_eq!(consumed, bytes.len());
+    let got = parsed
+        .frames
+        .iter()
+        .find_map(|f| match f {
+            Id3Frame::EncryptedMeta {
+                owner,
+                content,
+                encrypted,
+            } => Some((owner.clone(), content.clone(), encrypted.clone())),
+            _ => None,
+        })
+        .expect("CRM survives");
+    assert_eq!(
+        got,
+        (
+            "owner@example.com".to_string(),
+            "explanation text".to_string(),
+            vec![0xDE, 0xAD, 0x00, 0xBE, 0xEF],
+        )
+    );
+}
+
+/// Regression: an ID3v2.2 `RVA` frame must survive parse → write →
+/// parse through the v2.2 envelope. The bug was that the v2.2 writer
+/// routed the parsed `Rvad` through the v2.3 `RVAD` encoder, which keys
+/// front-channel presence on the inc/dec *sign* bits — so a
+/// both-decrement frame (inc/dec `$00`, which §4.12 still carries with
+/// both front magnitudes) was rejected with an
+/// "inc/dec front bits and `front` channel block disagree" error rather
+/// than written. The dedicated v2.2 `encode_rva_v22` path fixes it:
+/// v2.2 lists the front fields unconditionally, so the round trip holds
+/// for every inc/dec combination including all-decrement.
+#[test]
+fn roundtrip_v22_rva_both_decrement() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_2,
+        frames: vec![Id3Frame::Rvad {
+            increment_decrement: 0x00, // both channels decrement
+            bits_used: 16,
+            front: Some(RvadFrontChannels {
+                right: RvadChannel {
+                    volume_delta: vec![0x01, 0x00],
+                    peak: vec![0x7F, 0xFF],
+                },
+                left: RvadChannel {
+                    volume_delta: vec![0x02, 0x00],
+                    peak: vec![0x7E, 0x00],
+                },
+            }),
+            back: None,
+            center: None,
+            bass: None,
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_2).expect("write v2.2 RVA");
+    // Three-char "RVA" id, not "RVAD".
+    assert_eq!(&bytes[10..13], b"RVA");
+    let (parsed, consumed) = parse_tag(&bytes).expect("re-parse v2.2 RVA");
+    assert_eq!(consumed, bytes.len());
+    match &parsed.frames[0] {
+        Id3Frame::Rvad {
+            increment_decrement,
+            bits_used,
+            front,
+            back,
+            center,
+            bass,
+        } => {
+            assert_eq!(*increment_decrement, 0x00);
+            assert_eq!(*bits_used, 16);
+            let front = front.as_ref().expect("front block");
+            assert_eq!(front.right.volume_delta, vec![0x01, 0x00]);
+            assert_eq!(front.left.volume_delta, vec![0x02, 0x00]);
+            assert_eq!(front.right.peak, vec![0x7F, 0xFF]);
+            assert_eq!(front.left.peak, vec![0x7E, 0x00]);
+            assert!(back.is_none() && center.is_none() && bass.is_none());
+        }
+        other => panic!("expected Rvad, got {other:?}"),
+    }
+}
+
+/// The v2.2 `RVA` "peaks completely omitted" form (§4.12) also
+/// round-trips: a frame with empty peak vecs writes only the two
+/// volume-change fields and re-parses with empty peaks. Covers the
+/// 8-bit field width too (one byte per field).
+#[test]
+fn roundtrip_v22_rva_omitted_peaks_8bit() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_2,
+        frames: vec![Id3Frame::Rvad {
+            increment_decrement: 0x03, // both increment
+            bits_used: 8,
+            front: Some(RvadFrontChannels {
+                right: RvadChannel {
+                    volume_delta: vec![0x05],
+                    peak: vec![],
+                },
+                left: RvadChannel {
+                    volume_delta: vec![0x06],
+                    peak: vec![],
+                },
+            }),
+            back: None,
+            center: None,
+            bass: None,
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_2).expect("write");
+    // body = inc/dec + bits + right-delta + left-delta = 4 bytes; no peaks.
+    let frame_size = u32::from_be_bytes([0, bytes[13], bytes[14], bytes[15]]);
+    assert_eq!(frame_size, 4);
+    let (parsed, _) = parse_tag(&bytes).expect("re-parse");
+    match &parsed.frames[0] {
+        Id3Frame::Rvad { front, .. } => {
+            let front = front.as_ref().unwrap();
+            assert_eq!(front.right.volume_delta, vec![0x05]);
+            assert_eq!(front.left.volume_delta, vec![0x06]);
+            assert!(front.right.peak.is_empty());
+            assert!(front.left.peak.is_empty());
+        }
+        other => panic!("expected Rvad, got {other:?}"),
+    }
+}
+
 #[test]
 fn roundtrip_tkey_initial_key_typed_view() {
     // The TKEY initial-key typed accessor decodes the spec grammar
