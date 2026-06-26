@@ -54,13 +54,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed year/timestamp that cannot anchor the target form is
   preserved verbatim under its source id so no data is silently lost.
   Every other frame carries through unchanged. Converting to the version
-  a tag already declares returns a clone with `version` set; a v2.2 or
-  v1 source/target is rejected with `Error::unsupported`. The mapping is
-  a pure re-encoding of spec-defined fields into other spec-defined
+  a tag already declares returns a clone with `version` set. The mapping
+  is a pure re-encoding of spec-defined fields into other spec-defined
   fields. 24 new tests cover both directions, each precision level, the
   malformed-preservation paths, the round-trip stability, and an
   end-to-end `convert_tag → write_tag → parse_tag` that confirms `TDRC`
   lands on the wire.
+- `convert_tag` now also bridges **ID3v2.2** as either endpoint,
+  completing the v2.2 ↔ v2.3 ↔ v2.4 conversion matrix. Because a parsed
+  v2.2 tag already stores its frames under the promoted four-char v2.3
+  ids (`TT2`→`TIT2`, `PIC`→`APIC`, …), v2.2 is treated as
+  v2.3-with-a-narrower-frame-set: v2.2 → v2.3 is a relabel; v2.2 → v2.4
+  runs the v2.3→v2.4 date/IPLS fold; v2.3/v2.4 → v2.2 first folds to the
+  v2.3 vocabulary (so a v2.4 `TDRC` splits back to `TYER`/`TDAT`/`TIME`)
+  and then drops every frame the ID3v2.2 §4 frame set does not define —
+  the same closed set the v2.2 *writer* honours via `demote_to_v22`, so
+  the typed result stays byte-consistent with what `write_tag(_, V2_2)`
+  would serialise (a new test asserts convert-then-write equals
+  direct-write). The `Picture`→`PIC` and preserved-`CRM` writer special
+  cases survive. Only ID3v1 — which has no frame vocabulary — is rejected
+  with `Error::unsupported`. 7 new tests cover relabel, the v2.2 date
+  fold, the down-conversion drop set, the writer-agreement invariant, and
+  a v2.2 → v2.4 → v2.2 round trip.
 - Typed accessors for the four v2.3-only date/time/size split frames that
   v2.4 folded into the `TDRC` timestamp: `Id3Frame::year()` (`TYER`,
   four-digit year → `Id3Year`), `Id3Frame::date_ddmm()` (`TDAT`, `DDMM`

@@ -8834,29 +8834,116 @@ fn id3v1_genre_index(name: &str) -> Option<u8> {
 /// Every other frame is carried through unchanged (the version-specific
 /// body re-encoding is `write_tag`'s job). Converting to the version a
 /// tag already declares returns a clone with `version` set to the
-/// target. A v2.2 or v1 source/target is rejected with
-/// [`Error::unsupported`]: this bridge is specifically the v2.3↔v2.4
-/// frame-vocabulary delta. (v2.2→v2.3 promotion already happens on
-/// parse, where three-char ids are lifted to their four-char
-/// descendants.)
+/// target.
+///
+/// **v2.2 as source or target.** A parsed ID3v2.2 tag already carries
+/// its frames under their promoted four-char v2.3 ids (the parser's
+/// `dispatch_v22` lifts `TT2`→`TIT2`, `PIC`→`APIC`, … on read), so its
+/// in-memory frame vocabulary is identical to a v2.3 tag's. Conversion
+/// therefore treats v2.2 as v2.3-with-a-narrower-frame-set:
+///
+/// * **v2.2 → v2.3** is a relabel — the frame ids are already in v2.3
+///   form, so only `version` changes.
+/// * **v2.2 → v2.4** runs the v2.3→v2.4 date/IPLS fold (v2.2 carries
+///   `TYER`/`TDAT`/`TIME`/`TORY`/`IPLS`, never `TDRC`/`TDOR`/`TIPL`).
+/// * **v2.3/v2.4 → v2.2** first folds to the v2.3 vocabulary (so a v2.4
+///   `TDRC` splits back to `TYER`/`TDAT`/`TIME` first) and then **drops
+///   every frame the ID3v2.2 §4 frame set does not define** — the same
+///   closed set the v2.2 *writer* honours via [`demote_to_v22`]. Frames
+///   such as `RVA2`, `EQU2`, `SEEK`, `SIGN`, `ASPI`, `TMCL`, `TIPL`,
+///   `OWNE`, `COMR`, `USER`, `PRIV`, `SYTC`-successors-without-a-v2.2-id,
+///   etc. have no v2.2 home and are removed rather than emitted under an
+///   identifier a conformant v2.2 reader could not interpret. This keeps
+///   the typed `convert_tag` result byte-consistent with what
+///   `write_tag(_, V2_2)` would actually serialise.
+///
+/// A v1 source or target is rejected with [`Error::unsupported`]: the
+/// 128-byte trailing tag is not a frame-structured tag and has no
+/// frame-vocabulary bridge.
 pub fn convert_tag(tag: &Id3Tag, target_version: Id3Version) -> Result<Id3Tag> {
+    use Id3Version::{V2_2, V2_3, V2_4};
     match (tag.version, target_version) {
-        (Id3Version::V2_3, Id3Version::V2_4) => Ok(Id3Tag {
-            version: Id3Version::V2_4,
-            frames: convert_frames_v23_to_v24(&tag.frames),
-        }),
-        (Id3Version::V2_4, Id3Version::V2_3) => Ok(Id3Tag {
-            version: Id3Version::V2_3,
-            frames: convert_frames_v24_to_v23(&tag.frames),
-        }),
-        (Id3Version::V2_3, Id3Version::V2_3) | (Id3Version::V2_4, Id3Version::V2_4) => Ok(Id3Tag {
+        // --- identity (relabel only) ---
+        (V2_3, V2_3) | (V2_4, V2_4) => Ok(Id3Tag {
             version: target_version,
             frames: tag.frames.clone(),
         }),
+        // v2.2 frames are stored under v2.3 ids, so a v2.2->v2.2 or
+        // v2.2->v2.3 conversion is a pure relabel. The frame set is
+        // already a subset of v2.2's §4 vocabulary by construction
+        // (it was parsed from a v2.2 tag), so no drop is needed.
+        (V2_2, V2_2) | (V2_2, V2_3) => Ok(Id3Tag {
+            version: target_version,
+            frames: tag.frames.clone(),
+        }),
+        // --- v2.3 <-> v2.4 date/IPLS fold ---
+        (V2_3, V2_4) => Ok(Id3Tag {
+            version: V2_4,
+            frames: convert_frames_v23_to_v24(&tag.frames),
+        }),
+        (V2_4, V2_3) => Ok(Id3Tag {
+            version: V2_3,
+            frames: convert_frames_v24_to_v23(&tag.frames),
+        }),
+        // v2.2 -> v2.4: relabel to v2.3 then fold forward.
+        (V2_2, V2_4) => Ok(Id3Tag {
+            version: V2_4,
+            frames: convert_frames_v23_to_v24(&tag.frames),
+        }),
+        // --- down to v2.2: fold to v2.3 vocab, then drop non-v2.2 frames ---
+        (V2_3, V2_2) => Ok(Id3Tag {
+            version: V2_2,
+            frames: convert_frames_to_v22(&tag.frames),
+        }),
+        (V2_4, V2_2) => Ok(Id3Tag {
+            version: V2_2,
+            frames: convert_frames_to_v22(&convert_frames_v24_to_v23(&tag.frames)),
+        }),
         _ => Err(Error::unsupported(
-            "convert_tag bridges ID3v2.3 <-> ID3v2.4 only",
+            "convert_tag bridges the ID3v2.2 / v2.3 / v2.4 frame vocabularies; ID3v1 is unsupported",
         )),
     }
+}
+
+/// True when `frame` has a home in the ID3v2.2 §4 frame set — i.e. the
+/// v2.2 writer ([`write_v22_frame`]) would emit it rather than skip it.
+/// This is the typed-conversion mirror of that writer's drop logic, so
+/// `convert_tag(_, V2_2)` and `write_tag(_, V2_2)` agree on exactly
+/// which frames survive the version step.
+///
+/// The input is expected to already be in the v2.3 frame vocabulary
+/// (four-char ids, `TYER`/`TDAT`/`TIME` rather than `TDRC`), which is
+/// what every `convert_frames_to_v22` caller passes.
+fn frame_has_v22_home(frame: &Id3Frame) -> bool {
+    match frame {
+        // Special-cased by the v2.2 writer with a dedicated body.
+        Id3Frame::Picture(_) | Id3Frame::EncryptedMeta { .. } => true,
+        // Verbatim round-trip only when the id is already a valid v2.2
+        // three-char id (e.g. a preserved v2.2-only `CRM`) or has a
+        // demotion. A four-char Unknown with no demotion is dropped.
+        Id3Frame::Unknown { id, .. } => demote_to_v22(id).is_some() || is_valid_v22_id(id),
+        // Every other structural frame demotes via its v2.3 id, exactly
+        // as `write_v22_frame`'s default arm does: encode under the v2.3
+        // vocabulary to recover the four-char id, then test the demotion
+        // table. A frame whose id has no v2.2 entry is dropped.
+        other => match encode_frame(Id3Version::V2_3, other) {
+            Ok((id, _payload)) => demote_to_v22(&id).is_some(),
+            Err(_) => false,
+        },
+    }
+}
+
+/// Rewrite a v2.3-vocabulary frame list into the v2.2 frame set,
+/// dropping every frame the ID3v2.2 §4 spec does not define. The
+/// surviving frames keep their v2.3-form ids (the writer demotes them
+/// to three-char form at serialise time, exactly as it does for a v2.3
+/// source tag).
+fn convert_frames_to_v22(frames: &[Id3Frame]) -> Vec<Id3Frame> {
+    frames
+        .iter()
+        .filter(|f| frame_has_v22_home(f))
+        .cloned()
+        .collect()
 }
 
 /// Find the single value of a `T***` text frame by id, if present and
@@ -14418,18 +14505,190 @@ mod tests {
     }
 
     #[test]
-    fn convert_rejects_v22_and_v1() {
-        let v22 = Id3Tag {
-            version: Id3Version::V2_2,
-            frames: vec![],
-        };
-        assert!(convert_tag(&v22, Id3Version::V2_4).is_err());
+    fn convert_rejects_v1_only() {
+        // ID3v1 has no frame vocabulary, so it is rejected as either
+        // endpoint. v2.2 is now a supported endpoint (see the dedicated
+        // v2.2 conversion tests below).
         let v24 = Id3Tag {
             version: Id3Version::V2_4,
             frames: vec![],
         };
-        assert!(convert_tag(&v24, Id3Version::V2_2).is_err());
         assert!(convert_tag(&v24, Id3Version::V1).is_err());
+        let v1 = Id3Tag {
+            version: Id3Version::V1,
+            frames: vec![],
+        };
+        assert!(convert_tag(&v1, Id3Version::V2_4).is_err());
+        assert!(convert_tag(&v1, Id3Version::V2_2).is_err());
+    }
+
+    #[test]
+    fn convert_v22_to_v23_is_relabel() {
+        // A parsed v2.2 tag already carries v2.3-form ids; converting to
+        // v2.3 only changes the version stamp.
+        let tag = Id3Tag {
+            version: Id3Version::V2_2,
+            frames: vec![text("TIT2", "Song"), text("TPE1", "Artist")],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_3).unwrap();
+        assert_eq!(out.version, Id3Version::V2_3);
+        assert_eq!(out.frames.len(), 2);
+        assert_eq!(find_text(&out, "TIT2"), Some(&vec!["Song".to_string()]));
+        assert_eq!(find_text(&out, "TPE1"), Some(&vec!["Artist".to_string()]));
+    }
+
+    #[test]
+    fn convert_v22_to_v24_folds_date() {
+        // v2.2 carries TYER/TDAT/TIME (never TDRC); converting to v2.4
+        // runs the same fold as a v2.3 source.
+        let tag = Id3Tag {
+            version: Id3Version::V2_2,
+            frames: vec![
+                text("TIT2", "Song"),
+                text("TYER", "2024"),
+                text("TDAT", "1806"),
+                text("TIME", "1345"),
+            ],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_4).unwrap();
+        assert_eq!(out.version, Id3Version::V2_4);
+        assert!(find_text(&out, "TYER").is_none());
+        assert_eq!(
+            find_text(&out, "TDRC"),
+            Some(&vec!["2024-06-18T13:45".to_string()])
+        );
+    }
+
+    #[test]
+    fn convert_v23_to_v22_drops_non_v22_frames() {
+        // RVA2 / SEEK / TMCL / OWNE have no v2.2 §4 home; TIT2 / TPE1 /
+        // APIC do. Only the latter survive the down-conversion.
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![
+                text("TIT2", "Song"),
+                text("TPE1", "Artist"),
+                Id3Frame::Rva2 {
+                    identification: "norm".into(),
+                    channels: vec![],
+                },
+                Id3Frame::Seek {
+                    min_offset_to_next_tag: 42,
+                },
+                Id3Frame::Text {
+                    id: "TMCL".into(),
+                    values: vec!["Guitar".into(), "Jimi".into()],
+                },
+            ],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_2).unwrap();
+        assert_eq!(out.version, Id3Version::V2_2);
+        // Only the two text frames with a v2.2 demotion survive.
+        assert_eq!(out.frames.len(), 2);
+        assert_eq!(find_text(&out, "TIT2"), Some(&vec!["Song".to_string()]));
+        assert_eq!(find_text(&out, "TPE1"), Some(&vec!["Artist".to_string()]));
+        assert!(!out
+            .frames
+            .iter()
+            .any(|f| matches!(f, Id3Frame::Rva2 { .. } | Id3Frame::Seek { .. })));
+        assert!(find_text(&out, "TMCL").is_none());
+    }
+
+    #[test]
+    fn convert_v24_to_v22_splits_date_then_drops() {
+        // v2.4 -> v2.2: TDRC splits back to TYER (+TDAT/TIME), and the
+        // v2.4-only TDEN is dropped (no v2.2 home).
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![
+                text("TIT2", "Song"),
+                text("TDRC", "2024-06-18"),
+                text("TDEN", "2024-01-01T00:00:00"),
+            ],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_2).unwrap();
+        assert_eq!(out.version, Id3Version::V2_2);
+        assert_eq!(find_text(&out, "TYER"), Some(&vec!["2024".to_string()]));
+        assert_eq!(find_text(&out, "TDAT"), Some(&vec!["1806".to_string()]));
+        assert!(find_text(&out, "TDEN").is_none());
+        assert!(find_text(&out, "TDRC").is_none());
+    }
+
+    #[test]
+    fn convert_v23_to_v22_keeps_picture_and_crm() {
+        // The two v2.2 writer special cases — APIC->PIC and a preserved
+        // v2.2-only CRM (Unknown with a valid 3-char id) — survive.
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![
+                Id3Frame::Picture(AttachedPicture {
+                    mime_type: "image/png".into(),
+                    picture_type: PictureType::FrontCover,
+                    description: "cover".into(),
+                    data: vec![1, 2, 3],
+                }),
+                Id3Frame::EncryptedMeta {
+                    owner: "owner@x".into(),
+                    content: "explanation".into(),
+                    encrypted: vec![9, 9, 9],
+                },
+            ],
+        };
+        let out = convert_tag(&tag, Id3Version::V2_2).unwrap();
+        assert_eq!(out.frames.len(), 2);
+        assert!(out.frames.iter().any(|f| matches!(f, Id3Frame::Picture(_))));
+        assert!(out
+            .frames
+            .iter()
+            .any(|f| matches!(f, Id3Frame::EncryptedMeta { .. })));
+    }
+
+    #[test]
+    fn convert_to_v22_then_write_matches_writer_drop_set() {
+        // The typed conversion's surviving-frame set must agree with what
+        // write_tag(_, V2_2) actually serialises: convert-then-write and
+        // direct-write must produce identical bytes.
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![
+                text("TIT2", "Song"),
+                text("TPE1", "Artist"),
+                Id3Frame::Rva2 {
+                    identification: "norm".into(),
+                    channels: vec![],
+                },
+                Id3Frame::Seek {
+                    min_offset_to_next_tag: 42,
+                },
+            ],
+        };
+        let converted = convert_tag(&tag, Id3Version::V2_2).unwrap();
+        let via_convert = write_tag(&converted, Id3Version::V2_2).unwrap();
+        let direct = write_tag(&tag, Id3Version::V2_2).unwrap();
+        assert_eq!(via_convert, direct);
+    }
+
+    #[test]
+    fn convert_v22_to_v24_to_v22_roundtrip_stable() {
+        // A tag whose frames all have v2.2 homes survives a v2.2 -> v2.4
+        // -> v2.2 round trip unchanged (modulo the date fold, which is
+        // itself reversible at day precision).
+        let tag = Id3Tag {
+            version: Id3Version::V2_2,
+            frames: vec![
+                text("TIT2", "Song"),
+                text("TPE1", "Artist"),
+                text("TALB", "Album"),
+                text("TYER", "2024"),
+                text("TDAT", "1806"),
+            ],
+        };
+        let up = convert_tag(&tag, Id3Version::V2_4).unwrap();
+        let down = convert_tag(&up, Id3Version::V2_2).unwrap();
+        assert_eq!(down.version, Id3Version::V2_2);
+        assert_eq!(find_text(&down, "TIT2"), Some(&vec!["Song".to_string()]));
+        assert_eq!(find_text(&down, "TYER"), Some(&vec!["2024".to_string()]));
+        assert_eq!(find_text(&down, "TDAT"), Some(&vec!["1806".to_string()]));
     }
 
     #[test]
