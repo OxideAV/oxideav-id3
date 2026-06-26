@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round-trip tests pinning the iTunes-frame preservation contract.
+  `GRP1` (grouping), `MVNM` (movement name) and `MVIN` (movement index)
+  are not in the staged id3.org specs and do not begin with `T`/`W`, so
+  the parser keeps them as `Unknown` and the writer emits them verbatim
+  — a new test proves their bodies survive parse → write → parse
+  byte-for-byte under both v2.3 and v2.4. The iTunes sort frames `TSO2`
+  (album-artist sort) and `TSOC` (composer sort) begin with `T`, so the
+  universal text-frame path parses them as typed `Text` values and the
+  flat projection surfaces them under their lowercased ids (`tso2` /
+  `tsoc`); a second test pins that text round-trip plus the key/value
+  exposure. No non-spec semantics are invented — only the verbatim
+  `Unknown` carriage and the spec-defined text-frame structure.
+
 ### Changed
 
 - `to_key_value_pairs` now surfaces a multi-value text frame as one

@@ -303,6 +303,105 @@ fn roundtrip_preserves_unknown_frames() {
     assert_eq!(raw.as_deref(), Some(&b"arbitrary bytes"[..]));
 }
 
+/// The iTunes-proprietary binary-id frames `GRP1` (grouping), `MVNM`
+/// (movement name) and `MVIN` (movement index) are not defined by the
+/// staged id3.org specs and do not begin with `T`/`W`, so the parser
+/// keeps them as `Unknown` rather than inventing typed semantics from a
+/// non-spec source. This pins the contract that they nonetheless survive
+/// a parse -> write -> parse round trip with their bodies byte-for-byte
+/// intact: an `Unknown` frame's id and raw payload are emitted verbatim,
+/// so a downstream tool that *does* know the iTunes layout can still read
+/// them and our writer never silently drops them.
+#[test]
+fn roundtrip_preserves_itunes_binary_frames_verbatim() {
+    let bodies: &[(&str, &[u8])] = &[
+        ("GRP1", b"\x00Symphony No. 5\x00"),
+        ("MVNM", b"\x00Allegro con brio\x00"),
+        ("MVIN", b"\x001/4\x00"),
+    ];
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        let mut frames = vec![Id3Frame::Text {
+            id: "TIT2".into(),
+            values: vec!["x".into()],
+        }];
+        for (id, raw) in bodies {
+            frames.push(Id3Frame::Unknown {
+                id: (*id).into(),
+                raw: raw.to_vec(),
+            });
+        }
+        let tag = Id3Tag { version, frames };
+        let bytes = write_tag(&tag, version).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        for (id, raw) in bodies {
+            let got = parsed.frames.iter().find_map(|f| match f {
+                Id3Frame::Unknown { id: fid, raw } if fid == id => Some(raw.clone()),
+                _ => None,
+            });
+            assert_eq!(
+                got.as_deref(),
+                Some(*raw),
+                "iTunes frame {id} did not round-trip verbatim under {version:?}",
+            );
+        }
+    }
+}
+
+/// The iTunes sort-order frames `TSO2` (album-artist sort) and `TSOC`
+/// (composer sort) mirror the spec-defined `TSOA`/`TSOP`/`TSOT` sort
+/// frames but are iTunes additions absent from the staged specs. Because
+/// they begin with `T`, the generic text-frame path parses them as
+/// ordinary `Text` frames (the encoding byte + string layout common to
+/// every `T***` frame), so they survive a parse -> write -> parse round
+/// trip as a typed text value rather than opaque bytes, and the flat
+/// key/value projection surfaces them under their lowercased id (`tso2`
+/// / `tsoc`). This is strictly more useful than the `Unknown` path and
+/// requires no non-spec knowledge — only the universal text-frame
+/// structure the specs define.
+#[test]
+fn roundtrip_itunes_sort_text_frames() {
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        let tag = Id3Tag {
+            version,
+            frames: vec![
+                Id3Frame::Text {
+                    id: "TIT2".into(),
+                    values: vec!["x".into()],
+                },
+                Id3Frame::Text {
+                    id: "TSO2".into(),
+                    values: vec!["Beethoven, Ludwig van".into()],
+                },
+                Id3Frame::Text {
+                    id: "TSOC".into(),
+                    values: vec!["Beethoven, Ludwig van".into()],
+                },
+            ],
+        };
+        let bytes = write_tag(&tag, version).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        for id in ["TSO2", "TSOC"] {
+            let got = parsed.frames.iter().find_map(|f| match f {
+                Id3Frame::Text { id: fid, values } if fid == id => values.first().cloned(),
+                _ => None,
+            });
+            assert_eq!(
+                got.as_deref(),
+                Some("Beethoven, Ludwig van"),
+                "{id} did not round-trip as text under {version:?}",
+            );
+        }
+        // Flat projection exposes them under the lowercased id fallback.
+        let kv = to_key_value_pairs(&parsed);
+        assert!(kv
+            .iter()
+            .any(|(k, v)| k == "tso2" && v == "Beethoven, Ludwig van"));
+        assert!(kv
+            .iter()
+            .any(|(k, v)| k == "tsoc" && v == "Beethoven, Ludwig van"));
+    }
+}
+
 #[test]
 fn tag_size_matches_written_bytes() {
     let tag = make_tag(Id3Version::V2_3);
