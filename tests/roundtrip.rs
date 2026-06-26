@@ -4660,6 +4660,65 @@ fn roundtrip_v22_rva_both_decrement() {
     }
 }
 
+/// A v2.3 `RVAD` with back/centre/bass channels written to v2.2 emits
+/// only the front pair: v2.2 §4.12 defines no higher channels, so they
+/// are an intentional, spec-bounded loss (the front data is preserved
+/// exactly). The inc/dec byte's higher bits are still written verbatim;
+/// the re-parse keeps `back`/`center`/`bass` as `None` because the v2.2
+/// layout has no slots for them. This documents the down-conversion is
+/// lossy-but-valid rather than an error.
+#[test]
+fn roundtrip_v23_rvad_back_channels_to_v22_keeps_front() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![Id3Frame::Rvad {
+            increment_decrement: 0b0000_1111, // front + back, all increment
+            bits_used: 16,
+            front: Some(RvadFrontChannels {
+                right: RvadChannel {
+                    volume_delta: vec![0x10, 0x00],
+                    peak: vec![0x20, 0x00],
+                },
+                left: RvadChannel {
+                    volume_delta: vec![0x11, 0x00],
+                    peak: vec![0x21, 0x00],
+                },
+            }),
+            back: Some(RvadBackChannels {
+                right_back: RvadChannel {
+                    volume_delta: vec![0x30, 0x00],
+                    peak: vec![0x40, 0x00],
+                },
+                left_back: RvadChannel {
+                    volume_delta: vec![0x31, 0x00],
+                    peak: vec![0x41, 0x00],
+                },
+            }),
+            center: None,
+            bass: None,
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_2).expect("write v2.2");
+    assert_eq!(&bytes[10..13], b"RVA");
+    let (parsed, _) = parse_tag(&bytes).expect("re-parse");
+    match &parsed.frames[0] {
+        Id3Frame::Rvad {
+            front,
+            back,
+            center,
+            bass,
+            ..
+        } => {
+            let front = front.as_ref().expect("front survives");
+            assert_eq!(front.right.volume_delta, vec![0x10, 0x00]);
+            assert_eq!(front.left.peak, vec![0x21, 0x00]);
+            // Back/centre/bass have no v2.2 wire form.
+            assert!(back.is_none() && center.is_none() && bass.is_none());
+        }
+        other => panic!("expected Rvad, got {other:?}"),
+    }
+}
+
 /// The v2.2 `RVA` "peaks completely omitted" form (§4.12) also
 /// round-trips: a frame with empty peak vecs writes only the two
 /// volume-change fields and re-parses with empty peaks. Covers the
