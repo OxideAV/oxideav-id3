@@ -1493,6 +1493,43 @@ fn roundtrip_link_v23() {
     );
 }
 
+/// Regression: a v2.3 `LINK` whose URL begins with an upper-ASCII
+/// letter or digit must NOT have that leading character absorbed into
+/// the 3-byte frame-id field. The parser keys the id width off the tag
+/// version (3 bytes in v2.3), not off a content heuristic — an earlier
+/// "is byte 3 an id char?" heuristic mis-split exactly this case.
+#[test]
+fn roundtrip_link_v23_url_starts_with_id_char() {
+    // `WWW.example.com` — the 4th payload byte is 'W' (a valid id char),
+    // which the old heuristic would have stolen into the frame id.
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![Id3Frame::LinkedInfo {
+            frame_id: [b'W', b'O', b'A', 0],
+            url: "WWW.EXAMPLE.COM/legacy.mp3".into(),
+            additional: vec![1, 2, 3],
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    let got = parsed.frames.iter().find_map(|f| match f {
+        Id3Frame::LinkedInfo {
+            frame_id,
+            url,
+            additional,
+        } => Some((*frame_id, url.clone(), additional.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        got,
+        Some((
+            [b'W', b'O', b'A', 0],
+            "WWW.EXAMPLE.COM/legacy.mp3".to_string(),
+            vec![1, 2, 3]
+        ))
+    );
+}
+
 /// `ASPI` round-trip in v2.4 — a 100-point 16-bit index covering a
 /// notional VBR MP3 file. The shape is byte-aligned so the bytes
 /// written by `write_tag` parse back to the same fractions.

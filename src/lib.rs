@@ -4770,9 +4770,9 @@ fn parse_v23_frame(buf: &[u8]) -> Result<(Id3Frame, usize)> {
 
     let frame = if compressed {
         let inflated = inflate_frame(payload, decompressed_size)?;
-        dispatch_v23_v24(&id, &inflated)
+        dispatch_v23_v24(Id3Version::V2_3, &id, &inflated)
     } else {
-        dispatch_v23_v24(&id, payload)
+        dispatch_v23_v24(Id3Version::V2_3, &id, payload)
     };
     Ok((frame, 10 + size))
 }
@@ -4839,7 +4839,10 @@ fn parse_v24_frame(buf: &[u8]) -> Result<(Id3Frame, usize)> {
             data = &unsync_owned;
         }
         let inflated = inflate_frame(data, announced)?;
-        return Ok((dispatch_v23_v24(&id, &inflated), 10 + size));
+        return Ok((
+            dispatch_v23_v24(Id3Version::V2_4, &id, &inflated),
+            10 + size,
+        ));
     }
     // The data-length indicator is 4 synchsafe bytes giving the real
     // (post-decompression, post-unsync) size. We don't decompress so
@@ -4858,13 +4861,15 @@ fn parse_v24_frame(buf: &[u8]) -> Result<(Id3Frame, usize)> {
         // without an extra let, so give it one.
         let _ = &unsync_owned;
     }
-    let frame = dispatch_v23_v24(&id, payload);
+    let frame = dispatch_v23_v24(Id3Version::V2_4, &id, payload);
     Ok((frame, 10 + size))
 }
 
 /// Dispatch a v2.3/v2.4 frame payload to the right parser based on
-/// its 4-char id.
-fn dispatch_v23_v24(id: &str, payload: &[u8]) -> Id3Frame {
+/// its 4-char id. `version` disambiguates the handful of frames whose
+/// payload layout differs between v2.3 and v2.4 (currently only `LINK`,
+/// whose frame-id field is 3 bytes in v2.3 but 4 in v2.4).
+fn dispatch_v23_v24(version: Id3Version, id: &str, payload: &[u8]) -> Id3Frame {
     if id == "TXXX" {
         return parse_txxx(id, payload);
     }
@@ -4902,7 +4907,7 @@ fn dispatch_v23_v24(id: &str, payload: &[u8]) -> Id3Frame {
         "GRID" => parse_grid(payload),
         "ENCR" => parse_encr(payload),
         "AENC" => parse_aenc(payload),
-        "LINK" => parse_link(payload),
+        "LINK" => parse_link(version, payload),
         "ASPI" => parse_aspi(payload),
         "MLLT" => parse_mllt(payload),
         "RVRB" => parse_rvrb(payload),
@@ -5972,16 +5977,26 @@ fn parse_aenc(payload: &[u8]) -> Id3Frame {
 /// 3-character ASCII id triple: if it's a 4th ASCII upper/digit
 /// character we treat the id as 4 bytes (v2.4); otherwise the 3-byte
 /// v2.3 form, with the 4th array slot zero-padded for representation.
-fn parse_link(payload: &[u8]) -> Id3Frame {
-    if payload.len() < 3 {
+fn parse_link(version: Id3Version, payload: &[u8]) -> Id3Frame {
+    // The LINK frame-id field is 3 bytes in v2.3 (§4.21) and 4 bytes in
+    // v2.4 (§4.20). With no in-payload version marker, the *tag* version
+    // is the only reliable way to know the field width — a content-based
+    // heuristic ("is byte 3 an id char?") mis-splits a v2.3 LINK whose
+    // URL starts with an uppercase letter or digit (e.g. `http...` would
+    // be safe, but a bare-host URL like `WWW.example.com` would steal
+    // the leading `W` into the frame id). Trust the version instead.
+    let id_len = match version {
+        Id3Version::V2_4 => 4,
+        _ => 3,
+    };
+    if payload.len() < id_len {
         return Id3Frame::LinkedInfo {
             frame_id: [0; 4],
             url: String::new(),
             additional: Vec::new(),
         };
     }
-    let is_v24_id = payload.len() >= 4 && is_id_char(payload[3]);
-    let (frame_id, body): ([u8; 4], &[u8]) = if is_v24_id {
+    let (frame_id, body): ([u8; 4], &[u8]) = if id_len == 4 {
         (
             [payload[0], payload[1], payload[2], payload[3]],
             &payload[4..],
@@ -6613,13 +6628,6 @@ impl BitWriter {
     fn into_bytes(self) -> Vec<u8> {
         self.buf
     }
-}
-
-/// True for the upper-ASCII letters / digits used in ID3v2 frame
-/// identifiers. The spec restricts frame ids to `A-Z 0-9` so the
-/// LINK 3-vs-4 disambiguator can rely on this character class.
-fn is_id_char(b: u8) -> bool {
-    b.is_ascii_uppercase() || b.is_ascii_digit()
 }
 
 /// Decode a big-endian unsigned integer of arbitrary width into `u64`.
@@ -10674,6 +10682,64 @@ mod tests {
                         &out[out.len().saturating_sub(4)..]
                     );
                 }
+            }
+        }
+    }
+
+    /// Exhaustively verify both unsync invariants — `reverse∘apply ==
+    /// identity` and "no false sync / bare `$FF $00` / trailing `$FF`
+    /// survives apply" — over every byte string of length 0..=4 drawn
+    /// from the boundary alphabet `{$00, $01, $E0, $FB, $FF}`. That
+    /// alphabet covers each distinct case the encoder branches on (a
+    /// plain byte, the literal-zero sentinel, the two false-sync
+    /// patterns `$FF $E0` / `$FF $FB`, and the trailing-`$FF`), so the
+    /// 5^0 + … + 5^4 = 781 strings exercise every adjacency the
+    /// algorithm distinguishes without the cost of a full 256-symbol
+    /// sweep.
+    #[test]
+    fn unsync_roundtrip_and_invariant_exhaustive_boundary_alphabet() {
+        const ALPHABET: [u8; 5] = [0x00, 0x01, 0xE0, 0xFB, 0xFF];
+        fn check(buf: &[u8]) {
+            let encoded = apply_unsync(buf);
+            // Invariant 1: reverse undoes apply exactly.
+            assert_eq!(
+                reverse_unsync(&encoded).as_slice(),
+                buf,
+                "round-trip failed for {buf:02X?}"
+            );
+            // Invariant 2: the encoded form is fully unsynchronised —
+            // no `$FF` is followed by `%111xxxxx` or by a non-sentinel
+            // `$00` adjacency the parser would mis-read, and no `$FF`
+            // sits at the very end.
+            for w in encoded.windows(2) {
+                if w[0] == 0xFF {
+                    assert!(
+                        (w[1] & 0xE0) != 0xE0,
+                        "false sync $FF {:02X} survived in {buf:02X?}",
+                        w[1]
+                    );
+                }
+            }
+            assert_ne!(
+                encoded.last().copied(),
+                Some(0xFF),
+                "trailing $FF survived in {buf:02X?}"
+            );
+        }
+        // Length 0.
+        check(&[]);
+        // Lengths 1..=4, every combination from the alphabet.
+        let mut buf = Vec::new();
+        for len in 1..=4usize {
+            buf.clear();
+            buf.resize(len, 0);
+            let total = ALPHABET.len().pow(len as u32);
+            for mut idx in 0..total {
+                for slot in buf.iter_mut() {
+                    *slot = ALPHABET[idx % ALPHABET.len()];
+                    idx /= ALPHABET.len();
+                }
+                check(&buf);
             }
         }
     }

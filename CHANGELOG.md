@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `LINK` frame parsing now keys the frame-id field width off the tag
+  version (3 bytes in v2.3 §4.21, 4 bytes in v2.4 §4.20) instead of a
+  content heuristic. The previous "is payload byte 3 a valid id char?"
+  guess mis-split a v2.3 `LINK` whose linked URL began with an
+  upper-ASCII letter or digit (e.g. a bare-host `WWW.EXAMPLE.COM/…`),
+  stealing the leading character into the frame id and corrupting the
+  URL on round-trip. `dispatch_v23_v24` now threads the version down to
+  `parse_link`; the dead `is_id_char` helper was removed.
+
 - Cross-version frame-validity gating in the writer and `convert_tag`.
   The v2.4-only structural frames `RVA2` / `EQU2` / `SEEK` / `SIGN` /
   `ASPI` and the v2.4-only text frames (`TDRC`, `TDOR`, `TDRL`, `TDEN`,
