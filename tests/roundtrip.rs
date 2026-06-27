@@ -3299,40 +3299,41 @@ fn rva2_channel_type_roundtrips_v23_and_v24() {
             peak: Vec::new(),
         },
     ];
-    for version in [Id3Version::V2_3, Id3Version::V2_4] {
-        let tag = Id3Tag {
-            version,
-            frames: vec![Id3Frame::Rva2 {
-                identification: "mix".into(),
-                channels: channels.clone(),
-            }],
-        };
-        let bytes = write_tag(&tag, version).expect("write");
-        let (parsed, _) = parse_tag(&bytes).expect("parse");
-        let parsed_channels = parsed
-            .frames
-            .iter()
-            .find_map(|f| match f {
-                Id3Frame::Rva2 { channels, .. } => Some(channels.clone()),
-                _ => None,
-            })
-            .expect("RVA2 frame surfaces after round-trip");
-        assert_eq!(parsed_channels, channels);
-        assert_eq!(
-            parsed_channels[0].channel_type_typed(),
-            Some(Rva2ChannelType::MasterVolume)
-        );
-        assert_eq!(
-            parsed_channels[1].channel_type_typed(),
-            Some(Rva2ChannelType::FrontLeft)
-        );
-        assert_eq!(
-            parsed_channels[2].channel_type_typed(),
-            Some(Rva2ChannelType::Subwoofer)
-        );
-        assert_eq!(parsed_channels[3].channel_type_typed(), None);
-        assert_eq!(parsed_channels[3].channel_type, 0x42);
-    }
+    // RVA2 is a v2.4-only frame (§4.11; it supersedes v2.3's RVAD).
+    // It round-trips under V2_4 only — see `rva2_rejected_under_v23`
+    // for the version-guard half.
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Rva2 {
+            identification: "mix".into(),
+            channels: channels.clone(),
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_4).expect("write");
+    let (parsed, _) = parse_tag(&bytes).expect("parse");
+    let parsed_channels = parsed
+        .frames
+        .iter()
+        .find_map(|f| match f {
+            Id3Frame::Rva2 { channels, .. } => Some(channels.clone()),
+            _ => None,
+        })
+        .expect("RVA2 frame surfaces after round-trip");
+    assert_eq!(parsed_channels, channels);
+    assert_eq!(
+        parsed_channels[0].channel_type_typed(),
+        Some(Rva2ChannelType::MasterVolume)
+    );
+    assert_eq!(
+        parsed_channels[1].channel_type_typed(),
+        Some(Rva2ChannelType::FrontLeft)
+    );
+    assert_eq!(
+        parsed_channels[2].channel_type_typed(),
+        Some(Rva2ChannelType::Subwoofer)
+    );
+    assert_eq!(parsed_channels[3].channel_type_typed(), None);
+    assert_eq!(parsed_channels[3].channel_type, 0x42);
 }
 
 /// `Equ2Interpolation::from_wire` covers every spec value `$00..=$01`
@@ -4834,4 +4835,196 @@ fn roundtrip_tkey_initial_key_typed_view() {
         values: vec!["Dbm".into()],
     };
     assert_eq!(tit2.initial_key(), None);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-version frame-validity gating (round 377)
+//
+// v2.4 reorganised several frames out of the v2.3 vocabulary (and vice
+// versa). The writer must not emit a frame id the target version never
+// defined, and `convert_tag` must drop the same set so the typed
+// conversion stays byte-consistent with what `write_tag` serialises.
+// ---------------------------------------------------------------------------
+
+/// RVA2 is v2.4-only (§4.11, supersedes v2.3's RVAD). Writing it under a
+/// v2.3 or v2.2 envelope is rejected rather than emitting a frame id no
+/// conformant reader of that version recognises.
+#[test]
+fn rva2_rejected_under_v23_and_v22() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Rva2 {
+            identification: "norm".into(),
+            channels: vec![Rva2Channel {
+                channel_type: Rva2ChannelType::MasterVolume.to_wire(),
+                volume_adjustment: 128,
+                bits_peak: 0,
+                peak: Vec::new(),
+            }],
+        }],
+    };
+    assert!(write_tag(&tag, Id3Version::V2_3).is_err());
+    // A v2.2 target *drops* the frame (its writer skips frames without a
+    // v2.2 home) rather than erroring, producing a valid empty tag.
+    let v22 = write_tag(&tag, Id3Version::V2_2).expect("v2.2 write drops RVA2");
+    let (parsed, _) = parse_tag(&v22).expect("parse");
+    assert!(parsed
+        .frames
+        .iter()
+        .all(|f| !matches!(f, Id3Frame::Rva2 { .. })));
+}
+
+/// EQU2 / SEEK / SIGN / ASPI are likewise v2.4-only and rejected under
+/// v2.3.
+#[test]
+fn v24_only_structural_frames_rejected_under_v23() {
+    let frames = [
+        Id3Frame::Equ2 {
+            interpolation: 1,
+            identification: "eq".into(),
+            points: vec![(440, 8)],
+        },
+        Id3Frame::Seek {
+            min_offset_to_next_tag: 1024,
+        },
+        Id3Frame::Signature {
+            group_symbol: 0x80,
+            signature: vec![1, 2, 3],
+        },
+        Id3Frame::AudioSeekPointIndex {
+            indexed_data_start: 0,
+            indexed_data_length: 1000,
+            bits_per_index_point: 8,
+            fractions: vec![0, 128, 255],
+        },
+    ];
+    for frame in frames {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![frame.clone()],
+        };
+        // Sanity: each writes fine under v2.4.
+        assert!(write_tag(&tag, Id3Version::V2_4).is_ok(), "v2.4 write");
+        // ...and is rejected under v2.3.
+        assert!(
+            write_tag(&tag, Id3Version::V2_3).is_err(),
+            "v2.3 must reject {frame:?}"
+        );
+    }
+}
+
+/// v2.4-only text frames (TDRC / TMOO / TSOA / …) cannot be written
+/// verbatim into a v2.3 tag; the caller must `convert_tag` first.
+#[test]
+fn v24_only_text_frames_rejected_under_v23() {
+    for id in [
+        "TDRC", "TMOO", "TSOA", "TSOP", "TSOT", "TSST", "TPRO", "TDEN",
+    ] {
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: id.into(),
+                values: vec!["x".into()],
+            }],
+        };
+        assert!(write_tag(&tag, Id3Version::V2_4).is_ok(), "{id} under v2.4");
+        assert!(
+            write_tag(&tag, Id3Version::V2_3).is_err(),
+            "{id} must be rejected under v2.3"
+        );
+    }
+}
+
+/// v2.3-only date/size frames cannot be written into a v2.4 tag.
+#[test]
+fn v23_only_text_frames_rejected_under_v24() {
+    for id in ["TYER", "TDAT", "TIME", "TORY", "TRDA", "TSIZ"] {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![Id3Frame::Text {
+                id: id.into(),
+                values: vec!["2024".into()],
+            }],
+        };
+        assert!(write_tag(&tag, Id3Version::V2_3).is_ok(), "{id} under v2.3");
+        assert!(
+            write_tag(&tag, Id3Version::V2_4).is_err(),
+            "{id} must be rejected under v2.4"
+        );
+    }
+}
+
+/// `convert_tag` drops the v2.4-only structural frames when downgrading
+/// to v2.3, so the converted tag is writable as v2.3 and round-trips.
+#[test]
+fn convert_v24_to_v23_drops_v24_only_frames() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![
+            Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["Title".into()],
+            },
+            Id3Frame::Rva2 {
+                identification: "norm".into(),
+                channels: vec![Rva2Channel {
+                    channel_type: Rva2ChannelType::MasterVolume.to_wire(),
+                    volume_adjustment: 0,
+                    bits_peak: 0,
+                    peak: Vec::new(),
+                }],
+            },
+            Id3Frame::Seek {
+                min_offset_to_next_tag: 1,
+            },
+            Id3Frame::Text {
+                id: "TMOO".into(),
+                values: vec!["Calm".into()],
+            },
+            Id3Frame::Text {
+                id: "TSOT".into(),
+                values: vec!["Title".into()],
+            },
+        ],
+    };
+    let v23 = oxideav_id3::convert_tag(&tag, Id3Version::V2_3).expect("convert");
+    // Only the universally-valid TIT2 survives.
+    assert_eq!(v23.frames.len(), 1);
+    assert!(matches!(&v23.frames[0], Id3Frame::Text { id, .. } if id == "TIT2"));
+    // The converted tag now writes cleanly under v2.3 (no rejected frame).
+    let bytes = write_tag(&v23, Id3Version::V2_3).expect("write converted v2.3");
+    let (parsed, _) = parse_tag(&bytes).expect("parse");
+    assert_eq!(parsed.frames.len(), 1);
+}
+
+/// `convert_tag` drops v2.3-only RVAD/EQUA when upgrading to v2.4 (their
+/// successors RVA2/EQU2 use incompatible layouts), so the result writes
+/// cleanly under v2.4.
+#[test]
+fn convert_v23_to_v24_drops_rvad_equa() {
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![
+            Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["Title".into()],
+            },
+            Id3Frame::Equa {
+                adjustment_bits: 16,
+                bands: vec![EquaBand {
+                    increment: true,
+                    frequency: 1000,
+                    adjustment: vec![0x00, 0x05],
+                }],
+            },
+        ],
+    };
+    let v24 = oxideav_id3::convert_tag(&tag, Id3Version::V2_4).expect("convert");
+    assert!(v24
+        .frames
+        .iter()
+        .all(|f| !matches!(f, Id3Frame::Equa { .. } | Id3Frame::Rvad { .. })));
+    // TIT2 survives; the result is writable as v2.4.
+    let bytes = write_tag(&v24, Id3Version::V2_4).expect("write converted v2.4");
+    parse_tag(&bytes).expect("parse");
 }

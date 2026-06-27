@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Cross-version frame-validity gating in the writer and `convert_tag`.
+  The v2.4-only structural frames `RVA2` / `EQU2` / `SEEK` / `SIGN` /
+  `ASPI` and the v2.4-only text frames (`TDRC`, `TDOR`, `TDRL`, `TDEN`,
+  `TDTG`, `TMCL`, `TIPL`, `TSOA`, `TSOP`, `TSOT`, `TSST`, `TMOO`,
+  `TPRO`) were previously serialised verbatim into a v2.3 tag by
+  `write_tag(_, V2_3)`, producing a tag carrying frame ids no
+  conformant v2.3 reader recognises. They are now rejected at write
+  time (matching the existing v2.3-only `RVAD` / `EQUA` / `IPLS`
+  guards in the other direction). Symmetrically, the v2.3-only date /
+  size frames (`TYER`, `TDAT`, `TIME`, `TORY`, `TRDA`, `TSIZ`) are
+  rejected under a v2.4 envelope. `convert_tag` now drops the same
+  v2.4-only set on a v2.4 → v2.3 downgrade and the v2.3-only `RVAD` /
+  `EQUA` on a v2.3 → v2.4 upgrade (their successors use incompatible
+  binary layouts), so the typed conversion result always writes
+  cleanly under the target version. The ID3v2.2 writer drops the
+  version-incompatible frames rather than erroring, keeping it in
+  lockstep with `frame_has_v22_home`.
+
 ### Added
 
 - Round-trip tests pinning the iTunes-frame preservation contract.

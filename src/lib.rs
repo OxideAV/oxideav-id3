@@ -5063,6 +5063,40 @@ fn v22_promote(id: &str) -> &str {
 /// is closed, so an id absent from the table maps to `None` and the
 /// caller skips the frame rather than emitting an identifier a
 /// conformant v2.2 reader could not interpret.
+/// True when a four-character text/URL frame id has a wire form in the
+/// given target version. The only ids that are version-restricted are
+/// the date / people frames the v2.3↔v2.4 boundary reorganised:
+///
+/// * **v2.4-only** (no v2.3 home): `TDRC`, `TDOR`, `TDRL`, `TDEN`,
+///   `TDTG`, `TMCL`, `TIPL`, plus the sort-order / mood / production
+///   frames `TSOA`, `TSOP`, `TSOT`, `TSST`, `TMOO`, `TPRO` (v2.4 §4.2).
+/// * **v2.3-only** (dropped in v2.4): `TYER`, `TDAT`, `TIME`, `TORY`,
+///   `TRDA`, `TSIZ` (v2.3 §4.2.1, all folded into v2.4's `TDRC`/`TDOR`).
+///
+/// Every other text/URL id is defined in both v2.3 and v2.4, so it is
+/// always allowed. v2.2 is treated as v2.3 here — the v2.2 writer
+/// demotes the four-char id separately via [`demote_to_v22`], and an id
+/// that survives that demotion was already valid under the v2.3 set.
+///
+/// This is the writer-side counterpart of the `convert_tag` date/IPLS
+/// fold: a caller who hands a raw v2.4 `TDRC` to `write_tag(_, V2_3)`
+/// without converting first gets a clear error rather than a silently
+/// wire-invalid tag carrying a frame id the target version never
+/// defined.
+fn text_id_valid_in_version(id: &str, version: Id3Version) -> bool {
+    const V24_ONLY: &[&str] = &[
+        "TDRC", "TDOR", "TDRL", "TDEN", "TDTG", "TMCL", "TIPL", "TSOA", "TSOP", "TSOT", "TSST",
+        "TMOO", "TPRO",
+    ];
+    const V23_ONLY: &[&str] = &["TYER", "TDAT", "TIME", "TORY", "TRDA", "TSIZ"];
+    match version {
+        Id3Version::V2_4 => !V23_ONLY.contains(&id),
+        // v2.3 and v2.2 share the same date/people vocabulary; the v2.2
+        // writer applies its own three-char demotion afterwards.
+        _ => !V24_ONLY.contains(&id),
+    }
+}
+
 fn demote_to_v22(id: &str) -> Option<&'static str> {
     Some(match id {
         // §4.2 text information frames.
@@ -7786,12 +7820,27 @@ fn write_v22_frame(frame: &Id3Frame, out: &mut Vec<u8>) -> Result<()> {
                 None => return Ok(()),
             }
         }
+        // v2.4-only structural frames (RVA2 / EQU2 / SEEK / SIGN /
+        // ASPI) and v2.4-only text frames have no v2.2 home: drop them
+        // here rather than let `encode_frame(V2_3, …)`'s version guard
+        // surface as a propagated error. This keeps `write_tag(_, V2_2)`
+        // in lockstep with `frame_has_v22_home` / `convert_tag(_, V2_2)`
+        // on exactly which frames survive the version step.
+        Id3Frame::Rva2 { .. }
+        | Id3Frame::Equ2 { .. }
+        | Id3Frame::Seek { .. }
+        | Id3Frame::Signature { .. }
+        | Id3Frame::AudioSeekPointIndex { .. } => return Ok(()),
+        Id3Frame::Text { id, .. } if !text_id_valid_in_version(id, Id3Version::V2_3) => {
+            return Ok(())
+        }
         _ => {
             // Reuse the v2.3 encoder for the shared §4 bodies, then
             // demote the four-char id. encode_frame uses v2.3 text
             // conventions (UTF-16-with-BOM, '/' multi-value join) which
             // are valid v2.2 — encoding $01 and the '/' separator both
-            // predate v2.2.
+            // predate v2.2. A genuine malformed-payload error (e.g. an
+            // EQUA with zero adjustment_bits) still propagates.
             let (id, payload) = encode_frame(Id3Version::V2_3, frame)?;
             match demote_to_v22(&id) {
                 Some(id22) => (id22, payload),
@@ -7969,6 +8018,12 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
             if id.len() != 4 {
                 return Err(Error::invalid(format!(
                     "text frame id must be 4 chars: {id}"
+                )));
+            }
+            if !text_id_valid_in_version(id, version) {
+                return Err(Error::invalid(format!(
+                    "text frame {id} has no wire form in the target ID3v2 version; \
+                     call convert_tag first to fold it into the version's vocabulary"
                 )));
             }
             let joined = match version {
@@ -8172,6 +8227,14 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
             identification,
             channels,
         } => {
+            // RVA2 supersedes v2.3's RVAD and is v2.4-only (§4.11). It
+            // has no v2.3/v2.2 identifier; refuse to emit it under an
+            // older envelope, mirroring the RVAD v2.3-only guard.
+            if !matches!(version, Id3Version::V2_4) {
+                return Err(Error::invalid(
+                    "RVA2 frame is v2.4-only; use Rvad under V2_3 or drop it",
+                ));
+            }
             let mut payload = Vec::new();
             encode_latin1(&mut payload, identification);
             payload.push(0);
@@ -8206,6 +8269,14 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
             identification,
             points,
         } => {
+            // EQU2 supersedes v2.3's EQUA and is v2.4-only (§4.12); it
+            // has no v2.3/v2.2 identifier. Refuse rather than emit it
+            // under an older envelope, mirroring the EQUA guard.
+            if !matches!(version, Id3Version::V2_4) {
+                return Err(Error::invalid(
+                    "EQU2 frame is v2.4-only; use Equa under V2_3 or drop it",
+                ));
+            }
             let mut payload = Vec::new();
             payload.push(*interpolation);
             encode_latin1(&mut payload, identification);
@@ -8279,14 +8350,28 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
         }
         Id3Frame::Seek {
             min_offset_to_next_tag,
-        } => Ok((
-            "SEEK".to_string(),
-            min_offset_to_next_tag.to_be_bytes().to_vec(),
-        )),
+        } => {
+            // SEEK is a v2.4-only frame (§4.27); no older identifier.
+            if !matches!(version, Id3Version::V2_4) {
+                return Err(Error::invalid(
+                    "SEEK frame is v2.4-only; drop it before writing a v2.2/v2.3 tag",
+                ));
+            }
+            Ok((
+                "SEEK".to_string(),
+                min_offset_to_next_tag.to_be_bytes().to_vec(),
+            ))
+        }
         Id3Frame::Signature {
             group_symbol,
             signature,
         } => {
+            // SIGN is a v2.4-only frame (§4.28); no older identifier.
+            if !matches!(version, Id3Version::V2_4) {
+                return Err(Error::invalid(
+                    "SIGN frame is v2.4-only; drop it before writing a v2.2/v2.3 tag",
+                ));
+            }
             let mut payload = Vec::with_capacity(1 + signature.len());
             payload.push(*group_symbol);
             payload.extend_from_slice(signature);
@@ -8358,6 +8443,16 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
             bits_per_index_point,
             fractions,
         } => {
+            // ASPI is a v2.4-only frame (v2.4 §4.30); it has no v2.3 or
+            // v2.2 identifier, so refuse to serialise it under an older
+            // envelope rather than emit a frame id no conformant reader
+            // of that version recognises. This mirrors the v2.3-only
+            // RVAD/EQUA guards in the other direction.
+            if !matches!(version, Id3Version::V2_4) {
+                return Err(Error::invalid(
+                    "ASPI frame is v2.4-only; drop it before writing a v2.2/v2.3 tag",
+                ));
+            }
             // Spec §4.30 fixes the bits-per-point at 8 or 16. Anything
             // else is a caller bug; refuse rather than silently emit an
             // ambiguous frame the parser couldn't reconstruct.
@@ -9136,6 +9231,13 @@ fn convert_frames_v23_to_v24(frames: &[Id3Frame]) -> Vec<Id3Frame> {
                     values: flatten_pairs(pairs),
                 });
             }
+            // RVAD / EQUA are v2.3-only: v2.4 replaced them with RVA2 /
+            // EQU2, whose binary layouts differ enough that a lossless
+            // typed upgrade is out of scope. They have no v2.4 frame id,
+            // so drop them rather than carry a frame the v2.4 writer
+            // would itself reject (`encode_frame` errors on RVAD/EQUA
+            // under V2_4).
+            Id3Frame::Rvad { .. } | Id3Frame::Equa { .. } => {}
             other => out.push(other.clone()),
         }
     }
@@ -9190,16 +9292,30 @@ fn convert_frames_v24_to_v23(frames: &[Id3Frame]) -> Vec<Id3Frame> {
                     _ => out.push(frame.clone()),
                 }
             }
-            // Encoding / release / tagging time and musician credits have
-            // no v2.3 successor frame.
-            Id3Frame::Text { id, .. }
-                if id == "TDEN" || id == "TDRL" || id == "TDTG" || id == "TMCL" => {}
             Id3Frame::Text { id, values } if id == "TIPL" => {
                 // TIPL -> IPLS: same (role, name) pairs.
                 out.push(Id3Frame::Ipls {
                     pairs: pair_alternating(values),
                 });
             }
+            // Every remaining v2.4-only text id has no v2.3 home and no
+            // fold target: encoding / release / tagging time (TDEN /
+            // TDRL / TDTG), musician credits (TMCL), and the sort-order /
+            // mood / production frames (TSOA / TSOP / TSOT / TSST / TMOO /
+            // TPRO). Drop them so the converted tag carries only frame
+            // ids a conformant v2.3 reader recognises — the same set the
+            // v2.3 writer's `text_id_valid_in_version` gate accepts.
+            Id3Frame::Text { id, .. } if !text_id_valid_in_version(id, Id3Version::V2_3) => {}
+            // v2.4-only structural frames (RVA2 / EQU2 / SEEK / SIGN /
+            // ASPI) have no v2.3 identifier. (RVA2/EQU2 *replace* v2.3's
+            // RVAD/EQUA but the binary layouts differ enough that a
+            // lossless typed downgrade is out of scope; drop rather than
+            // emit a frame id the v2.3 writer would itself reject.)
+            Id3Frame::Rva2 { .. }
+            | Id3Frame::Equ2 { .. }
+            | Id3Frame::Seek { .. }
+            | Id3Frame::Signature { .. }
+            | Id3Frame::AudioSeekPointIndex { .. } => {}
             other => out.push(other.clone()),
         }
     }
