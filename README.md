@@ -353,10 +353,13 @@ spec-defined fields):
 | v2.3 → v2.4    | `TORY` v2.3 §4.2.1                      | `TDOR` (year) v2.4 §4.2.5      |
 | v2.3 → v2.4    | `IPLS` v2.3 §4.4                        | `TIPL` text frame v2.4 §4.2.2  |
 | v2.3 → v2.4    | `TRDA`, `TSIZ` v2.3 §4.2.1              | *(dropped — no v2.4 successor)*|
+| v2.3 → v2.4    | `RVAD` §4.12, `EQUA` §4.13              | *(dropped — `RVA2`/`EQU2` use incompatible layouts)*|
 | v2.4 → v2.3    | `TDRC` v2.4 §4.2.5                      | `TYER`(+`TDAT`+`TIME`) v2.3    |
 | v2.4 → v2.3    | `TDOR` v2.4 §4.2.5                      | `TORY` (year) v2.3 §4.2.1      |
 | v2.4 → v2.3    | `TIPL` v2.4 §4.2.2                      | `IPLS` v2.3 §4.4               |
 | v2.4 → v2.3    | `TDEN`, `TDRL`, `TDTG`, `TMCL`          | *(dropped — no v2.3 successor)*|
+| v2.4 → v2.3    | `TSOA`, `TSOP`, `TSOT`, `TSST`, `TMOO`, `TPRO` | *(dropped — v2.4-only §4.2)*|
+| v2.4 → v2.3    | `RVA2` §4.11, `EQU2` §4.12, `SEEK` §4.27, `SIGN` §4.28, `ASPI` §4.30 | *(dropped — v2.4-only)*|
 
 The timestamp fold/split honours precision: a bare `TYER` yields a
 `yyyy` `TDRC` and back; adding `TDAT` extends to `yyyy-MM-dd`; adding
@@ -366,6 +369,20 @@ target form is preserved verbatim under its source id rather than
 dropped, so the conversion never silently loses data. Every other frame
 carries through unchanged. Converting to the version a tag already
 declares returns a clone with `version` set.
+
+**Writer version gating.** `write_tag` is the lower layer: it serialises
+the in-memory frames as-is and does *not* translate vocabulary. So that
+it can never emit a frame id the target version never defined, it rejects
+a version-incompatible frame with `Error::invalid` rather than writing a
+wire-invalid tag. A v2.4-only frame (`RVA2`/`EQU2`/`SEEK`/`SIGN`/`ASPI`,
+or a v2.4-only text id such as `TDRC`/`TMOO`/`TSOA`) handed to
+`write_tag(_, V2_3)` is rejected; a v2.3-only date/size frame
+(`TYER`/`TDAT`/`TIME`/`TORY`/`TRDA`/`TSIZ`) handed to `write_tag(_, V2_4)`
+is rejected; the v2.3-only `RVAD`/`EQUA`/`IPLS` under `V2_4` were already
+rejected. Run `convert_tag` first to fold these into the target version's
+vocabulary — its output always writes cleanly. (The v2.2 writer, which is
+inherently lossy, *drops* version-incompatible frames instead of erroring,
+matching `demote_to_v22`.)
 
 **ID3v2.2 as an endpoint.** A parsed v2.2 tag already stores its frames
 under the promoted four-char v2.3 ids (`TT2 → TIT2`, `PIC → APIC`, …), so
