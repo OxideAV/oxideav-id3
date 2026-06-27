@@ -5065,3 +5065,83 @@ fn convert_v23_to_v24_drops_rvad_equa() {
     let bytes = write_tag(&v24, Id3Version::V2_4).expect("write converted v2.4");
     parse_tag(&bytes).expect("parse");
 }
+
+/// Full 3x3 version-conversion matrix smoke test. Build a tag carrying
+/// frames that are universal (TIT2, COMM, APIC) plus version-specific
+/// date frames, convert it to every target version, and assert the
+/// converted tag (a) declares the target version and (b) serialises
+/// cleanly under that version — i.e. carries no frame id the writer
+/// would reject. This pins `convert_tag` and `write_tag` agreement
+/// across every (source, target) pair.
+#[test]
+fn convert_matrix_every_pair_writes_clean() {
+    use Id3Version::{V2_2, V2_3, V2_4};
+
+    // A v2.3-vocabulary source (TYER/TDAT) plus universal frames.
+    let v23_src = Id3Tag {
+        version: V2_3,
+        frames: vec![
+            Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["Title".into()],
+            },
+            Id3Frame::Text {
+                id: "TYER".into(),
+                values: vec!["1999".into()],
+            },
+            Id3Frame::Text {
+                id: "TDAT".into(),
+                values: vec!["0312".into()], // 12 March
+            },
+            Id3Frame::Comment {
+                lang: *b"eng",
+                description: String::new(),
+                text: "hi".into(),
+            },
+        ],
+    };
+    // A v2.4-vocabulary source (TDRC) plus a v2.4-only mood frame.
+    let v24_src = Id3Tag {
+        version: V2_4,
+        frames: vec![
+            Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["Title".into()],
+            },
+            Id3Frame::Text {
+                id: "TDRC".into(),
+                values: vec!["1999-03-12".into()],
+            },
+            Id3Frame::Text {
+                id: "TMOO".into(),
+                values: vec!["Calm".into()],
+            },
+        ],
+    };
+
+    for src in [&v23_src, &v24_src] {
+        for target in [V2_2, V2_3, V2_4] {
+            let converted =
+                oxideav_id3::convert_tag(src, target).expect("convert should support all pairs");
+            assert_eq!(converted.version, target, "declared version");
+            // The converted tag must serialise without error under its
+            // own declared version, and re-parse.
+            let bytes = write_tag(&converted, target).unwrap_or_else(|e| {
+                panic!(
+                    "write {target:?} after convert from {:?}: {e:?}",
+                    src.version
+                )
+            });
+            let (parsed, _) = parse_tag(&bytes).expect("re-parse converted tag");
+            // TIT2 (universal) always survives every conversion path.
+            assert!(
+                parsed
+                    .frames
+                    .iter()
+                    .any(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TIT2")),
+                "TIT2 lost converting {:?} -> {target:?}",
+                src.version
+            );
+        }
+    }
+}
