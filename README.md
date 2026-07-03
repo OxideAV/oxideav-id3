@@ -1,5 +1,7 @@
 # oxideav-id3
 
+[![CI](https://github.com/OxideAV/oxideav-id3/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-id3/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-id3.svg)](https://crates.io/crates/oxideav-id3) [![docs.rs](https://docs.rs/oxideav-id3/badge.svg)](https://docs.rs/oxideav-id3) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **ID3** metadata tag parser and writer — ID3v1 / ID3v1.1
 trailers and ID3v2 (2.2 / 2.3 / 2.4) headers. Handles whole-tag and
 per-frame unsynchronisation, the v2.4 data-length indicator, and
