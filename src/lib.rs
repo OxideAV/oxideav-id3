@@ -6808,6 +6808,14 @@ fn decode_text(enc: u8, buf: &[u8]) -> String {
         3 => String::from_utf8_lossy(buf).to_string(),
         _ => latin1_to_string(buf),
     };
+    // Strip a stray leading BOM (U+FEFF). Encoding $01 (UTF-16) carries
+    // a mandatory byte-order mark that `decode_utf16_bom` already
+    // consumes at the byte level, but encodings $02 (UTF-16BE) and $03
+    // (UTF-8) are defined *without* a BOM (structure spec §4) — some
+    // taggers prepend one anyway. A leading U+FEFF is never meaningful
+    // content, so drop it here so it never leaks into a decoded value
+    // (this also catches a doubled BOM on the $01 path).
+    let s = s.strip_prefix('\u{FEFF}').unwrap_or(&s);
     // Trim trailing NULs — many taggers pad strings with them.
     s.trim_end_matches('\u{0}').to_string()
 }
@@ -15223,6 +15231,57 @@ mod tests {
                     values,
                     &vec!["One".to_string(), "Two".to_string(), "Three".to_string()]
                 );
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn utf8_text_frame_strips_stray_leading_bom() {
+        // Encoding $03 is defined without a BOM, but some taggers prepend
+        // the UTF-8 BOM (EF BB BF). It must not leak into the value.
+        let mut payload = vec![3u8]; // enc = UTF-8
+        payload.extend_from_slice(&[0xEF, 0xBB, 0xBF]); // UTF-8 BOM
+        payload.extend_from_slice("Café".as_bytes());
+        match parse_text_frame("TIT2", &payload) {
+            Id3Frame::Text { values, .. } => {
+                assert_eq!(values, vec!["Café".to_string()], "BOM must be stripped");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn utf16be_text_frame_strips_stray_leading_bom() {
+        // Encoding $02 is big-endian without a BOM; a stray FE FF prefix
+        // must be dropped rather than surfacing as U+FEFF.
+        fn utf16be(s: &str) -> Vec<u8> {
+            let mut v = Vec::new();
+            for u in s.encode_utf16() {
+                v.extend_from_slice(&u.to_be_bytes());
+            }
+            v
+        }
+        let mut payload = vec![2u8]; // enc = UTF-16BE
+        payload.extend_from_slice(&[0xFE, 0xFF]); // BE BOM as content
+        payload.extend_from_slice(&utf16be("Zürich"));
+        match parse_text_frame("TIT2", &payload) {
+            Id3Frame::Text { values, .. } => {
+                assert_eq!(values, vec!["Zürich".to_string()], "BOM must be stripped");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn utf8_bom_stripped_only_at_leading_position() {
+        // A U+FEFF that is not at the front (extremely rare, but valid
+        // content) must survive — only a *leading* BOM is stripped.
+        let mut payload = vec![3u8];
+        payload.extend_from_slice("A\u{FEFF}B".as_bytes());
+        match parse_text_frame("TIT2", &payload) {
+            Id3Frame::Text { values, .. } => {
+                assert_eq!(values, vec!["A\u{FEFF}B".to_string()]);
             }
             other => panic!("expected Text, got {other:?}"),
         }
