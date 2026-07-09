@@ -92,10 +92,15 @@ let trailer_bytes = write_id3v1(&tag);                   // 128 bytes, starts wi
 ```
 
 Text frames are emitted UTF-8 in v2.4 and UTF-16-with-BOM in v2.3 so
-non-ASCII values survive both. Multi-value text frames use NUL in v2.4
-and `/` in v2.3, matching what the parser splits on. `Id3Frame::Unknown`
-payloads round-trip verbatim so frames the parser did not understand
-are preserved on write.
+non-ASCII values survive both. A multi-value text frame is a NUL-separated
+list in v2.4 (spec §4.2), and the parser splits it back into its values
+losslessly. ID3v2.3 has no standard multi-value text mechanism, so the
+writer joins the values with `/` into a single string; the v2.3 parser
+does **not** re-split on `/` — that character is legitimate content in
+frames like `TRCK` (`3/10`) and `TPOS` — so a genuinely multi-value frame
+degrades to one joined value when written as v2.3. Convert to v2.4 first
+to preserve the values as a list. `Id3Frame::Unknown` payloads round-trip
+verbatim so frames the parser did not understand are preserved on write.
 
 ### Unsynchronisation on write
 

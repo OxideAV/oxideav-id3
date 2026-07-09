@@ -208,6 +208,53 @@ fn roundtrip_v24_multivalue_text() {
 }
 
 #[test]
+fn v23_multivalue_text_joins_and_does_not_resplit() {
+    // ID3v2.3 has no standard multi-value mechanism; the writer joins
+    // with `/` and the parser does NOT re-split on `/` (that would
+    // corrupt content like TRCK "3/10"). So a genuinely multi-value
+    // frame degrades to a single joined value under v2.3. This pins the
+    // documented lossy behavior — the previous README wording wrongly
+    // claimed the parser splits v2.3 on `/`.
+    let tag = Id3Tag {
+        version: Id3Version::V2_3,
+        frames: vec![Id3Frame::Text {
+            id: "TPE1".into(),
+            values: vec!["Alice".into(), "Bob".into()],
+        }],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
+    let (parsed, _) = parse_tag(&bytes).unwrap();
+    assert_eq!(
+        find_text(&parsed, "TPE1"),
+        Some(&["Alice/Bob".to_string()][..]),
+        "v2.3 multi-value must degrade to one joined value, not re-split"
+    );
+}
+
+#[test]
+fn v23_slash_bearing_single_value_survives_verbatim() {
+    // A single value that legitimately contains `/` (TRCK "3/10") must
+    // survive a v2.3 round-trip as exactly one value — never split into
+    // ["3","10"]. Guards the parser's deliberate no-`/`-split rule.
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        let tag = Id3Tag {
+            version,
+            frames: vec![Id3Frame::Text {
+                id: "TRCK".into(),
+                values: vec!["3/10".into()],
+            }],
+        };
+        let bytes = write_tag(&tag, version).unwrap();
+        let (parsed, _) = parse_tag(&bytes).unwrap();
+        assert_eq!(
+            find_text(&parsed, "TRCK"),
+            Some(&["3/10".to_string()][..]),
+            "TRCK 3/10 must round-trip as one value under {version:?}"
+        );
+    }
+}
+
+#[test]
 fn roundtrip_v23_unicode_via_utf16() {
     // v2.3 writer uses UTF-16 with BOM. Ensure non-ASCII titles survive.
     let tag = Id3Tag {
