@@ -1317,6 +1317,40 @@ fn parse_tcon_value(value: &str, out: &mut Vec<ContentType>) {
     }
 }
 
+/// Render one raw `TCON` value into the human-readable genre name(s)
+/// the flat key/value view exposes. A numeric reference — bare `17`
+/// (v2.4) or parenthesised `(17)` (v2.3) — resolves to its ID3v1
+/// genre-list name; the `RX` / `CR` keywords resolve to `Remix` /
+/// `Cover`; a free-text refinement passes through verbatim. An
+/// out-of-table numeric reference has no name in our table, so its
+/// numeric form is kept rather than silently dropped. A value that
+/// carries several references (e.g. `(17)(RX)Hardcore`) yields one
+/// entry per reference, matching how the flat view models a
+/// multi-value text frame.
+fn tcon_display_values(value: &str) -> Vec<String> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    let mut refs = Vec::new();
+    parse_tcon_value(value, &mut refs);
+    let mut out = Vec::new();
+    for r in refs {
+        match r {
+            ContentType::Genre { index, name } => {
+                out.push(name.map_or_else(|| index.to_string(), |n| n.to_string()));
+            }
+            ContentType::Remix => out.push("Remix".to_string()),
+            ContentType::Cover => out.push("Cover".to_string()),
+            ContentType::Custom(s) => {
+                if !s.is_empty() {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Interpret a bare (unparenthesised) reference token: a pure numeric
 /// string maps to a numeric genre, `RX` / `CR` to the keyword variants,
 /// and anything else to free text. Empty tokens are ignored.
@@ -4162,9 +4196,28 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
                 // per non-empty value under the shared key rather than
                 // collapsing them into a single slash-joined string.
                 let key = text_frame_to_key(id);
-                for value in values {
-                    if !value.is_empty() {
-                        push_unique(&mut out, key.clone(), value.clone());
+                if id == "TCON" {
+                    // TCON stores content-type *references*, not display
+                    // text: a bare or parenthesised numeric points into
+                    // the ID3v1 genre list (spec v2.3 §4.2.1 / v2.4
+                    // §4.2.3) and `RX` / `CR` are the spec's Remix /
+                    // Cover keywords. Resolve each reference to its
+                    // human-readable name for the flat view so a Vorbis
+                    // consumer sees `Rock`, not `(17)` — and so
+                    // `write_id3v1` (which round-trips the flat `genre`
+                    // string back through `id3v1_genre_index`) can map
+                    // the name to a numeric byte instead of losing the
+                    // genre.
+                    for value in values {
+                        for display in tcon_display_values(value) {
+                            push_unique(&mut out, key.clone(), display);
+                        }
+                    }
+                } else {
+                    for value in values {
+                        if !value.is_empty() {
+                            push_unique(&mut out, key.clone(), value.clone());
+                        }
                     }
                 }
             }
@@ -15171,5 +15224,140 @@ mod tests {
             }
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn flat_view_resolves_v23_parenthesised_genre_reference() {
+        // A v2.3 TCON carrying a numeric ID3v1 genre reference must
+        // surface the resolved name in the flat view, not the literal
+        // `(17)` — index 17 is Rock in the ID3v1 genre table.
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![Id3Frame::Text {
+                id: "TCON".to_string(),
+                values: vec!["(17)".to_string()],
+            }],
+        };
+        let kv = to_key_value_pairs(&tag);
+        assert!(
+            kv.contains(&("genre".to_string(), "Rock".to_string())),
+            "expected resolved genre=Rock, got {kv:?}"
+        );
+        assert!(
+            !kv.iter().any(|(k, v)| k == "genre" && v == "(17)"),
+            "raw reference must not leak into the flat view: {kv:?}"
+        );
+    }
+
+    #[test]
+    fn flat_view_resolves_v24_bare_numeric_genre_reference() {
+        // v2.4 dropped the parentheses; a bare numeric string is still a
+        // genre-list reference (§4.2.3).
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TCON".to_string(),
+                values: vec!["9".to_string()], // Metal
+            }],
+        };
+        let kv = to_key_value_pairs(&tag);
+        assert!(
+            kv.contains(&("genre".to_string(), "Metal".to_string())),
+            "expected resolved genre=Metal, got {kv:?}"
+        );
+    }
+
+    #[test]
+    fn flat_view_resolves_rx_cr_keywords_and_refinement() {
+        // `(17)(RX)Hardcore` = Rock, Remix keyword, plus a free-text
+        // refinement — each surfaces as its own genre entry.
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![Id3Frame::Text {
+                id: "TCON".to_string(),
+                values: vec!["(17)(RX)Hardcore".to_string()],
+            }],
+        };
+        let kv = to_key_value_pairs(&tag);
+        let genres: Vec<&String> = kv
+            .iter()
+            .filter(|(k, _)| k == "genre")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            genres,
+            vec![
+                &"Rock".to_string(),
+                &"Remix".to_string(),
+                &"Hardcore".to_string()
+            ],
+            "got {kv:?}"
+        );
+    }
+
+    #[test]
+    fn flat_view_preserves_plain_genre_name() {
+        // A free-text genre name is not a reference and must pass through
+        // unchanged (no regression for the common case).
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TCON".to_string(),
+                values: vec!["Progressive Rock".to_string()],
+            }],
+        };
+        let kv = to_key_value_pairs(&tag);
+        assert!(
+            kv.contains(&("genre".to_string(), "Progressive Rock".to_string())),
+            "got {kv:?}"
+        );
+    }
+
+    #[test]
+    fn flat_view_out_of_table_genre_index_kept_as_number() {
+        // A numeric reference outside our genre table has no name; keep
+        // the numeric form rather than dropping the datum.
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TCON".to_string(),
+                values: vec!["200".to_string()],
+            }],
+        };
+        let kv = to_key_value_pairs(&tag);
+        assert!(
+            kv.contains(&("genre".to_string(), "200".to_string())),
+            "got {kv:?}"
+        );
+    }
+
+    #[test]
+    fn parenthesised_genre_reference_survives_v2_to_v1_downconvert() {
+        // Regression: before the flat view resolved TCON references,
+        // `write_id3v1` fed the raw `(17)` to `id3v1_genre_index`, which
+        // does name matching, so the genre byte fell through to $FF
+        // (unknown) and the genre was lost. It must now round-trip to 17.
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![
+                Id3Frame::Text {
+                    id: "TIT2".to_string(),
+                    values: vec!["Song".to_string()],
+                },
+                Id3Frame::Text {
+                    id: "TCON".to_string(),
+                    values: vec!["(17)".to_string()],
+                },
+            ],
+        };
+        let v1 = write_id3v1(&tag);
+        assert_eq!(v1[127], 17, "genre byte must resolve to Rock (17)");
+        // And round back through the v1 parser to the resolved name.
+        let reparsed = parse_id3v1(&v1).expect("v1 parses");
+        let kv = to_key_value_pairs(&reparsed);
+        assert!(
+            kv.contains(&("genre".to_string(), "Rock".to_string())),
+            "got {kv:?}"
+        );
     }
 }
