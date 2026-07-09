@@ -4533,6 +4533,40 @@ fn v22_skips_frames_without_v22_equivalent() {
 }
 
 #[test]
+fn v22_drops_structural_aspi_lossily() {
+    // ASPI is v2.4-only (§4.30) with no v2.2 id. The inherently-lossy
+    // v2.2 writer drops it (matching the doc contract) rather than
+    // erroring or emitting a truncated id, while a co-resident text
+    // frame survives.
+    let tag = Id3Tag {
+        version: Id3Version::V2_2,
+        frames: vec![
+            Id3Frame::AudioSeekPointIndex {
+                indexed_data_start: 0,
+                indexed_data_length: 1000,
+                bits_per_index_point: 8,
+                fractions: vec![0, 128, 255],
+            },
+            Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["Survivor".into()],
+            },
+        ],
+    };
+    let bytes = write_tag(&tag, Id3Version::V2_2).expect("v2.2 write must not error");
+    assert!(
+        !bytes.windows(3).any(|w| w == b"ASP"),
+        "ASPI must be dropped under v2.2, not emitted"
+    );
+    let (parsed, _) = parse_tag(&bytes).expect("re-parse");
+    assert_eq!(parsed.frames.len(), 1);
+    assert_eq!(
+        find_text(&parsed, "TIT2"),
+        Some(&["Survivor".to_string()][..])
+    );
+}
+
+#[test]
 fn v22_rejects_v23plus_only_options() {
     let tag = Id3Tag {
         version: Id3Version::V2_2,

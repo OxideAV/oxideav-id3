@@ -337,9 +337,11 @@ pub enum Id3Frame {
     /// other widths. The presence of an ASPI frame implies a TLEN frame
     /// must also be present in the tag (this crate does not enforce
     /// that cross-frame invariant — that is a caller-level concern).
-    /// ASPI is v2.4-only per spec but the wire layout is byte-aligned
-    /// and version-independent, so the writer emits it under any
-    /// version envelope.
+    /// ASPI is v2.4-only per spec: it has no v2.3 or v2.2 frame id, so
+    /// the writer rejects it with [`Error::invalid`] under a `V2_3`
+    /// target (matching the `RVA2`/`EQU2`/`SEEK`/`SIGN` v2.4-only gate)
+    /// and the inherently-lossy v2.2 writer drops it, rather than
+    /// emitting a frame id no conformant reader of that version knows.
     AudioSeekPointIndex {
         indexed_data_start: u32,
         indexed_data_length: u32,
