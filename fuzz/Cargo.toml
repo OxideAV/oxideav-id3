@@ -26,7 +26,7 @@ cargo-fuzz = true
 # encoder doesn't know how to express).
 #
 # No external library worth dlopen-ing as a cross-decode oracle: the
-# clean-room wall bars id3/taglib/mutagen/eyed3, and even if it didn't,
+# clean-room wall bars all external ID3 implementations, and even if it didn't,
 # real-world ID3 readers diverge wildly on malformed input — there is
 # no canonical "what should this byte sequence mean" answer to compare
 # against. Decode-only panic-freedom is the contract.
