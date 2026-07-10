@@ -17,7 +17,14 @@
 //!   header and return an [`Id3Tag`] plus the number of bytes consumed
 //!   (so callers can seek past the tag and resume normal file reads).
 //! * [`parse_id3v1`] — take the last 128 bytes of a file and, if they
-//!   start with `TAG`, return the v1 tag.
+//!   start with `TAG`, return the v1 tag. [`Id3v1Tag`] is the typed
+//!   fixed-field form underneath it (raw genre byte, v1.0-vs-v1.1
+//!   track rule), with [`Id3v1Tag::parse`] / [`Id3v1Tag::to_bytes`]
+//!   symmetric.
+//! * [`parse_id3v1_enhanced`] / [`write_id3v1_enhanced`] — the
+//!   informal 227-byte `TAG+` extension block ([`EnhancedTag`]):
+//!   60-char title/artist/album continuations, free-text genre,
+//!   speed and `mmm:ss` start/end times.
 //! * [`tag_size_at_head`] — peek at the first 10 bytes to work out the
 //!   total on-disk tag size without parsing frames.
 //! * [`to_key_value_pairs`] — normalise an [`Id3Tag`] into the
@@ -62,9 +69,10 @@
 //! * The full ID3v2.2.0 §4 frame table — every declared 3-char id
 //!   maps onto the typed variants below (`UFI`/`IPL`/`MCI`/`ETC`/
 //!   `MLL`/`STC`/`SLT`/`COM`/`RVA`/`EQU`/`REV`/`PIC`/`GEO`/`CNT`/
-//!   `POP`/`BUF`/`CRA`/`LNK` plus all text and URL ids), except `CRM`
-//!   (encrypted meta frame, v2.2 §4.20 — no v2.3/v2.4 descendant)
-//!   which is preserved via [`Id3Frame::Unknown`]. The v2.2 header
+//!   `POP`/`BUF`/`CRA`/`LNK` plus all text and URL ids), including
+//!   `CRM` (encrypted meta frame, v2.2 §4.20 — no v2.3/v2.4
+//!   descendant), whose structural fields surface as
+//!   [`Id3Frame::EncryptedMeta`]. The v2.2 header
 //!   compression bit (§3.1 flag bit 6) makes the parser ignore the
 //!   entire tag body per spec while still reporting the correct
 //!   consumed size.
@@ -89,6 +97,11 @@
 //! * `AENC` audio encryption / `LINK` linked information.
 //! * `ASPI` audio seek point index (v2.4).
 //! * `MLLT` MPEG location lookup table.
+//! * `CHAP` chapters and `CTOC` tables of contents (the ID3v2 Chapter
+//!   Frame Addendum to v2.3/v2.4), with embedded sub-frames (chapter
+//!   titles, images, URLs) parsed recursively behind a nesting-depth
+//!   guard. [`Id3Tag::chapters`] / [`Id3Tag::ordered_chapters`] /
+//!   [`Id3Tag::top_level_toc`] walk them typed, cycle-safe.
 //!
 //! Everything else lands in [`Id3Frame::Unknown`] with the raw payload
 //! preserved so future code can extend recognition without reparsing.
@@ -565,9 +578,70 @@ pub enum Id3Frame {
         content: String,
         encrypted: Vec<u8>,
     },
-    /// Any frame whose id we don't parse structurally (RGAD, CHAP,
-    /// ...). The payload is preserved verbatim so callers or later
-    /// versions can recognise it without needing to reparse.
+    /// `CHAP` chapter frame (ID3v2 Chapter Frame Addendum §3.1, an
+    /// addendum to v2.3 and v2.4). Describes a single chapter within
+    /// the audio file. More than one `CHAP` may appear in a tag, but
+    /// each must carry an element ID unique against every other
+    /// `CHAP` / `CTOC` in the tag (a caller-level invariant, matching
+    /// how the crate treats other uniqueness rules).
+    ///
+    /// * `element_id` — NUL-terminated ISO-8859-1 identifier. Not
+    ///   intended to be human readable and should not be shown to the
+    ///   end user (chapter names belong in a `TIT2` sub-frame).
+    /// * `start_time_ms` / `end_time_ms` — millisecond counts from the
+    ///   beginning of the file to the start and end of the chapter.
+    /// * `start_offset` / `end_offset` — zero-based byte counts from
+    ///   the beginning of the file to the first byte of the first
+    ///   audio frame in the chapter / of the audio frame following
+    ///   the chapter's end. The addendum's "all bytes set to 0xFF"
+    ///   ignore-sentinel is surfaced as `None` (use the time values
+    ///   instead); the writer emits `$FF FF FF FF` for `None`.
+    /// * `sub_frames` — optional embedded frames carried within the
+    ///   `CHAP` body (e.g. a `TIT2` chapter name, `TIT3` description,
+    ///   `APIC` image, `W***`/`WXXX` URLs), each with a full frame
+    ///   header in the enclosing tag's version.
+    Chapter {
+        element_id: String,
+        start_time_ms: u32,
+        end_time_ms: u32,
+        start_offset: Option<u32>,
+        end_offset: Option<u32>,
+        sub_frames: Vec<Id3Frame>,
+    },
+    /// `CTOC` table-of-contents frame (ID3v2 Chapter Frame Addendum
+    /// §3.2). Each `CTOC` represents one level of a (possibly
+    /// hierarchical) table of contents as a list of child element IDs
+    /// referencing other `CHAP` / `CTOC` frames in the tag. Element-ID
+    /// uniqueness across all `CHAP` / `CTOC` frames and the
+    /// only-one-top-level-`CTOC` rule are caller-level invariants.
+    ///
+    /// * `top_level` — flag bit `a`: set on the root of the TOC tree
+    ///   (a frame that is not a child of any other `CTOC`); only one
+    ///   `CTOC` per tag may set it.
+    /// * `ordered` — flag bit `b`: set when the child list is an
+    ///   ordered sequence (play continuously) rather than an
+    ///   unordered collection (play individually).
+    /// * `child_ids` — the child element ID list (each entry a
+    ///   NUL-terminated ISO-8859-1 string on the wire). The addendum
+    ///   requires the entry count to be greater than zero; the writer
+    ///   enforces that, while the parser tolerates an empty list so a
+    ///   non-conforming source surfaces structurally. The count field
+    ///   is a single byte, capping the list at 255 entries on write.
+    /// * `sub_frames` — optional embedded frames describing this TOC
+    ///   element (e.g. a `TIT2` name such as "Part 1").
+    TableOfContents {
+        element_id: String,
+        top_level: bool,
+        ordered: bool,
+        child_ids: Vec<String>,
+        sub_frames: Vec<Id3Frame>,
+    },
+    /// Any frame whose id we don't parse structurally (RGAD, ...).
+    /// The payload is preserved verbatim so callers or later versions
+    /// can recognise it without needing to reparse. Structural frames
+    /// whose payload is malformed (e.g. a truncated `CHAP` or an
+    /// over-announced `CTOC` child count) also land here so the raw
+    /// bytes survive a round-trip.
     Unknown { id: String, raw: Vec<u8> },
 }
 
@@ -4836,6 +4910,8 @@ pub fn to_key_value_pairs(tag: &Id3Tag) -> Vec<(String, String)> {
             | Id3Frame::Equa { .. }
             | Id3Frame::Ipls { .. }
             | Id3Frame::EncryptedMeta { .. }
+            | Id3Frame::Chapter { .. }
+            | Id3Frame::TableOfContents { .. }
             | Id3Frame::Unknown { .. } => {}
         }
     }
@@ -5189,6 +5265,22 @@ fn crc32_to_synchsafe5(crc: u32) -> [u8; 5] {
 }
 
 fn parse_frames(version: Id3Version, body: &[u8]) -> Vec<Id3Frame> {
+    parse_frames_at_depth(version, body, 0)
+}
+
+/// Maximum nesting depth for frames embedded inside `CHAP` / `CTOC`
+/// bodies. The addendum permits sub-frames — including further `CHAP`
+/// / `CTOC` frames — inside a chapter body, which makes the parser
+/// structurally recursive; a hostile tag could nest thousands of
+/// levels in a few kilobytes and overflow the stack. Beyond this depth
+/// the embedded region is preserved verbatim inside the enclosing
+/// frame's [`Id3Frame::Unknown`] fallback instead of being descended
+/// into. Real-world chapter tags use depth 1 (sub-frames directly in
+/// the chapter); a hierarchical TOC references its children by element
+/// ID rather than by nesting, so 8 is generous.
+const MAX_EMBEDDED_FRAME_DEPTH: usize = 8;
+
+fn parse_frames_at_depth(version: Id3Version, body: &[u8], depth: usize) -> Vec<Id3Frame> {
     let mut frames = Vec::new();
     let mut i = 0usize;
     while i < body.len() {
@@ -5197,7 +5289,7 @@ fn parse_frames(version: Id3Version, body: &[u8]) -> Vec<Id3Frame> {
         if body[i] == 0 {
             break;
         }
-        match parse_one_frame(version, &body[i..]) {
+        match parse_one_frame(version, &body[i..], depth) {
             Ok((frame, consumed)) => {
                 frames.push(frame);
                 i += consumed;
@@ -5214,11 +5306,11 @@ fn parse_frames(version: Id3Version, body: &[u8]) -> Vec<Id3Frame> {
     frames
 }
 
-fn parse_one_frame(version: Id3Version, buf: &[u8]) -> Result<(Id3Frame, usize)> {
+fn parse_one_frame(version: Id3Version, buf: &[u8], depth: usize) -> Result<(Id3Frame, usize)> {
     match version {
         Id3Version::V2_2 => parse_v22_frame(buf),
-        Id3Version::V2_3 => parse_v23_frame(buf),
-        Id3Version::V2_4 => parse_v24_frame(buf),
+        Id3Version::V2_3 => parse_v23_frame(buf, depth),
+        Id3Version::V2_4 => parse_v24_frame(buf, depth),
         Id3Version::V1 => Err(Error::invalid("parse_one_frame called on v1")),
     }
 }
@@ -5239,7 +5331,7 @@ fn parse_v22_frame(buf: &[u8]) -> Result<(Id3Frame, usize)> {
     Ok((frame, 6 + size))
 }
 
-fn parse_v23_frame(buf: &[u8]) -> Result<(Id3Frame, usize)> {
+fn parse_v23_frame(buf: &[u8], depth: usize) -> Result<(Id3Frame, usize)> {
     if buf.len() < 10 {
         return Err(Error::invalid("v2.3 frame header truncated"));
     }
@@ -5300,14 +5392,14 @@ fn parse_v23_frame(buf: &[u8]) -> Result<(Id3Frame, usize)> {
 
     let frame = if compressed {
         let inflated = inflate_frame(payload, decompressed_size)?;
-        dispatch_v23_v24(Id3Version::V2_3, &id, &inflated)
+        dispatch_v23_v24(Id3Version::V2_3, &id, &inflated, depth)
     } else {
-        dispatch_v23_v24(Id3Version::V2_3, &id, payload)
+        dispatch_v23_v24(Id3Version::V2_3, &id, payload, depth)
     };
     Ok((frame, 10 + size))
 }
 
-fn parse_v24_frame(buf: &[u8]) -> Result<(Id3Frame, usize)> {
+fn parse_v24_frame(buf: &[u8], depth: usize) -> Result<(Id3Frame, usize)> {
     if buf.len() < 10 {
         return Err(Error::invalid("v2.4 frame header truncated"));
     }
@@ -5370,7 +5462,7 @@ fn parse_v24_frame(buf: &[u8]) -> Result<(Id3Frame, usize)> {
         }
         let inflated = inflate_frame(data, announced)?;
         return Ok((
-            dispatch_v23_v24(Id3Version::V2_4, &id, &inflated),
+            dispatch_v23_v24(Id3Version::V2_4, &id, &inflated, depth),
             10 + size,
         ));
     }
@@ -5391,7 +5483,7 @@ fn parse_v24_frame(buf: &[u8]) -> Result<(Id3Frame, usize)> {
         // without an extra let, so give it one.
         let _ = &unsync_owned;
     }
-    let frame = dispatch_v23_v24(Id3Version::V2_4, &id, payload);
+    let frame = dispatch_v23_v24(Id3Version::V2_4, &id, payload, depth);
     Ok((frame, 10 + size))
 }
 
@@ -5399,7 +5491,7 @@ fn parse_v24_frame(buf: &[u8]) -> Result<(Id3Frame, usize)> {
 /// its 4-char id. `version` disambiguates the handful of frames whose
 /// payload layout differs between v2.3 and v2.4 (currently only `LINK`,
 /// whose frame-id field is 3 bytes in v2.3 but 4 in v2.4).
-fn dispatch_v23_v24(version: Id3Version, id: &str, payload: &[u8]) -> Id3Frame {
+fn dispatch_v23_v24(version: Id3Version, id: &str, payload: &[u8], depth: usize) -> Id3Frame {
     if id == "TXXX" {
         return parse_txxx(id, payload);
     }
@@ -5438,6 +5530,8 @@ fn dispatch_v23_v24(version: Id3Version, id: &str, payload: &[u8]) -> Id3Frame {
         "ENCR" => parse_encr(payload),
         "AENC" => parse_aenc(payload),
         "LINK" => parse_link(version, payload),
+        "CHAP" => parse_chap(version, payload, depth),
+        "CTOC" => parse_ctoc(version, payload, depth),
         "ASPI" => parse_aspi(payload),
         "MLLT" => parse_mllt(payload),
         "RVRB" => parse_rvrb(payload),
@@ -6572,6 +6666,115 @@ fn parse_link_v22(payload: &[u8]) -> Id3Frame {
         frame_id,
         url: latin1_to_string(url_bytes),
         additional: additional_bytes.to_vec(),
+    }
+}
+
+/// Parse a `CHAP` chapter payload (Chapter Frame Addendum §3.1).
+/// Layout after the enclosing frame header:
+///
+/// ```text
+///   Element ID     <text string> $00   (ISO-8859-1, NUL-terminated)
+///   Start time     $xx xx xx xx        (BE u32, milliseconds)
+///   End time       $xx xx xx xx        (BE u32, milliseconds)
+///   Start offset   $xx xx xx xx        (BE u32 bytes; $FF FF FF FF = ignore)
+///   End offset     $xx xx xx xx        (BE u32 bytes; $FF FF FF FF = ignore)
+///   <optional embedded sub-frames>     (full frame headers, tag's version)
+/// ```
+///
+/// A payload too short to carry the element-ID terminator plus the
+/// four fixed u32 fields is preserved verbatim as
+/// [`Id3Frame::Unknown`] so the bytes survive a round-trip. The
+/// embedded sub-frames are parsed with the enclosing tag's frame
+/// walker at `depth + 1`; past [`MAX_EMBEDDED_FRAME_DEPTH`] the whole
+/// payload falls back to `Unknown` rather than recursing further.
+fn parse_chap(version: Id3Version, payload: &[u8], depth: usize) -> Id3Frame {
+    let unknown = || Id3Frame::Unknown {
+        id: "CHAP".to_string(),
+        raw: payload.to_vec(),
+    };
+    if depth >= MAX_EMBEDDED_FRAME_DEPTH {
+        return unknown();
+    }
+    // The element ID requires an explicit NUL terminator: without one
+    // there is no fixed-field block at all.
+    let Some(nul) = payload.iter().position(|&b| b == 0) else {
+        return unknown();
+    };
+    let element_id = latin1_to_string(&payload[..nul]);
+    let rest = &payload[nul + 1..];
+    if rest.len() < 16 {
+        return unknown();
+    }
+    let word = |i: usize| regular_u32(rest[i], rest[i + 1], rest[i + 2], rest[i + 3]);
+    // "If these bytes are all set to 0xFF then the value should be
+    // ignored and the start/end time value should be utilized."
+    let offset = |i: usize| match word(i) {
+        0xFFFF_FFFF => None,
+        v => Some(v),
+    };
+    Id3Frame::Chapter {
+        element_id,
+        start_time_ms: word(0),
+        end_time_ms: word(4),
+        start_offset: offset(8),
+        end_offset: offset(12),
+        sub_frames: parse_frames_at_depth(version, &rest[16..], depth + 1),
+    }
+}
+
+/// Parse a `CTOC` table-of-contents payload (Chapter Frame Addendum
+/// §3.2). Layout after the enclosing frame header:
+///
+/// ```text
+///   Element ID        <text string> $00   (ISO-8859-1, NUL-terminated)
+///   Flags             %000000ab           (a = top-level, b = ordered)
+///   Entry count       $xx                 (u8, must be > 0 per spec)
+///   Child Element ID  <text string> $00   (entry-count repetitions)
+///   <optional embedded sub-frames>
+/// ```
+///
+/// The parser tolerates a zero entry count (non-conforming but
+/// structurally sound) so the frame surfaces typed; an entry count
+/// that *over-announces* the available data (the payload runs out
+/// before the last child ID) preserves the payload verbatim as
+/// [`Id3Frame::Unknown`] instead of inventing empty children —
+/// there is no way to tell child-list bytes from sub-frame bytes once
+/// the count lies. Reserved flag bits (the high six) are ignored.
+fn parse_ctoc(version: Id3Version, payload: &[u8], depth: usize) -> Id3Frame {
+    let unknown = || Id3Frame::Unknown {
+        id: "CTOC".to_string(),
+        raw: payload.to_vec(),
+    };
+    if depth >= MAX_EMBEDDED_FRAME_DEPTH {
+        return unknown();
+    }
+    let Some(nul) = payload.iter().position(|&b| b == 0) else {
+        return unknown();
+    };
+    let element_id = latin1_to_string(&payload[..nul]);
+    let rest = &payload[nul + 1..];
+    if rest.len() < 2 {
+        return unknown();
+    }
+    let flags = rest[0];
+    let entry_count = rest[1] as usize;
+    let mut remaining = &rest[2..];
+    let mut child_ids = Vec::with_capacity(entry_count.min(32));
+    for _ in 0..entry_count {
+        // Each entry is a NUL-terminated string; a missing terminator
+        // means the announced count outruns the data.
+        let Some(nul) = remaining.iter().position(|&b| b == 0) else {
+            return unknown();
+        };
+        child_ids.push(latin1_to_string(&remaining[..nul]));
+        remaining = &remaining[nul + 1..];
+    }
+    Id3Frame::TableOfContents {
+        element_id,
+        top_level: flags & 0x02 != 0,
+        ordered: flags & 0x01 != 0,
+        child_ids,
+        sub_frames: parse_frames_at_depth(version, remaining, depth + 1),
     }
 }
 
@@ -8344,6 +8547,11 @@ fn write_v22_frame(frame: &Id3Frame, out: &mut Vec<u8>) -> Result<()> {
         | Id3Frame::Seek { .. }
         | Id3Frame::Signature { .. }
         | Id3Frame::AudioSeekPointIndex { .. } => return Ok(()),
+        // CHAP / CTOC are a v2.3/v2.4 addendum with no v2.2 frame id;
+        // drop them here (rather than via the demotion table) so a
+        // sub-frame that cannot encode under v2.3 doesn't surface as a
+        // propagated error from a frame we were going to drop anyway.
+        Id3Frame::Chapter { .. } | Id3Frame::TableOfContents { .. } => return Ok(()),
         Id3Frame::Text { id, .. } if !text_id_valid_in_version(id, Id3Version::V2_3) => {
             return Ok(())
         }
@@ -8950,6 +9158,66 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
             payload.extend_from_slice(additional);
             Ok(("LINK".to_string(), payload))
         }
+        Id3Frame::Chapter {
+            element_id,
+            start_time_ms,
+            end_time_ms,
+            start_offset,
+            end_offset,
+            sub_frames,
+        } => {
+            // CHAP is an addendum to v2.3 and v2.4 only; it has no
+            // v2.2 identifier (the v2.2 writer drops it).
+            if !matches!(version, Id3Version::V2_3 | Id3Version::V2_4) {
+                return Err(Error::invalid(
+                    "CHAP frames are defined for ID3v2.3/v2.4 only",
+                ));
+            }
+            let mut payload = Vec::new();
+            encode_element_id(&mut payload, element_id)?;
+            payload.extend_from_slice(&start_time_ms.to_be_bytes());
+            payload.extend_from_slice(&end_time_ms.to_be_bytes());
+            // §3.1: an all-0xFF offset means "ignore; use the time".
+            payload.extend_from_slice(&start_offset.unwrap_or(0xFFFF_FFFF).to_be_bytes());
+            payload.extend_from_slice(&end_offset.unwrap_or(0xFFFF_FFFF).to_be_bytes());
+            encode_embedded_subframes(version, sub_frames, &mut payload)?;
+            Ok(("CHAP".to_string(), payload))
+        }
+        Id3Frame::TableOfContents {
+            element_id,
+            top_level,
+            ordered,
+            child_ids,
+            sub_frames,
+        } => {
+            if !matches!(version, Id3Version::V2_3 | Id3Version::V2_4) {
+                return Err(Error::invalid(
+                    "CTOC frames are defined for ID3v2.3/v2.4 only",
+                ));
+            }
+            // §3.2: "The Entry count is the number of entries in the
+            // Child Element ID list that follows and must be greater
+            // than zero." The count field is one byte, so 255 is the
+            // ceiling.
+            if child_ids.is_empty() {
+                return Err(Error::invalid("CTOC entry count must be greater than zero"));
+            }
+            if child_ids.len() > 255 {
+                return Err(Error::invalid(
+                    "CTOC child list exceeds the one-byte entry-count field (max 255)",
+                ));
+            }
+            let mut payload = Vec::new();
+            encode_element_id(&mut payload, element_id)?;
+            // Flags %000000ab: a (bit 1) = top-level, b (bit 0) = ordered.
+            payload.push(((*top_level as u8) << 1) | (*ordered as u8));
+            payload.push(child_ids.len() as u8);
+            for child in child_ids {
+                encode_element_id(&mut payload, child)?;
+            }
+            encode_embedded_subframes(version, sub_frames, &mut payload)?;
+            Ok(("CTOC".to_string(), payload))
+        }
         Id3Frame::AudioSeekPointIndex {
             indexed_data_start,
             indexed_data_length,
@@ -9412,6 +9680,66 @@ fn encode_latin1(out: &mut Vec<u8>, s: &str) {
     }
 }
 
+/// Write a `CHAP` / `CTOC` element ID: ISO-8859-1 bytes plus the NUL
+/// terminator. An embedded NUL character would silently truncate the
+/// identifier for every reader (the wire format is NUL-terminated), so
+/// it is rejected rather than emitted.
+fn encode_element_id(out: &mut Vec<u8>, id: &str) -> Result<()> {
+    if id.chars().any(|c| c == '\u{0}') {
+        return Err(Error::invalid(
+            "CHAP/CTOC element ids are NUL-terminated on the wire and cannot contain NUL",
+        ));
+    }
+    encode_latin1(out, id);
+    out.push(0);
+    Ok(())
+}
+
+/// Serialise embedded sub-frames (the optional tail of a `CHAP` /
+/// `CTOC` body). Each sub-frame gets a full frame header in the
+/// enclosing tag's version — 4-char id, version-appropriate size field
+/// (regular u32 for v2.3, synchsafe for v2.4), zeroed flag bytes —
+/// exactly as it would at tag top level, which is what lets a chapter
+/// skipper treat the region as opaque bytes. Per-frame compression /
+/// unsync options never apply inside an embedded region.
+fn encode_embedded_subframes(
+    version: Id3Version,
+    sub_frames: &[Id3Frame],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    for sub in sub_frames {
+        let (id, payload) = encode_frame(version, sub)?;
+        let id_bytes = id.as_bytes();
+        if id_bytes.len() != 4 || !id_bytes.iter().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(Error::invalid(format!(
+                "invalid embedded sub-frame id: {id}"
+            )));
+        }
+        out.extend_from_slice(id_bytes);
+        match version {
+            Id3Version::V2_4 => {
+                if payload.len() >= 1 << 28 {
+                    return Err(Error::invalid(
+                        "embedded sub-frame size exceeds the v2.4 synchsafe limit",
+                    ));
+                }
+                out.extend_from_slice(&synchsafe_bytes_u28(payload.len() as u32));
+            }
+            Id3Version::V2_3 => {
+                out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            }
+            Id3Version::V2_2 | Id3Version::V1 => {
+                return Err(Error::invalid(
+                    "embedded sub-frames require a v2.3/v2.4 envelope",
+                ));
+            }
+        }
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&payload);
+    }
+    Ok(())
+}
+
 /// Write `s` as exactly 8 ISO-8859-1 bytes — truncate if longer,
 /// pad with ASCII spaces if shorter. Used for the spec-mandated
 /// fixed-width `YYYYMMDD` date fields in `OWNE` / `COMR`.
@@ -9619,6 +9947,9 @@ fn frame_has_v22_home(frame: &Id3Frame) -> bool {
         // three-char id (e.g. a preserved v2.2-only `CRM`) or has a
         // demotion. A four-char Unknown with no demotion is dropped.
         Id3Frame::Unknown { id, .. } => demote_to_v22(id).is_some() || is_valid_v22_id(id),
+        // The chapter addendum extends v2.3/v2.4 only; the v2.2 writer
+        // drops CHAP / CTOC via its dedicated skip arm.
+        Id3Frame::Chapter { .. } | Id3Frame::TableOfContents { .. } => false,
         // Every other structural frame demotes via its v2.3 id, exactly
         // as `write_v22_frame`'s default arm does: encode under the v2.3
         // vocabulary to recover the four-char id, then test the demotion
@@ -9755,6 +10086,38 @@ fn convert_frames_v23_to_v24(frames: &[Id3Frame]) -> Vec<Id3Frame> {
             // would itself reject (`encode_frame` errors on RVAD/EQUA
             // under V2_4).
             Id3Frame::Rvad { .. } | Id3Frame::Equa { .. } => {}
+            // CHAP / CTOC carry whole embedded frames; their
+            // sub-frames cross the version boundary with the same
+            // vocabulary fold as top-level frames (e.g. a chapter's
+            // TYER folds into TDRC and vice versa).
+            Id3Frame::Chapter {
+                element_id,
+                start_time_ms,
+                end_time_ms,
+                start_offset,
+                end_offset,
+                sub_frames,
+            } => out.push(Id3Frame::Chapter {
+                element_id: element_id.clone(),
+                start_time_ms: *start_time_ms,
+                end_time_ms: *end_time_ms,
+                start_offset: *start_offset,
+                end_offset: *end_offset,
+                sub_frames: convert_frames_v23_to_v24(sub_frames),
+            }),
+            Id3Frame::TableOfContents {
+                element_id,
+                top_level,
+                ordered,
+                child_ids,
+                sub_frames,
+            } => out.push(Id3Frame::TableOfContents {
+                element_id: element_id.clone(),
+                top_level: *top_level,
+                ordered: *ordered,
+                child_ids: child_ids.clone(),
+                sub_frames: convert_frames_v23_to_v24(sub_frames),
+            }),
             other => out.push(other.clone()),
         }
     }
@@ -9833,6 +10196,38 @@ fn convert_frames_v24_to_v23(frames: &[Id3Frame]) -> Vec<Id3Frame> {
             | Id3Frame::Seek { .. }
             | Id3Frame::Signature { .. }
             | Id3Frame::AudioSeekPointIndex { .. } => {}
+            // CHAP / CTOC carry whole embedded frames; their
+            // sub-frames cross the version boundary with the same
+            // vocabulary fold as top-level frames (e.g. a chapter's
+            // TYER folds into TDRC and vice versa).
+            Id3Frame::Chapter {
+                element_id,
+                start_time_ms,
+                end_time_ms,
+                start_offset,
+                end_offset,
+                sub_frames,
+            } => out.push(Id3Frame::Chapter {
+                element_id: element_id.clone(),
+                start_time_ms: *start_time_ms,
+                end_time_ms: *end_time_ms,
+                start_offset: *start_offset,
+                end_offset: *end_offset,
+                sub_frames: convert_frames_v24_to_v23(sub_frames),
+            }),
+            Id3Frame::TableOfContents {
+                element_id,
+                top_level,
+                ordered,
+                child_ids,
+                sub_frames,
+            } => out.push(Id3Frame::TableOfContents {
+                element_id: element_id.clone(),
+                top_level: *top_level,
+                ordered: *ordered,
+                child_ids: child_ids.clone(),
+                sub_frames: convert_frames_v24_to_v23(sub_frames),
+            }),
             other => out.push(other.clone()),
         }
     }
@@ -9857,6 +10252,211 @@ impl Id3Tag {
     /// [`convert_tag`] for the exact frame mapping and version support.
     pub fn to_version(&self, target_version: Id3Version) -> Result<Id3Tag> {
         convert_tag(self, target_version)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chapter / table-of-contents typed walkers
+// (docs/container/id3/id3v2-chapters-1.0.md)
+// ---------------------------------------------------------------------------
+
+/// Borrowed typed view of one `CHAP` frame
+/// ([`Id3Frame::Chapter`]) with sub-frame convenience accessors.
+#[derive(Clone, Copy, Debug)]
+pub struct ChapterRef<'a> {
+    pub element_id: &'a str,
+    pub start_time_ms: u32,
+    pub end_time_ms: u32,
+    pub start_offset: Option<u32>,
+    pub end_offset: Option<u32>,
+    pub sub_frames: &'a [Id3Frame],
+}
+
+impl<'a> ChapterRef<'a> {
+    /// The chapter name: the first embedded `TIT2` sub-frame's value.
+    /// The addendum §4 recommends every `CHAP` carry one as the
+    /// human-readable identifier (the element ID is not for display).
+    pub fn title(&self) -> Option<&'a str> {
+        first_sub_text(self.sub_frames, "TIT2")
+    }
+
+    /// The chapter description: the first embedded `TIT3` sub-frame's
+    /// value (the addendum's Figure 1 example pairs a `TIT2` name with
+    /// a `TIT3` description).
+    pub fn description(&self) -> Option<&'a str> {
+        first_sub_text(self.sub_frames, "TIT3")
+    }
+
+    /// Every embedded `APIC` picture (e.g. a per-chapter slide).
+    pub fn pictures(&self) -> Vec<&'a AttachedPicture> {
+        self.sub_frames
+            .iter()
+            .filter_map(|f| match f {
+                Id3Frame::Picture(p) => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every embedded URL — both the fixed `W***` frames and
+    /// user-defined `WXXX`.
+    pub fn urls(&self) -> Vec<&'a str> {
+        self.sub_frames
+            .iter()
+            .filter_map(|f| match f {
+                Id3Frame::Url { url, .. } => Some(url.as_str()),
+                Id3Frame::UserUrl { url, .. } => Some(url.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Borrowed typed view of one `CTOC` frame
+/// ([`Id3Frame::TableOfContents`]).
+#[derive(Clone, Copy, Debug)]
+pub struct TocRef<'a> {
+    pub element_id: &'a str,
+    pub top_level: bool,
+    pub ordered: bool,
+    pub child_ids: &'a [String],
+    pub sub_frames: &'a [Id3Frame],
+}
+
+impl<'a> TocRef<'a> {
+    /// The TOC element's display name: the first embedded `TIT2`
+    /// sub-frame's value (e.g. "Part 1" in the addendum's Figure 2).
+    pub fn title(&self) -> Option<&'a str> {
+        first_sub_text(self.sub_frames, "TIT2")
+    }
+}
+
+/// First value of the first embedded `T***` text sub-frame with the
+/// given id.
+fn first_sub_text<'a>(frames: &'a [Id3Frame], id: &str) -> Option<&'a str> {
+    frames.iter().find_map(|f| match f {
+        Id3Frame::Text { id: fid, values } if fid == id => values.first().map(String::as_str),
+        _ => None,
+    })
+}
+
+fn chapter_ref(frame: &Id3Frame) -> Option<ChapterRef<'_>> {
+    match frame {
+        Id3Frame::Chapter {
+            element_id,
+            start_time_ms,
+            end_time_ms,
+            start_offset,
+            end_offset,
+            sub_frames,
+        } => Some(ChapterRef {
+            element_id,
+            start_time_ms: *start_time_ms,
+            end_time_ms: *end_time_ms,
+            start_offset: *start_offset,
+            end_offset: *end_offset,
+            sub_frames,
+        }),
+        _ => None,
+    }
+}
+
+fn toc_ref(frame: &Id3Frame) -> Option<TocRef<'_>> {
+    match frame {
+        Id3Frame::TableOfContents {
+            element_id,
+            top_level,
+            ordered,
+            child_ids,
+            sub_frames,
+        } => Some(TocRef {
+            element_id,
+            top_level: *top_level,
+            ordered: *ordered,
+            child_ids,
+            sub_frames,
+        }),
+        _ => None,
+    }
+}
+
+impl Id3Tag {
+    /// Every `CHAP` frame in wire order, as typed views. The addendum
+    /// permits chapters that are not referenced by any `CTOC` (§4), so
+    /// this is the complete chapter set; use
+    /// [`Id3Tag::ordered_chapters`] for the TOC-driven sequence.
+    pub fn chapters(&self) -> Vec<ChapterRef<'_>> {
+        self.frames.iter().filter_map(chapter_ref).collect()
+    }
+
+    /// Every `CTOC` frame in wire order, as typed views.
+    pub fn tables_of_contents(&self) -> Vec<TocRef<'_>> {
+        self.frames.iter().filter_map(toc_ref).collect()
+    }
+
+    /// The root of the table-of-contents tree: the first `CTOC` with
+    /// the top-level bit set (§3.2 permits exactly one; on a
+    /// non-conforming tag with several, the first wins).
+    pub fn top_level_toc(&self) -> Option<TocRef<'_>> {
+        self.frames.iter().filter_map(toc_ref).find(|t| t.top_level)
+    }
+
+    /// Look up a `CHAP` frame by its element ID (first match).
+    pub fn chapter_by_element_id(&self, element_id: &str) -> Option<ChapterRef<'_>> {
+        self.frames
+            .iter()
+            .filter_map(chapter_ref)
+            .find(|c| c.element_id == element_id)
+    }
+
+    /// Look up a `CTOC` frame by its element ID (first match).
+    pub fn toc_by_element_id(&self, element_id: &str) -> Option<TocRef<'_>> {
+        self.frames
+            .iter()
+            .filter_map(toc_ref)
+            .find(|t| t.element_id == element_id)
+    }
+
+    /// The chapters in table-of-contents order: a pre-order walk from
+    /// the root `CTOC` (the top-level frame, or the first `CTOC` when
+    /// no frame carries the top-level bit), descending through nested
+    /// `CTOC` references and collecting each referenced `CHAP`.
+    ///
+    /// Built for hostile input: each element ID is visited at most
+    /// once, so cyclic `CTOC` reference graphs (`toc1` → `toc2` →
+    /// `toc1`) and duplicate references terminate instead of looping,
+    /// and dangling child IDs that match no `CHAP`/`CTOC` in the tag
+    /// are skipped. When the tag has no `CTOC` at all, every `CHAP`
+    /// is returned in wire order (chapters without a TOC are legal
+    /// per §4).
+    pub fn ordered_chapters(&self) -> Vec<ChapterRef<'_>> {
+        let root = match self
+            .top_level_toc()
+            .or_else(|| self.frames.iter().filter_map(toc_ref).next())
+        {
+            Some(root) => root,
+            None => return self.chapters(),
+        };
+        let mut out = Vec::new();
+        let mut visited: Vec<&str> = vec![root.element_id];
+        // Pre-order DFS, iterative so tag data can't grow the call
+        // stack: push children in reverse so the leftmost pops first.
+        let mut stack: Vec<&str> = root.child_ids.iter().rev().map(String::as_str).collect();
+        while let Some(id) = stack.pop() {
+            if visited.contains(&id) {
+                continue; // cycle or duplicate reference
+            }
+            visited.push(id);
+            if let Some(chapter) = self.chapter_by_element_id(id) {
+                out.push(chapter);
+            } else if let Some(toc) = self.toc_by_element_id(id) {
+                for child in toc.child_ids.iter().rev() {
+                    stack.push(child);
+                }
+            }
+            // A dangling id matches nothing and is skipped.
+        }
+        out
     }
 }
 
@@ -11025,6 +11625,453 @@ mod tests {
         assert_eq!(id3v1_genre_name(255), None);
         assert_eq!(id3v1_genre_index(""), None);
         assert_eq!(id3v1_genre_index("Not A Genre"), None);
+    }
+
+    // --- CHAP / CTOC (Chapter Frame Addendum) ---
+
+    /// Wrap raw frame bytes in a minimal v2.3 tag envelope.
+    fn wrap_v23(frames: &[u8]) -> Vec<u8> {
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"ID3");
+        tag.extend_from_slice(&[3, 0, 0]);
+        let s = frames.len() as u32;
+        tag.push(((s >> 21) & 0x7F) as u8);
+        tag.push(((s >> 14) & 0x7F) as u8);
+        tag.push(((s >> 7) & 0x7F) as u8);
+        tag.push((s & 0x7F) as u8);
+        tag.extend_from_slice(frames);
+        tag
+    }
+
+    /// Raw v2.3 frame header + payload.
+    fn v23_frame(id: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(id);
+        f.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    #[test]
+    fn chap_parse_hand_built_v23() {
+        // CHAP body: element id, times, offsets (start real, end the
+        // all-0xFF ignore sentinel), then TIT2 + TIT3 sub-frames.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"chp0\0");
+        body.extend_from_slice(&15_000u32.to_be_bytes()); // start ms
+        body.extend_from_slice(&72_500u32.to_be_bytes()); // end ms
+        body.extend_from_slice(&0x0000_1234u32.to_be_bytes()); // start offset
+        body.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // end offset: ignore
+        body.extend_from_slice(&v23_frame(b"TIT2", &[&[0u8][..], b"Chapter One"].concat()));
+        body.extend_from_slice(&v23_frame(
+            b"TIT3",
+            &[&[0u8][..], b"A description"].concat(),
+        ));
+        let tag_bytes = wrap_v23(&v23_frame(b"CHAP", &body));
+
+        let (tag, _) = parse_tag(&tag_bytes).expect("tag parses");
+        assert_eq!(tag.chapters().len(), 1);
+        let ch = &tag.chapters()[0];
+        assert_eq!(ch.element_id, "chp0");
+        assert_eq!(ch.start_time_ms, 15_000);
+        assert_eq!(ch.end_time_ms, 72_500);
+        assert_eq!(ch.start_offset, Some(0x1234));
+        assert_eq!(
+            ch.end_offset, None,
+            "all-0xFF offset is the ignore sentinel"
+        );
+        assert_eq!(ch.title(), Some("Chapter One"));
+        assert_eq!(ch.description(), Some("A description"));
+        assert_eq!(ch.sub_frames.len(), 2);
+        // Chapters are structural: the flat key/value view skips them.
+        assert!(to_key_value_pairs(&tag)
+            .iter()
+            .all(|(k, _)| !k.contains("chap")));
+    }
+
+    #[test]
+    fn ctoc_parse_hand_built_v23_flags_and_children() {
+        // CTOC body: element id, flags %00000011 (top-level+ordered),
+        // 3 children, then a TIT2 sub-frame naming the element.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"toc\0");
+        body.push(0x03);
+        body.push(3);
+        body.extend_from_slice(b"ch1\0ch2\0ch3\0");
+        body.extend_from_slice(&v23_frame(b"TIT2", &[&[0u8][..], b"Part 1"].concat()));
+        let tag_bytes = wrap_v23(&v23_frame(b"CTOC", &body));
+
+        let (tag, _) = parse_tag(&tag_bytes).expect("tag parses");
+        let toc = tag.top_level_toc().expect("top-level CTOC found");
+        assert_eq!(toc.element_id, "toc");
+        assert!(toc.top_level);
+        assert!(toc.ordered);
+        assert_eq!(toc.child_ids, &["ch1", "ch2", "ch3"]);
+        assert_eq!(toc.title(), Some("Part 1"));
+
+        // Flags carry reserved bits high: they are ignored, and only
+        // bits a/b decode.
+        let mut body2 = Vec::new();
+        body2.extend_from_slice(b"t2\0");
+        body2.push(0xFC); // reserved bits set, a=0 b=0
+        body2.push(1);
+        body2.extend_from_slice(b"x\0");
+        let (tag2, _) = parse_tag(&wrap_v23(&v23_frame(b"CTOC", &body2))).expect("parses");
+        let toc2 = &tag2.tables_of_contents()[0];
+        assert!(!toc2.top_level);
+        assert!(!toc2.ordered);
+    }
+
+    #[test]
+    fn chap_ctoc_typed_round_trip_v23_and_v24() {
+        let chapter = |eid: &str, start: u32, end: u32, title: &str| Id3Frame::Chapter {
+            element_id: eid.into(),
+            start_time_ms: start,
+            end_time_ms: end,
+            start_offset: None,
+            end_offset: None,
+            sub_frames: vec![Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec![title.into()],
+            }],
+        };
+        let src = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![
+                Id3Frame::TableOfContents {
+                    element_id: "root".into(),
+                    top_level: true,
+                    ordered: true,
+                    child_ids: vec!["c1".into(), "c2".into()],
+                    sub_frames: vec![Id3Frame::Text {
+                        id: "TIT2".into(),
+                        values: vec!["All Parts".into()],
+                    }],
+                },
+                chapter("c1", 0, 60_000, "Intro"),
+                Id3Frame::Chapter {
+                    element_id: "c2".into(),
+                    start_time_ms: 60_000,
+                    end_time_ms: 120_000,
+                    start_offset: Some(0xDEAD),
+                    end_offset: Some(0xBEEF),
+                    sub_frames: vec![
+                        Id3Frame::Text {
+                            id: "TIT2".into(),
+                            values: vec!["Main \u{00E9}pisode".into()],
+                        },
+                        Id3Frame::Picture(AttachedPicture {
+                            mime_type: "image/png".into(),
+                            picture_type: PictureType::Other,
+                            description: "slide".into(),
+                            data: vec![1, 2, 3, 4],
+                        }),
+                        Id3Frame::UserUrl {
+                            description: "more".into(),
+                            url: "https://example.invalid/ch2".into(),
+                        },
+                    ],
+                },
+            ],
+        };
+        for version in [Id3Version::V2_3, Id3Version::V2_4] {
+            let target = src.to_version(version).expect("convert");
+            let bytes = write_tag(&target, version).expect("write");
+            let (parsed, _) = parse_tag(&bytes).expect("re-parse");
+            assert_eq!(
+                format!("{:?}", parsed.frames),
+                format!("{:?}", target.frames),
+                "structural round-trip under {version:?}"
+            );
+            // Typed accessors on the re-parse.
+            let ch2 = parsed.chapter_by_element_id("c2").expect("c2 present");
+            assert_eq!(ch2.title(), Some("Main \u{00E9}pisode"));
+            assert_eq!(ch2.pictures().len(), 1);
+            assert_eq!(ch2.pictures()[0].data, vec![1, 2, 3, 4]);
+            assert_eq!(ch2.urls(), vec!["https://example.invalid/ch2"]);
+            assert_eq!(ch2.start_offset, Some(0xDEAD));
+            let ordered: Vec<&str> = parsed
+                .ordered_chapters()
+                .iter()
+                .map(|c| c.element_id)
+                .collect();
+            assert_eq!(ordered, vec!["c1", "c2"]);
+        }
+    }
+
+    #[test]
+    fn chap_truncated_and_ctoc_over_announced_fall_to_unknown() {
+        // CHAP whose fixed fields are cut short: element id + 10 of
+        // the required 16 bytes.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"chp0\0");
+        body.extend_from_slice(&[0u8; 10]);
+        let (tag, _) = parse_tag(&wrap_v23(&v23_frame(b"CHAP", &body))).expect("parses");
+        match &tag.frames[0] {
+            Id3Frame::Unknown { id, raw } => {
+                assert_eq!(id, "CHAP");
+                assert_eq!(raw, &body, "payload preserved verbatim");
+            }
+            other => panic!("expected Unknown fallback, got {other:?}"),
+        }
+        // And the preserved bytes survive a write round-trip.
+        let rewritten =
+            write_tag(&tag.to_version(Id3Version::V2_3).unwrap(), Id3Version::V2_3).expect("write");
+        let (back, _) = parse_tag(&rewritten).expect("re-parse");
+        match &back.frames[0] {
+            Id3Frame::Unknown { id, raw } => {
+                assert_eq!(id, "CHAP");
+                assert_eq!(raw, &body);
+            }
+            other => panic!("expected Unknown after round-trip, got {other:?}"),
+        }
+
+        // A CHAP with no element-id terminator at all.
+        let no_nul = b"element-id-without-terminator".to_vec();
+        let (tag, _) = parse_tag(&wrap_v23(&v23_frame(b"CHAP", &no_nul))).expect("parses");
+        assert!(matches!(&tag.frames[0], Id3Frame::Unknown { id, .. } if id == "CHAP"));
+
+        // CTOC announcing 200 children but carrying 2.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"toc\0");
+        body.push(0x02);
+        body.push(200);
+        body.extend_from_slice(b"a\0b\0");
+        let (tag, _) = parse_tag(&wrap_v23(&v23_frame(b"CTOC", &body))).expect("parses");
+        match &tag.frames[0] {
+            Id3Frame::Unknown { id, raw } => {
+                assert_eq!(id, "CTOC");
+                assert_eq!(raw, &body);
+            }
+            other => panic!("expected Unknown fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctoc_zero_entry_count_parses_but_write_rejects() {
+        // Entry count 0 is non-conforming ("must be greater than
+        // zero") — the parser surfaces it typed, the writer refuses it.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"toc\0");
+        body.push(0x00);
+        body.push(0);
+        let (tag, _) = parse_tag(&wrap_v23(&v23_frame(b"CTOC", &body))).expect("parses");
+        match &tag.frames[0] {
+            Id3Frame::TableOfContents { child_ids, .. } => assert!(child_ids.is_empty()),
+            other => panic!("expected typed CTOC, got {other:?}"),
+        }
+        assert!(write_tag(&tag.to_version(Id3Version::V2_3).unwrap(), Id3Version::V2_3).is_err());
+
+        // The writer also rejects a >255-entry list (one-byte count).
+        let big = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![Id3Frame::TableOfContents {
+                element_id: "toc".into(),
+                top_level: true,
+                ordered: false,
+                child_ids: (0..256).map(|i| format!("c{i}")).collect(),
+                sub_frames: Vec::new(),
+            }],
+        };
+        assert!(write_tag(&big, Id3Version::V2_3).is_err());
+
+        // And element ids containing NUL (they would self-truncate).
+        let nul_id = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![Id3Frame::Chapter {
+                element_id: "ch\u{0}p".into(),
+                start_time_ms: 0,
+                end_time_ms: 0,
+                start_offset: None,
+                end_offset: None,
+                sub_frames: Vec::new(),
+            }],
+        };
+        assert!(write_tag(&nul_id, Id3Version::V2_3).is_err());
+    }
+
+    #[test]
+    fn ctoc_cycles_duplicates_and_dangling_refs_terminate() {
+        let chap = |eid: &str| Id3Frame::Chapter {
+            element_id: eid.into(),
+            start_time_ms: 0,
+            end_time_ms: 1,
+            start_offset: None,
+            end_offset: None,
+            sub_frames: Vec::new(),
+        };
+        let toc = |eid: &str, top: bool, kids: &[&str]| Id3Frame::TableOfContents {
+            element_id: eid.into(),
+            top_level: top,
+            ordered: true,
+            child_ids: kids.iter().map(|s| s.to_string()).collect(),
+            sub_frames: Vec::new(),
+        };
+        // root -> [a, b, ghost]; a -> [root (cycle), c1, c1 (dup)];
+        // b is a chapter; ghost matches nothing.
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![
+                toc("root", true, &["a", "b", "ghost"]),
+                toc("a", false, &["root", "c1", "c1"]),
+                chap("b"),
+                chap("c1"),
+                chap("unreferenced"),
+            ],
+        };
+        let ordered: Vec<&str> = tag
+            .ordered_chapters()
+            .iter()
+            .map(|c| c.element_id)
+            .collect();
+        assert_eq!(ordered, vec!["c1", "b"]);
+        // The full chapter set still lists everything in wire order.
+        let all: Vec<&str> = tag.chapters().iter().map(|c| c.element_id).collect();
+        assert_eq!(all, vec!["b", "c1", "unreferenced"]);
+
+        // A self-referencing lone CTOC terminates too.
+        let selfref = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![toc("loop", true, &["loop"]), chap("x")],
+        };
+        assert!(selfref.ordered_chapters().is_empty());
+
+        // No CTOC at all: wire order.
+        let no_toc = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![chap("z"), chap("y")],
+        };
+        let ordered: Vec<&str> = no_toc
+            .ordered_chapters()
+            .iter()
+            .map(|c| c.element_id)
+            .collect();
+        assert_eq!(ordered, vec!["z", "y"]);
+    }
+
+    #[test]
+    fn chap_nesting_depth_guard_stops_recursion() {
+        // Build a CHAP nested 12 deep. Levels 0..=7 parse typed; the
+        // level-8 payload is preserved as Unknown instead of recursing.
+        let mut frame = v23_frame(b"TIT2", &[&[0u8][..], b"innermost"].concat());
+        for i in (0..12).rev() {
+            let mut body = Vec::new();
+            body.extend_from_slice(format!("n{i}\0").as_bytes());
+            body.extend_from_slice(&[0u8; 16]);
+            body.extend_from_slice(&frame);
+            frame = v23_frame(b"CHAP", &body);
+        }
+        let (tag, _) = parse_tag(&wrap_v23(&frame)).expect("parses without overflowing");
+        let mut level = 0usize;
+        let mut cursor = &tag.frames[0];
+        loop {
+            match cursor {
+                Id3Frame::Chapter { sub_frames, .. } => {
+                    level += 1;
+                    cursor = sub_frames.first().expect("nested frame present");
+                }
+                Id3Frame::Unknown { id, .. } => {
+                    assert_eq!(id, "CHAP");
+                    break;
+                }
+                other => panic!("unexpected frame at level {level}: {other:?}"),
+            }
+        }
+        assert_eq!(
+            level, MAX_EMBEDDED_FRAME_DEPTH,
+            "typed descent stops exactly at the guard"
+        );
+    }
+
+    #[test]
+    fn chap_sub_frames_cross_version_vocabulary_folds() {
+        // A v2.3 chapter carrying TYER/TDAT + IPLS sub-frames: the
+        // v2.4 conversion must fold them inside the chapter body just
+        // as it would at top level, and the result must write cleanly.
+        let src = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![Id3Frame::Chapter {
+                element_id: "c".into(),
+                start_time_ms: 0,
+                end_time_ms: 10,
+                start_offset: None,
+                end_offset: None,
+                sub_frames: vec![
+                    Id3Frame::Text {
+                        id: "TYER".into(),
+                        values: vec!["1999".into()],
+                    },
+                    Id3Frame::Text {
+                        id: "TDAT".into(),
+                        values: vec!["0305".into()],
+                    },
+                    Id3Frame::Ipls {
+                        pairs: vec![("producer".into(), "Alice".into())],
+                    },
+                ],
+            }],
+        };
+        let v24 = src.to_version(Id3Version::V2_4).expect("convert");
+        let ch = v24.chapter_by_element_id("c").expect("chapter survives");
+        assert_eq!(first_sub_text(ch.sub_frames, "TDRC"), Some("1999-05-03"));
+        assert!(ch
+            .sub_frames
+            .iter()
+            .any(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TIPL")));
+        assert!(!ch
+            .sub_frames
+            .iter()
+            .any(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TYER" || id == "TDAT")));
+        let bytes = write_tag(&v24, Id3Version::V2_4).expect("writes cleanly");
+        let (reparsed, _) = parse_tag(&bytes).expect("re-parses");
+        let ch = reparsed.chapter_by_element_id("c").expect("still there");
+        assert_eq!(first_sub_text(ch.sub_frames, "TDRC"), Some("1999-05-03"));
+
+        // And the fold runs back down: v2.4 -> v2.3 splits TDRC again.
+        let v23 = v24.to_version(Id3Version::V2_3).expect("convert back");
+        let ch = v23.chapter_by_element_id("c").expect("chapter survives");
+        assert_eq!(first_sub_text(ch.sub_frames, "TYER"), Some("1999"));
+        assert_eq!(first_sub_text(ch.sub_frames, "TDAT"), Some("0305"));
+    }
+
+    #[test]
+    fn chap_ctoc_have_no_v22_home() {
+        let tag = Id3Tag {
+            version: Id3Version::V2_3,
+            frames: vec![
+                Id3Frame::Text {
+                    id: "TIT2".into(),
+                    values: vec!["kept".into()],
+                },
+                Id3Frame::Chapter {
+                    element_id: "c".into(),
+                    start_time_ms: 0,
+                    end_time_ms: 1,
+                    start_offset: None,
+                    end_offset: None,
+                    sub_frames: vec![Id3Frame::Seek {
+                        min_offset_to_next_tag: 4,
+                    }],
+                },
+                Id3Frame::TableOfContents {
+                    element_id: "t".into(),
+                    top_level: true,
+                    ordered: false,
+                    child_ids: vec!["c".into()],
+                    sub_frames: Vec::new(),
+                },
+            ],
+        };
+        // The v2.2 writer drops both (even with a sub-frame that
+        // cannot encode under v2.3 — the drop is unconditional).
+        let bytes = write_tag(&tag, Id3Version::V2_2).expect("writes");
+        let (parsed, _) = parse_tag(&bytes).expect("parses");
+        assert_eq!(parsed.frames.len(), 1);
+        assert!(matches!(&parsed.frames[0], Id3Frame::Text { id, .. } if id == "TIT2"));
+        // convert_tag agrees.
+        let v22 = tag.to_version(Id3Version::V2_2).expect("convert");
+        assert_eq!(v22.frames.len(), 1);
     }
 
     #[test]

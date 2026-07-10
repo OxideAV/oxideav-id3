@@ -38,6 +38,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `CHAP` / `CTOC` chapter support per
+  `docs/container/id3/id3v2-chapters-1.0.md` (the ID3v2 Chapter Frame
+  Addendum to v2.3/v2.4). New typed frames `Id3Frame::Chapter`
+  (element ID, start/end times in ms, start/end byte offsets with the
+  all-`0xFF` ignore-sentinel surfaced as `None`, embedded sub-frames)
+  and `Id3Frame::TableOfContents` (element ID, top-level + ordered
+  flag bits, child element ID list, embedded sub-frames), parsed and
+  written symmetrically under both v2.3 and v2.4 envelopes (regular
+  vs synchsafe sub-frame sizes). Embedded sub-frames ride the full
+  frame machinery — a chapter can carry `TIT2`/`TIT3` names, `APIC`
+  images, URL frames, anything — and `convert_tag` folds sub-frame
+  vocabularies across the v2.3/v2.4 boundary recursively (a chapter's
+  `TYER`+`TDAT` becomes `TDRC` and back). Typed walkers on `Id3Tag`:
+  `chapters`, `tables_of_contents`, `top_level_toc`,
+  `chapter_by_element_id`, `toc_by_element_id`, and the TOC-driven
+  `ordered_chapters` (pre-order, each element visited at most once so
+  cyclic / duplicate / dangling `CTOC` references terminate; falls
+  back to wire order when no `CTOC` exists), plus `ChapterRef` /
+  `TocRef` views with `title` / `description` / `pictures` / `urls`
+  accessors. Hostile-input posture: truncated `CHAP` fixed fields,
+  a missing element-ID terminator, or a `CTOC` child count that
+  over-announces the payload fall back to `Id3Frame::Unknown` with
+  the raw bytes preserved (round-trip safe); nesting beyond 8
+  embedded levels stops descending instead of overflowing the stack;
+  a zero `CTOC` entry count parses typed but is rejected on write
+  ("must be greater than zero"), as are >255-entry lists (one-byte
+  count field) and element IDs containing NUL. The v2.2 writer and
+  `convert_tag(_, V2_2)` drop both frames (the addendum extends
+  v2.3/v2.4 only). 9 new tests.
+
 - Enhanced `TAG+` support per `docs/container/id3/enhanced-tag.md` —
   the informal 227-byte ID3v1 extension block that precedes the
   trailing 128-byte tag. New typed `EnhancedTag` struct (60-byte
