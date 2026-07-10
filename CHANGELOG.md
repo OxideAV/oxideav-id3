@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-id3/compare/v0.0.6...v0.0.7) - 2026-07-10
+
+### Other
+
+- reword a policy comment to name no external implementations
+- deterministic mutation smoke test for the hostile-input surfaces
+- fuzz + integration hardening for v1/TAG+/chapter surfaces; README
+- CHAP/CTOC chapter frames (Chapter Addendum 1.0) with typed walkers
+- Enhanced TAG+ (227-byte ID3v1 extension) typed read/write
+- typed ID3v1/1.1 API (Id3v1Tag) + public genre-table lookups
+- strip a stray leading BOM from UTF-8 / UTF-16BE decoded text
+- correct v2.3 multi-value text docs + pin the true split behavior
+- correct stale ASPI version-gating doc + pin v2.2 lossy drop
+- resolve TCON genre references in the flat key/value view
+- add CI / crates.io / docs.rs / MIT-license badges
+- *(README)* document writer version-gating + expanded convert_tag drop sets
+- full 3x3 version-conversion matrix round-trip test
+- version-aware LINK frame-id width + exhaustive unsync round-trip test
+- gate v2.4-only frames out of v2.3/v2.2 tags in writer + convert_tag
+- test v2.3 RVAD back-channel down-conversion to v2.2 is lossy-valid
+- fix ID3v2.2 RVA round-trip for the both-decrement case
+- document the v2.2 ↔ v2.3 ↔ v2.4 conversion matrix in README
+- pin iTunes-frame round-trip preservation contract
+- convert_tag completes the v2.2 ↔ v2.3 ↔ v2.4 matrix
+- panic-freedom test for split_text_values on malformed bodies
+- README — document per-string-BOM-aware multi-value text handling
+- correct ID3v1 genre-table range doc + add bounds regression test
+- surface multi-value text frames as one k/v pair each (Vorbis semantics)
+- per-string-BOM-aware multi-value text-frame splitting (spec §4.2)
+- add v2.3<->v2.4 frame-vocabulary conversion (convert_tag / Id3Tag::to_version)
+- CRM edge-case tests — missing terminator, empty strings, unsync
+- README — document typed CRM (EncryptedMeta) support
+- type CRM encrypted-meta frame (v2.2 §4.20) — decode + v2.2 encode + round-trip
+- typed TYER/TDAT/TIME/TSIZ accessors for the v2.3 date/time/size split (spec §4.2.1)
+- typed TLEN/TDLY duration + TBPM accessors (DurationMs / Bpm; spec §4.2.1)
+- typed Id3Timestamp accessors for v2.4 §4.2.5 TDxx date frames
+- typed Id3Frame::isrc() accessor for TSRC ISRC frame (§4.2.1)
+- typed OWNE/COMR date accessors + Id3Date enum (spec §4.23/§4.24 v2.4)
+- typed TRCK/TPOS track-position accessor + TrackPosition enum (spec §4.2.1)
+- typed POPM rating accessor popm_rating() + PopmRating enum (spec v2.3 §4.18 / v2.4 §4.17)
+- typed COMR/OWNE price accessors + Price enum (spec §4.24/§4.25 v2.3, §4.23/§4.24 v2.4)
+
 ### Fixed
 
 - `LINK` frame parsing now keys the frame-id field width off the tag
