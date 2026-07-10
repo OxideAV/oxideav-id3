@@ -38,6 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Deterministic mutation smoke test (`tests/hostile_smoke.rs`): a
+  fast, reproducible slice of the daily fuzz budget that runs on
+  every CI push. Chapterised v2.3/v2.4 tags and a 355-byte enhanced
+  trailer are subjected to ~12k seeded xorshift byte-flip /
+  truncation mutations plus exhaustive single-byte prefix truncation,
+  and every parse entry point, chapter walker, and writer is driven
+  over the result — the contract is panic-freedom, so a bounds
+  regression in `parse_chap` / `parse_ctoc` / `parse_id3v1_enhanced`
+  surfaces on the next push instead of the next scheduled fuzz run.
+
 - Fuzz + integration coverage for the round-405 surface. The `parse`
   fuzz target now drives the typed ID3v1 pair (`Id3v1Tag::parse`,
   `EnhancedTag::parse`, the end-anchored `parse_id3v1_enhanced` scan,
