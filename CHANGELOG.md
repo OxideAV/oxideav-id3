@@ -38,6 +38,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Enhanced `TAG+` support per `docs/container/id3/enhanced-tag.md` —
+  the informal 227-byte ID3v1 extension block that precedes the
+  trailing 128-byte tag. New typed `EnhancedTag` struct (60-byte
+  title / artist / album continuations, raw speed byte with a decoded
+  `EnhancedTagSpeed` enum, 30-byte free-text genre, and `mmm:ss`
+  start/end times as `Option<EnhancedTagTime>`), with symmetric
+  `parse` / `to_bytes`, join helpers (`full_title` / `full_artist` /
+  `full_album` / `effective_genre`), and pair-level entry points:
+  `parse_id3v1_enhanced` (end-anchored tail scan; an orphan `TAG+`
+  with no trailing `TAG` is not surfaced), `write_id3v1_enhanced`
+  (355-byte trailer that splits characters 30..90 of overlong fields
+  into the continuation block and preserves out-of-table genre names
+  as free text), `EnhancedTag::split_tag`, and
+  `Id3v1Tag::to_tag_with_enhanced` for the merged frame view.
+  Constants `ENHANCED_TAG_SIZE` / `ID3V1_ENHANCED_TAIL_SIZE`. Blank
+  or malformed time fields (non-digit, seconds > 59, overwide) decode
+  as `None`; 4 new tests cover hand-built block parse, byte
+  round-trips, hostile time fields, tail detection/merge, and the
+  overflow-split + custom-genre write path.
+
 - Typed ID3v1 / ID3v1.1 API per `docs/container/id3/id3v1.md`: a public
   `Id3v1Tag` struct exposing the raw fixed fields (title / artist /
   album / year / comment, the ID3v1.1 `track: Option<u8>` keyed on the

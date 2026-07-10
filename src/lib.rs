@@ -4327,6 +4327,335 @@ pub fn parse_id3v1(trailer_128: &[u8]) -> Option<Id3Tag> {
     Some(Id3v1Tag::parse(trailer_128)?.to_tag())
 }
 
+// ---------------------------------------------------------------------------
+// Enhanced TAG+ — the 227-byte ID3v1 extension
+// (docs/container/id3/enhanced-tag.md)
+// ---------------------------------------------------------------------------
+
+/// Byte size of the enhanced `"TAG+"` block: always exactly 227 bytes,
+/// placed immediately *before* the 128-byte ID3v1 trailer.
+pub const ENHANCED_TAG_SIZE: usize = 227;
+
+/// Byte size of a full enhanced trailer: the 227-byte `"TAG+"` block
+/// followed by the 128-byte ID3v1 `"TAG"` block (355 bytes total at
+/// the very end of the file).
+pub const ID3V1_ENHANCED_TAIL_SIZE: usize = ENHANCED_TAG_SIZE + ID3V1_TAG_SIZE;
+
+/// A `mmm:ss` playback position as stored in the enhanced tag's ASCII
+/// start-time / end-time fields (used by players for fade-in at the
+/// start point and fade-out at the end point).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EnhancedTagTime {
+    /// Minutes, `0..=999` (the field is three ASCII digits wide;
+    /// larger values are clamped at serialise time).
+    pub minutes: u16,
+    /// Seconds, `0..=59` (clamped at serialise time).
+    pub seconds: u8,
+}
+
+impl EnhancedTagTime {
+    /// Total position in whole seconds.
+    pub fn total_seconds(&self) -> u32 {
+        self.minutes as u32 * 60 + self.seconds as u32
+    }
+}
+
+/// The enhanced tag's 1-byte playback-speed hint, decoded. The
+/// canonical values are `0` (unset) through `4` (hardcore); anything
+/// else surfaces as [`EnhancedTagSpeed::Other`] so a non-canonical
+/// byte is visible rather than silently folded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnhancedTagSpeed {
+    Unset,
+    Slow,
+    Medium,
+    Fast,
+    Hardcore,
+    Other(u8),
+}
+
+impl EnhancedTagSpeed {
+    /// Decode the raw speed byte.
+    pub fn from_byte(b: u8) -> EnhancedTagSpeed {
+        match b {
+            0 => EnhancedTagSpeed::Unset,
+            1 => EnhancedTagSpeed::Slow,
+            2 => EnhancedTagSpeed::Medium,
+            3 => EnhancedTagSpeed::Fast,
+            4 => EnhancedTagSpeed::Hardcore,
+            other => EnhancedTagSpeed::Other(other),
+        }
+    }
+
+    /// The wire byte for this speed value.
+    pub fn byte(self) -> u8 {
+        match self {
+            EnhancedTagSpeed::Unset => 0,
+            EnhancedTagSpeed::Slow => 1,
+            EnhancedTagSpeed::Medium => 2,
+            EnhancedTagSpeed::Fast => 3,
+            EnhancedTagSpeed::Hardcore => 4,
+            EnhancedTagSpeed::Other(b) => b,
+        }
+    }
+}
+
+/// Typed view of the enhanced (`"TAG+"`) 227-byte ID3v1 extension
+/// block — an informal community extension, not an official standard.
+///
+/// Layout (offsets within the 227-byte block): 4-byte `"TAG+"` magic,
+/// then 60-byte title / artist / album *continuations* (characters
+/// 31..90 of each field — the first 30 live in the trailing ID3v1
+/// tag), a 1-byte speed hint, a 30-byte free-text genre (supplementing
+/// ID3v1's numeric genre byte), and two 6-byte ASCII `mmm:ss`
+/// start-time / end-time fields. Unused bytes are zero-padded as in
+/// ID3v1.
+///
+/// As with [`Id3v1Tag`], the in-memory strings are unclamped;
+/// [`Self::to_bytes`] truncates to the field widths and drops
+/// non-ISO-8859-1 characters.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnhancedTag {
+    /// Title continuation — characters 31..90 of the full title.
+    pub title: String,
+    /// Artist continuation — characters 31..90 of the full artist.
+    pub artist: String,
+    /// Album continuation — characters 31..90 of the full album.
+    pub album: String,
+    /// Raw speed byte (`0` = unset .. `4` = hardcore; see
+    /// [`EnhancedTagSpeed`]).
+    pub speed: u8,
+    /// Free-text (custom) genre, in contrast to the fixed-table byte
+    /// of the ID3v1 tag it accompanies.
+    pub genre: String,
+    /// Fade-in start point; `None` when the field is blank.
+    pub start_time: Option<EnhancedTagTime>,
+    /// Fade-out / stop point; `None` when the field is blank.
+    pub end_time: Option<EnhancedTagTime>,
+}
+
+impl EnhancedTag {
+    /// Parse the 227-byte `"TAG+"` block at the *start* of `block`.
+    /// Returns `None` when the buffer is shorter than 227 bytes or
+    /// doesn't begin with `"TAG+"`. A time field that is blank or not
+    /// in `mmm:ss` digit form parses as `None`.
+    pub fn parse(block: &[u8]) -> Option<EnhancedTag> {
+        if block.len() < ENHANCED_TAG_SIZE || &block[0..4] != b"TAG+" {
+            return None;
+        }
+        Some(EnhancedTag {
+            title: v1_string(&block[4..64]),
+            artist: v1_string(&block[64..124]),
+            album: v1_string(&block[124..184]),
+            speed: block[184],
+            genre: v1_string(&block[185..215]),
+            start_time: parse_enhanced_time(&block[215..221]),
+            end_time: parse_enhanced_time(&block[221..227]),
+        })
+    }
+
+    /// Serialise as the fixed 227-byte block. Strings are truncated to
+    /// their field widths (60 for the continuations, 30 for the
+    /// genre), non-ISO-8859-1 characters are dropped, short fields are
+    /// zero-padded, and each `Some` time is written as `mmm:ss`
+    /// (minutes clamped to 999, seconds to 59) while `None` leaves the
+    /// field zeroed.
+    pub fn to_bytes(&self) -> [u8; ENHANCED_TAG_SIZE] {
+        let mut out = [0u8; ENHANCED_TAG_SIZE];
+        out[0..4].copy_from_slice(b"TAG+");
+        write_v1_field(&mut out[4..64], &self.title);
+        write_v1_field(&mut out[64..124], &self.artist);
+        write_v1_field(&mut out[124..184], &self.album);
+        out[184] = self.speed;
+        write_v1_field(&mut out[185..215], &self.genre);
+        write_enhanced_time(&mut out[215..221], self.start_time);
+        write_enhanced_time(&mut out[221..227], self.end_time);
+        out
+    }
+
+    /// The decoded speed hint.
+    pub fn speed_kind(&self) -> EnhancedTagSpeed {
+        EnhancedTagSpeed::from_byte(self.speed)
+    }
+
+    /// Join the base ID3v1 title with this block's continuation.
+    pub fn full_title(&self, v1: &Id3v1Tag) -> String {
+        format!("{}{}", v1.title, self.title)
+    }
+
+    /// Join the base ID3v1 artist with this block's continuation.
+    pub fn full_artist(&self, v1: &Id3v1Tag) -> String {
+        format!("{}{}", v1.artist, self.artist)
+    }
+
+    /// Join the base ID3v1 album with this block's continuation.
+    pub fn full_album(&self, v1: &Id3v1Tag) -> String {
+        format!("{}{}", v1.album, self.album)
+    }
+
+    /// The effective genre of the pair: the free-text genre when
+    /// non-empty (it replaces the fixed table value), else the ID3v1
+    /// genre byte's table name.
+    pub fn effective_genre(&self, v1: &Id3v1Tag) -> Option<String> {
+        if !self.genre.is_empty() {
+            Some(self.genre.clone())
+        } else {
+            v1.genre_name().map(|s| s.to_string())
+        }
+    }
+
+    /// Split an [`Id3Tag`]'s v1-expressible fields across a base ID3v1
+    /// tag and an enhanced continuation block: characters `0..30` of
+    /// title / artist / album go to the v1 tag and characters `30..90`
+    /// to the continuation, and a genre name that is *not* in the
+    /// fixed table is carried as free text (with the v1 byte left at
+    /// the `0xFF` sentinel) instead of being dropped. The inverse of
+    /// [`Id3v1Tag::to_tag_with_enhanced`].
+    pub fn split_tag(tag: &Id3Tag) -> (Id3v1Tag, EnhancedTag) {
+        let mut v1 = Id3v1Tag::from_tag(tag);
+        let split30 = |s: &mut String| -> String {
+            if s.chars().count() <= 30 {
+                return String::new();
+            }
+            let tail: String = s.chars().skip(30).take(60).collect();
+            *s = s.chars().take(30).collect();
+            tail
+        };
+        let title = split30(&mut v1.title);
+        let artist = split30(&mut v1.artist);
+        let album = split30(&mut v1.album);
+        // A genre the fixed table doesn't know has no v1 byte; carry
+        // it as the enhanced free-text genre instead of losing it. A
+        // table-resolvable genre stays numeric-only (free text empty).
+        let genre = if v1.genre == 0xFF {
+            let kv = to_key_value_pairs(tag);
+            kv.into_iter()
+                .find(|(k, _)| k == "genre")
+                .map(|(_, v)| v)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        (
+            v1,
+            EnhancedTag {
+                title,
+                artist,
+                album,
+                speed: 0,
+                genre,
+                start_time: None,
+                end_time: None,
+            },
+        )
+    }
+}
+
+impl Id3v1Tag {
+    /// Project into the frame-structured [`Id3Tag`] view, merging an
+    /// enhanced continuation block when present: title / artist /
+    /// album are the joined 90-character forms, and a non-empty
+    /// free-text genre replaces the fixed-table byte in `TCON`. With
+    /// `None` this is exactly [`Id3v1Tag::to_tag`]. The speed and
+    /// start/end-time fields have no ID3v2 frame equivalent and stay
+    /// on the typed [`EnhancedTag`].
+    pub fn to_tag_with_enhanced(&self, plus: Option<&EnhancedTag>) -> Id3Tag {
+        let Some(plus) = plus else {
+            return self.to_tag();
+        };
+        let merged = Id3v1Tag {
+            title: plus.full_title(self),
+            artist: plus.full_artist(self),
+            album: plus.full_album(self),
+            year: self.year.clone(),
+            comment: self.comment.clone(),
+            track: self.track,
+            // A non-empty free-text genre overrides the table byte;
+            // force the sentinel so to_tag doesn't emit the table name.
+            genre: if plus.genre.is_empty() {
+                self.genre
+            } else {
+                0xFF
+            },
+        };
+        let mut tag = merged.to_tag();
+        if !plus.genre.is_empty() {
+            tag.frames.push(Id3Frame::Text {
+                id: "TCON".into(),
+                values: vec![plus.genre.clone()],
+            });
+        }
+        tag
+    }
+}
+
+/// Parse the enhanced-tag pair from the tail of a file. `tail` is the
+/// last `N` bytes (anchored at end-of-file): the ID3v1 tag must occupy
+/// the final 128 bytes, and when `tail` reaches back at least 355
+/// bytes the 227 bytes preceding the ID3v1 tag are checked for the
+/// `"TAG+"` block. Returns `None` when no ID3v1 tag is present — the
+/// enhanced block only exists as a prefix to a standard trailer, so
+/// an orphan `"TAG+"` is not surfaced.
+pub fn parse_id3v1_enhanced(tail: &[u8]) -> Option<(Id3v1Tag, Option<EnhancedTag>)> {
+    if tail.len() < ID3V1_TAG_SIZE {
+        return None;
+    }
+    let v1 = Id3v1Tag::parse(&tail[tail.len() - ID3V1_TAG_SIZE..])?;
+    let plus = if tail.len() >= ID3V1_ENHANCED_TAIL_SIZE {
+        EnhancedTag::parse(
+            &tail[tail.len() - ID3V1_ENHANCED_TAIL_SIZE..tail.len() - ID3V1_TAG_SIZE],
+        )
+    } else {
+        None
+    };
+    Some((v1, plus))
+}
+
+/// Serialise an [`Id3Tag`]'s v1-expressible fields as a full 355-byte
+/// enhanced trailer: the 227-byte `"TAG+"` continuation block followed
+/// by the 128-byte ID3v1/1.1 tag. Characters `30..90` of title /
+/// artist / album land in the continuation and an out-of-table genre
+/// name is preserved as free text — the two losses this format exists
+/// to fix over plain [`write_id3v1`]. An ID3v1-only reader that seeks
+/// the last 128 bytes still finds a valid `"TAG"` block.
+pub fn write_id3v1_enhanced(tag: &Id3Tag) -> Vec<u8> {
+    let (v1, plus) = EnhancedTag::split_tag(tag);
+    let mut out = Vec::with_capacity(ID3V1_ENHANCED_TAIL_SIZE);
+    out.extend_from_slice(&plus.to_bytes());
+    out.extend_from_slice(&v1.to_bytes());
+    out
+}
+
+/// Parse a 6-byte ASCII `mmm:ss` enhanced-tag time field. Blank
+/// (zero/space-padded empty) fields and anything not in digit
+/// `m..m:ss` form (1–3 minute digits, 1–2 second digits, seconds
+/// `<= 59`) decode as `None`.
+fn parse_enhanced_time(field: &[u8]) -> Option<EnhancedTagTime> {
+    let s = v1_string(field);
+    let s = s.trim();
+    let (m, sec) = s.split_once(':')?;
+    if m.is_empty() || m.len() > 3 || sec.is_empty() || sec.len() > 2 {
+        return None;
+    }
+    if !m.bytes().all(|b| b.is_ascii_digit()) || !sec.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let minutes: u16 = m.parse().ok()?;
+    let seconds: u8 = sec.parse().ok()?;
+    if seconds > 59 {
+        return None;
+    }
+    Some(EnhancedTagTime { minutes, seconds })
+}
+
+/// Write a 6-byte `mmm:ss` field (`None` leaves it zeroed).
+fn write_enhanced_time(dst: &mut [u8], time: Option<EnhancedTagTime>) {
+    if let Some(t) = time {
+        let s = format!("{:03}:{:02}", t.minutes.min(999), t.seconds.min(59));
+        dst.copy_from_slice(s.as_bytes());
+    }
+}
+
 /// Normalise an [`Id3Tag`] into flat `(key, value)` pairs using the
 /// lowercase Vorbis-comment keys the rest of the workspace expects.
 /// Known v2.3/v2.4 four-char ids map to their Vorbis equivalents;
@@ -10459,6 +10788,231 @@ mod tests {
 
         // write_id3v1 delegates to the same fold.
         assert_eq!(write_id3v1(&v2), folded.to_bytes().to_vec());
+    }
+
+    #[test]
+    fn enhanced_tag_parse_hand_built_block() {
+        let mut block = vec![0u8; 227];
+        block[0..4].copy_from_slice(b"TAG+");
+        block[4..24].copy_from_slice(b" And The Continuatio"); // title cont.
+        block[64..70].copy_from_slice(b"s Band"); // artist cont.
+        block[184] = 3; // fast
+        block[185..196].copy_from_slice(b"Depth Blues");
+        block[215..221].copy_from_slice(b"001:30");
+        block[221..227].copy_from_slice(b"073:05");
+        let plus = EnhancedTag::parse(&block).expect("parses");
+        assert_eq!(plus.title, " And The Continuatio");
+        assert_eq!(plus.artist, "s Band");
+        assert_eq!(plus.album, "");
+        assert_eq!(plus.speed_kind(), EnhancedTagSpeed::Fast);
+        assert_eq!(plus.genre, "Depth Blues");
+        assert_eq!(
+            plus.start_time,
+            Some(EnhancedTagTime {
+                minutes: 1,
+                seconds: 30
+            })
+        );
+        assert_eq!(
+            plus.end_time,
+            Some(EnhancedTagTime {
+                minutes: 73,
+                seconds: 5
+            })
+        );
+        assert_eq!(plus.end_time.unwrap().total_seconds(), 73 * 60 + 5);
+
+        // Too short / wrong magic → None. Plain "TAG" (the ID3v1
+        // magic) must not be mistaken for "TAG+".
+        assert!(EnhancedTag::parse(&block[..226]).is_none());
+        let mut bad = block.clone();
+        bad[3] = 0;
+        assert!(EnhancedTag::parse(&bad).is_none());
+    }
+
+    #[test]
+    fn enhanced_tag_round_trip_and_hostile_times() {
+        let src = EnhancedTag {
+            title: "x".repeat(60),
+            artist: "y".repeat(59),
+            album: "album continuation".into(),
+            speed: 4,
+            genre: "Free Text Genre".into(),
+            start_time: Some(EnhancedTagTime {
+                minutes: 999,
+                seconds: 59,
+            }),
+            end_time: None,
+        };
+        let bytes = src.to_bytes();
+        assert_eq!(bytes.len(), ENHANCED_TAG_SIZE);
+        let back = EnhancedTag::parse(&bytes).expect("parses");
+        assert_eq!(back, src);
+        // A None time leaves the field zeroed.
+        assert_eq!(&bytes[221..227], &[0u8; 6]);
+
+        // Non-canonical speed bytes surface as Other, and round-trip.
+        for b in [5u8, 42, 255] {
+            assert_eq!(EnhancedTagSpeed::from_byte(b), EnhancedTagSpeed::Other(b));
+            assert_eq!(EnhancedTagSpeed::from_byte(b).byte(), b);
+        }
+
+        // Hostile time fields decode as None without panicking.
+        for garbage in [
+            &b"12:345"[..],
+            b"ab:cd\0",
+            b"::::::",
+            b"1:60\0\0",
+            b"1234:5",
+            b"\xFF\xFF\xFF\xFF\xFF\xFF",
+            b"      ",
+        ] {
+            let mut block = vec![0u8; 227];
+            block[0..4].copy_from_slice(b"TAG+");
+            block[215..221].copy_from_slice(garbage);
+            let parsed = EnhancedTag::parse(&block).expect("block parses");
+            assert_eq!(parsed.start_time, None, "field {garbage:?}");
+        }
+        // Short digit forms are accepted: "1:5" is 1 minute 5 seconds.
+        let mut block = vec![0u8; 227];
+        block[0..4].copy_from_slice(b"TAG+");
+        block[215..218].copy_from_slice(b"1:5");
+        let parsed = EnhancedTag::parse(&block).expect("block parses");
+        assert_eq!(
+            parsed.start_time,
+            Some(EnhancedTagTime {
+                minutes: 1,
+                seconds: 5
+            })
+        );
+    }
+
+    #[test]
+    fn enhanced_tail_parse_and_merge() {
+        // Build a 355-byte tail: TAG+ block then TAG block.
+        let v1 = Id3v1Tag {
+            title: "012345678901234567890123456789".chars().take(30).collect(),
+            artist: "Artist".into(),
+            year: "1988".into(),
+            track: Some(2),
+            genre: 0xFF,
+            ..Id3v1Tag::default()
+        };
+        let plus = EnhancedTag {
+            title: " and the rest of a long title".into(),
+            genre: "Custom Genre".into(),
+            ..EnhancedTag::default()
+        };
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&plus.to_bytes());
+        tail.extend_from_slice(&v1.to_bytes());
+        assert_eq!(tail.len(), ID3V1_ENHANCED_TAIL_SIZE);
+
+        let (v1_back, plus_back) = parse_id3v1_enhanced(&tail).expect("pair parses");
+        let plus_back = plus_back.expect("TAG+ detected");
+        assert_eq!(v1_back, v1);
+        assert_eq!(plus_back, plus);
+        assert_eq!(
+            plus_back.full_title(&v1_back),
+            "012345678901234567890123456789 and the rest of a long title"
+        );
+        assert_eq!(
+            plus_back.effective_genre(&v1_back).as_deref(),
+            Some("Custom Genre")
+        );
+
+        // Merged frame view: joined title + free-text TCON.
+        let tag = v1_back.to_tag_with_enhanced(Some(&plus_back));
+        let kv = to_key_value_pairs(&tag);
+        assert!(kv.contains(&(
+            "title".into(),
+            "012345678901234567890123456789 and the rest of a long title".into()
+        )));
+        assert!(kv.contains(&("genre".into(), "Custom Genre".into())));
+        assert!(kv.contains(&("track".into(), "2".into())));
+
+        // 128-byte-only tail: v1 parses, no enhanced block.
+        let (v1_only, none) = parse_id3v1_enhanced(&v1.to_bytes()).expect("v1 parses");
+        assert_eq!(v1_only, v1);
+        assert!(none.is_none());
+
+        // 355-byte tail whose leading block is not TAG+ → (v1, None).
+        let mut plain = vec![0u8; 227];
+        plain.extend_from_slice(&v1.to_bytes());
+        let (_, none) = parse_id3v1_enhanced(&plain).expect("v1 parses");
+        assert!(none.is_none());
+
+        // An orphan TAG+ with no trailing TAG is not surfaced.
+        let mut orphan = plus.to_bytes().to_vec();
+        orphan.extend_from_slice(&[0u8; 128]);
+        assert!(parse_id3v1_enhanced(&orphan).is_none());
+
+        // effective_genre falls back to the v1 table byte when the
+        // free-text field is empty.
+        let rock = Id3v1Tag {
+            genre: 17,
+            ..Id3v1Tag::default()
+        };
+        let no_text = EnhancedTag::default();
+        assert_eq!(no_text.effective_genre(&rock).as_deref(), Some("Rock"));
+        // And the merged view keeps the table name in that case.
+        let merged = rock.to_tag_with_enhanced(Some(&no_text));
+        let kv = to_key_value_pairs(&merged);
+        assert!(kv.contains(&("genre".into(), "Rock".into())));
+    }
+
+    #[test]
+    fn enhanced_write_splits_overflow_and_custom_genre() {
+        // A 75-char title must split 30 (v1) + 45 (TAG+), and an
+        // out-of-table genre must ride the free-text field instead of
+        // being dropped to 0xFF-with-no-name.
+        let long_title: String = ('a'..='z').cycle().take(75).collect();
+        let tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![
+                Id3Frame::Text {
+                    id: "TIT2".into(),
+                    values: vec![long_title.clone()],
+                },
+                Id3Frame::Text {
+                    id: "TPE1".into(),
+                    values: vec!["Short".into()],
+                },
+                Id3Frame::Text {
+                    id: "TCON".into(),
+                    values: vec!["Chiptune Revival".into()],
+                },
+            ],
+        };
+        let bytes = write_id3v1_enhanced(&tag);
+        assert_eq!(bytes.len(), ID3V1_ENHANCED_TAIL_SIZE);
+
+        // An ID3v1-only reader still sees a valid plain trailer.
+        let v1_view = parse_id3v1(&bytes[bytes.len() - 128..]).expect("plain v1 reader");
+        let kv = to_key_value_pairs(&v1_view);
+        let title_prefix: String = long_title.chars().take(30).collect();
+        assert!(kv.contains(&("title".into(), title_prefix)));
+
+        // The enhanced-aware reader recovers the full field + genre.
+        let (v1, plus) = parse_id3v1_enhanced(&bytes).expect("pair parses");
+        let plus = plus.expect("TAG+ present");
+        assert_eq!(plus.full_title(&v1), long_title);
+        assert_eq!(v1.genre, 0xFF);
+        assert_eq!(plus.genre, "Chiptune Revival");
+        assert_eq!(plus.full_artist(&v1), "Short");
+
+        // A table genre stays numeric-only: no free text emitted.
+        let rock_tag = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![Id3Frame::Text {
+                id: "TCON".into(),
+                values: vec!["Rock".into()],
+            }],
+        };
+        let (v1, plus) = EnhancedTag::split_tag(&rock_tag);
+        assert_eq!(v1.genre, 17);
+        assert_eq!(plus.genre, "");
+        assert_eq!(plus.effective_genre(&v1).as_deref(), Some("Rock"));
     }
 
     #[test]
