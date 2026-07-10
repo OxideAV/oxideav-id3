@@ -62,6 +62,39 @@ if let Some(tag) = oxideav_id3::parse_id3v1(last_128) {
 }
 ```
 
+Underneath the frame view sits the typed fixed-field form, `Id3v1Tag`,
+with symmetric `parse` / `to_bytes`: the raw genre byte (so
+out-of-table values round-trip bit-for-bit, `id3v1_genre_name` /
+`id3v1_genre_index` expose the fixed table), and the ID3v1.1 rule
+typed as `track: Option<u8>` — a tag carries a track number iff byte
+125 is `$00` and byte 126 is non-zero, in which case the comment field
+shrinks to 28 characters.
+
+### Enhanced `TAG+` trailer
+
+The informal 227-byte enhanced tag — a `"TAG+"` block placed
+immediately before the ID3v1 trailer — extends title / artist / album
+to 90 characters (the extra 60 live in the continuation block), adds a
+free-text genre, a playback-speed hint, and `mmm:ss` fade start/stop
+times:
+
+```rust
+use oxideav_id3::{parse_id3v1_enhanced, write_id3v1_enhanced};
+
+// tail = the last >=128 (ideally >=355) bytes of the file.
+# let tail = write_id3v1_enhanced(&oxideav_id3::Id3Tag { version: oxideav_id3::Id3Version::V2_4, frames: vec![] });
+if let Some((v1, Some(plus))) = parse_id3v1_enhanced(&tail) {
+    let title = plus.full_title(&v1);          // up to 90 chars
+    let genre = plus.effective_genre(&v1);     // free text beats the byte
+    let merged = v1.to_tag_with_enhanced(Some(&plus)); // frame view
+}
+```
+
+`write_id3v1_enhanced` produces the full 355-byte trailer, splitting
+characters 30..90 of overlong fields into the continuation block and
+carrying an out-of-table genre name as free text; an ID3v1-only reader
+still finds a valid plain `TAG` in the last 128 bytes.
+
 ## Writing a tag
 
 Build an `Id3Tag` in memory and serialise it with `write_tag` (for
@@ -288,6 +321,49 @@ corrupting the payload offset, and an encrypted frame (flag `j`)
 surfaces as `Id3Frame::Unknown` with the method byte + ciphertext
 preserved — matching the v2.4 posture — instead of dispatching
 ciphertext to a structural parser.
+
+## Chapters and tables of contents (CHAP / CTOC)
+
+The ID3v2 Chapter Frame Addendum (an addendum to v2.3/v2.4) is
+supported end to end: `CHAP` frames parse to `Id3Frame::Chapter`
+(element ID, start/end times in milliseconds, optional byte offsets —
+the all-`0xFF` "ignore" sentinel surfaces as `None` — plus embedded
+sub-frames) and `CTOC` frames to `Id3Frame::TableOfContents`
+(top-level / ordered flag bits and the child element ID list).
+Embedded sub-frames ride the full frame machinery, so a chapter can
+carry `TIT2` titles, `APIC` images, or URL frames, and they convert
+across the v2.3 ↔ v2.4 vocabulary boundary recursively.
+
+```rust
+use oxideav_id3::parse_tag;
+
+# let bytes = oxideav_id3::write_tag(&oxideav_id3::Id3Tag { version: oxideav_id3::Id3Version::V2_4, frames: vec![] }, oxideav_id3::Id3Version::V2_4)?;
+let (tag, _) = parse_tag(&bytes)?;
+for chapter in tag.ordered_chapters() {
+    println!(
+        "{:?} [{} ms .. {} ms] {:?}",
+        chapter.title(),
+        chapter.start_time_ms,
+        chapter.end_time_ms,
+        chapter.element_id,
+    );
+    for pic in chapter.pictures() { /* per-chapter slides */ }
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`ordered_chapters` walks the table of contents pre-order from the
+top-level `CTOC` (wire order when no TOC exists) and is built for
+hostile input: cyclic or duplicate `CTOC` references terminate (each
+element ID is visited once) and dangling references are skipped.
+`chapters` / `tables_of_contents` / `top_level_toc` /
+`chapter_by_element_id` / `toc_by_element_id` give direct access.
+Malformed chapter payloads (truncated fixed fields, an over-announced
+child count) are preserved verbatim as `Id3Frame::Unknown`, and frame
+nesting inside chapter bodies is depth-capped so a hostile tag cannot
+overflow the parser stack. The writer enforces the addendum's rules:
+a `CTOC` child list must be non-empty and at most 255 entries, and
+element IDs cannot contain NUL.
 
 ## Vorbis-style flat-pair view
 

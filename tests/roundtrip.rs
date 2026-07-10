@@ -5,13 +5,15 @@
 
 use oxideav_core::{AttachedPicture, PictureType};
 use oxideav_id3::{
-    attached_pictures, parse_id3v1, parse_tag, parse_tag_with_extended_header, to_key_value_pairs,
-    write_id3v1, write_tag, write_tag_with_options, CommercialDelivery, ContentType,
-    Equ2Interpolation, EquaBand, EtcoEventType, FileType, Id3Frame, Id3Tag, Id3Version,
-    ImageEncodingRestriction, ImageSizeRestriction, KeyAccidental, MediaType, MusicalKey,
-    PopmRating, Restrictions, Rva2Channel, Rva2ChannelType, RvadBackChannels, RvadChannel,
-    RvadFrontChannels, SyltContentType, SytcTempo, TagSizeRestriction, TextEncodingRestriction,
-    TextFieldsRestriction, TimestampUnit, UnsyncMode, WriteOptions,
+    attached_pictures, parse_id3v1, parse_id3v1_enhanced, parse_tag,
+    parse_tag_with_extended_header, to_key_value_pairs, write_id3v1, write_id3v1_enhanced,
+    write_tag, write_tag_with_options, CommercialDelivery, ContentType, EnhancedTag,
+    EnhancedTagSpeed, EnhancedTagTime, Equ2Interpolation, EquaBand, EtcoEventType, FileType,
+    Id3Frame, Id3Tag, Id3Version, Id3v1Tag, ImageEncodingRestriction, ImageSizeRestriction,
+    KeyAccidental, MediaType, MusicalKey, PopmRating, Restrictions, Rva2Channel, Rva2ChannelType,
+    RvadBackChannels, RvadChannel, RvadFrontChannels, SyltContentType, SytcTempo,
+    TagSizeRestriction, TextEncodingRestriction, TextFieldsRestriction, TimestampUnit, UnsyncMode,
+    WriteOptions,
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
@@ -5225,4 +5227,198 @@ fn convert_matrix_every_pair_writes_clean() {
             );
         }
     }
+}
+
+#[test]
+fn roundtrip_chapters_full_stack() {
+    // An audiobook-shaped tag: top-level ordered CTOC referencing two
+    // chapters, each chapter carrying a TIT2 title; the second also
+    // carries an APIC slide and a WXXX link. Everything must survive
+    // write -> parse under both v2.3 and v2.4 and stay reachable
+    // through the typed walkers.
+    let src = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![
+            Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["The Whale".into()],
+            },
+            Id3Frame::TableOfContents {
+                element_id: "toc".into(),
+                top_level: true,
+                ordered: true,
+                child_ids: vec!["ch1".into(), "ch2".into()],
+                sub_frames: vec![Id3Frame::Text {
+                    id: "TIT2".into(),
+                    values: vec!["Part 1".into()],
+                }],
+            },
+            Id3Frame::Chapter {
+                element_id: "ch1".into(),
+                start_time_ms: 0,
+                end_time_ms: 480_000,
+                start_offset: None,
+                end_offset: None,
+                sub_frames: vec![Id3Frame::Text {
+                    id: "TIT2".into(),
+                    values: vec!["Chapter 1 - Loomings".into()],
+                }],
+            },
+            Id3Frame::Chapter {
+                element_id: "ch2".into(),
+                start_time_ms: 480_000,
+                end_time_ms: 960_000,
+                start_offset: Some(1_234_567),
+                end_offset: Some(2_345_678),
+                sub_frames: vec![
+                    Id3Frame::Text {
+                        id: "TIT2".into(),
+                        values: vec!["Chapter 2 - The Carpet-Bag".into()],
+                    },
+                    Id3Frame::Picture(AttachedPicture {
+                        mime_type: "image/jpeg".into(),
+                        picture_type: PictureType::Other,
+                        description: "slide".into(),
+                        data: vec![0xFF, 0xD8, 0xFF, 0x00, 0x10],
+                    }),
+                    Id3Frame::UserUrl {
+                        description: "notes".into(),
+                        url: "https://example.invalid/ch2-notes".into(),
+                    },
+                ],
+            },
+        ],
+    };
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        let bytes = write_tag(&src, version).expect("write");
+        let (parsed, consumed) = parse_tag(&bytes).expect("parse");
+        assert_eq!(consumed, bytes.len());
+
+        let toc = parsed.top_level_toc().expect("top-level CTOC");
+        assert!(toc.ordered);
+        assert_eq!(toc.child_ids, ["ch1", "ch2"]);
+        assert_eq!(toc.title(), Some("Part 1"));
+
+        let ordered = parsed.ordered_chapters();
+        let ids: Vec<&str> = ordered.iter().map(|c| c.element_id).collect();
+        assert_eq!(ids, ["ch1", "ch2"]);
+        assert_eq!(ordered[0].title(), Some("Chapter 1 - Loomings"));
+        assert_eq!(ordered[0].start_offset, None);
+        assert_eq!(ordered[1].end_time_ms, 960_000);
+        assert_eq!(ordered[1].start_offset, Some(1_234_567));
+        assert_eq!(ordered[1].pictures().len(), 1);
+        assert_eq!(
+            ordered[1].pictures()[0].data,
+            vec![0xFF, 0xD8, 0xFF, 0x00, 0x10],
+            "picture data with an embedded 0xFF 0x00 pair survives {version:?}"
+        );
+        assert_eq!(ordered[1].urls(), ["https://example.invalid/ch2-notes"]);
+
+        // The chapter machinery must not disturb the ordinary frames.
+        let kv = to_key_value_pairs(&parsed);
+        assert!(kv.contains(&("title".into(), "The Whale".into())));
+    }
+}
+
+#[test]
+fn roundtrip_chapters_survive_whole_tag_unsync_and_compression() {
+    // Chapter bodies contain 0xFF-heavy binary (offsets, APIC data),
+    // so drive them through whole-tag unsync and frame compression to
+    // prove the embedded sub-frame layer composes with the envelope
+    // transforms.
+    let src = Id3Tag {
+        version: Id3Version::V2_4,
+        frames: vec![Id3Frame::Chapter {
+            element_id: "c".into(),
+            start_time_ms: 0xFF00FF,
+            end_time_ms: 0xFFFFFF,
+            start_offset: Some(0xFF00_FF00),
+            end_offset: None,
+            sub_frames: vec![Id3Frame::Text {
+                id: "TIT2".into(),
+                values: vec!["unsync me".into()],
+            }],
+        }],
+    };
+    for version in [Id3Version::V2_3, Id3Version::V2_4] {
+        for (unsync, compress) in [
+            (UnsyncMode::WholeTag, false),
+            (UnsyncMode::None, true),
+            (UnsyncMode::WholeTag, true),
+        ] {
+            let opts = WriteOptions::new()
+                .with_unsync(unsync)
+                .with_compression(compress);
+            let bytes = write_tag_with_options(&src, version, &opts).expect("write");
+            let (parsed, _) = parse_tag(&bytes).expect("parse");
+            let ch = parsed.chapter_by_element_id("c").expect("chapter");
+            assert_eq!(ch.start_time_ms, 0xFF00FF);
+            assert_eq!(ch.end_time_ms, 0xFFFFFF);
+            assert_eq!(ch.start_offset, Some(0xFF00_FF00));
+            assert_eq!(ch.end_offset, None);
+            assert_eq!(ch.title(), Some("unsync me"));
+        }
+    }
+}
+
+#[test]
+fn roundtrip_enhanced_trailer_public_surface() {
+    // Typed structs -> 355-byte trailer -> typed structs, then the
+    // same via the Id3Tag-level writer.
+    let v1 = Id3v1Tag {
+        title: "A".repeat(30),
+        artist: "The Band".into(),
+        album: "LP".into(),
+        year: "2001".into(),
+        comment: "note".into(),
+        track: Some(5),
+        genre: 0xFF,
+    };
+    let plus = EnhancedTag {
+        title: "B".repeat(45),
+        speed: 2,
+        genre: "Progressive Chiptune".into(),
+        start_time: Some(EnhancedTagTime {
+            minutes: 0,
+            seconds: 30,
+        }),
+        end_time: Some(EnhancedTagTime {
+            minutes: 74,
+            seconds: 10,
+        }),
+        ..EnhancedTag::default()
+    };
+    let mut trailer = Vec::new();
+    trailer.extend_from_slice(&plus.to_bytes());
+    trailer.extend_from_slice(&v1.to_bytes());
+
+    let (v1_back, plus_back) = parse_id3v1_enhanced(&trailer).expect("pair");
+    let plus_back = plus_back.expect("TAG+ found");
+    assert_eq!(v1_back, v1);
+    assert_eq!(plus_back, plus);
+    assert_eq!(plus_back.speed_kind(), EnhancedTagSpeed::Medium);
+    let full = plus_back.full_title(&v1_back);
+    assert_eq!(full.len(), 75);
+    assert!(full.starts_with(&"A".repeat(30)) && full.ends_with(&"B".repeat(45)));
+
+    // Id3Tag-level: write_id3v1_enhanced splits a 75-char title and
+    // keeps the out-of-table genre.
+    let tag = v1_back.to_tag_with_enhanced(Some(&plus_back));
+    let bytes = write_id3v1_enhanced(&tag);
+    assert_eq!(bytes.len(), 355);
+    let (v1_2, plus_2) = parse_id3v1_enhanced(&bytes).expect("pair");
+    let plus_2 = plus_2.expect("TAG+ found");
+    assert_eq!(plus_2.full_title(&v1_2), full);
+    assert_eq!(
+        plus_2.effective_genre(&v1_2).as_deref(),
+        Some("Progressive Chiptune")
+    );
+    assert_eq!(v1_2.track, Some(5));
+
+    // And the plain 128-byte writer still interoperates: same tag,
+    // truncated title, table-less genre falls to 0xFF.
+    let plain = write_id3v1(&tag);
+    let v1_plain = Id3v1Tag::parse(&plain).expect("plain v1");
+    assert_eq!(v1_plain.title, "A".repeat(30));
+    assert_eq!(v1_plain.genre, 0xFF);
 }

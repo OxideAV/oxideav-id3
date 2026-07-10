@@ -57,8 +57,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_id3::{
-    attached_pictures, parse_id3v1, parse_tag, tag_size_at_head, to_key_value_pairs, write_id3v1,
-    write_tag, write_tag_with_options, Id3Version, UnsyncMode, WriteOptions,
+    attached_pictures, parse_id3v1, parse_id3v1_enhanced, parse_tag, tag_size_at_head,
+    to_key_value_pairs, write_id3v1, write_id3v1_enhanced, write_tag, write_tag_with_options,
+    EnhancedTag, Id3Version, Id3v1Tag, UnsyncMode, WriteOptions,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -84,6 +85,28 @@ fuzz_target!(|data: &[u8]| {
         let _ = parse_id3v1(&data[data.len() - 128..]);
     }
 
+    // 3b. Typed ID3v1 + enhanced TAG+ pair. The end-anchored tail
+    //     scan must stay in bounds for any input length, the typed
+    //     serialisers must be panic-free on whatever fields the
+    //     parsers admitted (including raw out-of-table genre bytes
+    //     and hostile mmm:ss time fields), and the merged frame view
+    //     must survive the v1 writer.
+    let _ = Id3v1Tag::parse(data);
+    let _ = EnhancedTag::parse(data);
+    if let Some((v1, plus)) = parse_id3v1_enhanced(data) {
+        let _ = v1.to_bytes();
+        let _ = v1.genre_name();
+        if let Some(p) = &plus {
+            let _ = p.to_bytes();
+            let _ = p.speed_kind();
+            let _ = p.full_title(&v1);
+            let _ = p.effective_genre(&v1);
+        }
+        let merged = v1.to_tag_with_enhanced(plus.as_ref());
+        let _ = write_id3v1(&merged);
+        let _ = write_id3v1_enhanced(&merged);
+    }
+
     // 4. Downstream APIs. Anything the parser accepted must survive
     //    a `to_key_value_pairs` + `attached_pictures` walk; both are
     //    pure functions over the parsed structure.
@@ -93,6 +116,17 @@ fuzz_target!(|data: &[u8]| {
     let _ = to_key_value_pairs(&tag);
     let _ = attached_pictures(&tag);
     let _ = write_id3v1(&tag);
+
+    // 4b. Chapter walkers. CHAP/CTOC parsing is depth-capped inside
+    //     the parser (nested chapter bodies), and `ordered_chapters`
+    //     resolves attacker-controlled CTOC reference graphs — cycles,
+    //     duplicate references, dangling element ids — behind a
+    //     visited-set. All four walks must terminate panic-free on
+    //     any parsed tag.
+    let _ = tag.chapters();
+    let _ = tag.tables_of_contents();
+    let _ = tag.top_level_toc();
+    let _ = tag.ordered_chapters();
 
     // 5. Writer. v2.2 input is not writeable (the encoder targets 2.3
     //    or 2.4) so promote the parsed tag's version to v2.3 first

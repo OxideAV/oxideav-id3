@@ -38,6 +38,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Fuzz + integration coverage for the round-405 surface. The `parse`
+  fuzz target now drives the typed ID3v1 pair (`Id3v1Tag::parse`,
+  `EnhancedTag::parse`, the end-anchored `parse_id3v1_enhanced` scan,
+  both typed serialisers, and the merged-view `write_id3v1_enhanced`
+  path) and the chapter walkers (`chapters` / `tables_of_contents` /
+  `top_level_toc` / `ordered_chapters`, i.e. the cycle-guard under
+  attacker-shaped CTOC graphs) on every parsed tag; two new corpus
+  seeds cover a CTOC+2×CHAP v2.3 tag and a 355-byte `TAG+`+`TAG`
+  trailer. Three new integration round-trip tests exercise the public
+  surface end to end: a full audiobook-shaped chapter stack under
+  both v2.3 and v2.4, chapters composed with whole-tag unsync and
+  frame compression (0xFF-heavy offsets), and the enhanced-trailer
+  typed/tag-level write→parse loop. README documents the typed
+  `Id3v1Tag`, the `TAG+` trailer, and the chapter walkers.
+
 - `CHAP` / `CTOC` chapter support per
   `docs/container/id3/id3v2-chapters-1.0.md` (the ID3v2 Chapter Frame
   Addendum to v2.3/v2.4). New typed frames `Id3Frame::Chapter`
