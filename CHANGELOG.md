@@ -38,6 +38,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed ID3v1 / ID3v1.1 API per `docs/container/id3/id3v1.md`: a public
+  `Id3v1Tag` struct exposing the raw fixed fields (title / artist /
+  album / year / comment, the ID3v1.1 `track: Option<u8>` keyed on the
+  byte-125/126 rule, and the raw `genre` byte) with symmetric
+  `parse` / `to_bytes` (out-of-table genre bytes now round-trip
+  bit-for-bit), plus `to_tag` / `from_tag` projections into the
+  frame-structured `Id3Tag` view. `parse_id3v1` and `write_id3v1` now
+  delegate to it with unchanged behaviour. The ID3v1 genre table is
+  exposed via `id3v1_genre_name(u8)` and the (previously private)
+  reverse lookup `id3v1_genre_index(&str)`, and `ID3V1_TAG_SIZE` names
+  the 128-byte trailer size. 5 new tests cover the v1.0-vs-v1.1
+  layout rule, byte round-trips across table-boundary genre bytes,
+  field clamping (30-char truncation, non-Latin-1 drop, `Some(0)`
+  track folding to the v1.0 layout), both projections, and the
+  genre-lookup inverse property over the full `0..=147` table.
+
 - Round-trip tests pinning the iTunes-frame preservation contract.
   `GRP1` (grouping), `MVNM` (movement name) and `MVIN` (movement index)
   are not in the staged id3.org specs and do not begin with `T`/`W`, so

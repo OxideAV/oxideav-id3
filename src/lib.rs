@@ -4109,76 +4109,222 @@ pub fn tag_size_at_head(first10: &[u8]) -> Option<usize> {
     Some(ID3V2_HEADER_SIZE + size + footer)
 }
 
+// ---------------------------------------------------------------------------
+// ID3v1 / ID3v1.1 — the trailing 128-byte TAG
+// (docs/container/id3/id3v1.md)
+// ---------------------------------------------------------------------------
+
+/// Byte size of an ID3v1 / ID3v1.1 trailer: always exactly 128 bytes at
+/// the very end of the file, identified by the leading `"TAG"` bytes.
+pub const ID3V1_TAG_SIZE: usize = 128;
+
+/// Typed view of an ID3v1 / ID3v1.1 trailing tag (the fixed 128-byte
+/// `TAG` block at the end of a file).
+///
+/// Field widths per the ID3v1 layout table: title / artist / album are
+/// 30 ISO-8859-1 characters, year is 4, and the comment is either 30
+/// characters (ID3v1.0) or 28 characters plus a NUL and a track byte
+/// (ID3v1.1). Short fields are NUL-padded on the wire; [`Self::parse`]
+/// strips trailing NUL and space padding.
+///
+/// * `track` — `Some` when the tag uses the ID3v1.1 comment split
+///   (byte 125 is `$00` and byte 126 is non-zero). A track number of
+///   zero is not representable in v1.1 (a zero byte 126 *defines* the
+///   tag as v1.0), so [`Self::to_bytes`] treats `Some(0)` as "no
+///   track" and emits the v1.0 30-character comment layout.
+/// * `genre` — the raw genre byte. The byte indexes the fixed genre
+///   table ([`id3v1_genre_name`]); `0xFF` is the conventional "no
+///   genre" sentinel. Kept raw (rather than resolved) so an
+///   out-of-table byte round-trips bit-for-bit.
+///
+/// The in-memory strings are *not* clamped: [`Self::to_bytes`]
+/// truncates to the field widths at serialise time (and drops
+/// non-ISO-8859-1 characters), so a lossless
+/// `parse → to_bytes` round-trip is guaranteed only for values that
+/// originated on the wire.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Id3v1Tag {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub year: String,
+    pub comment: String,
+    /// ID3v1.1 track number; `None` for a v1.0-layout tag.
+    pub track: Option<u8>,
+    /// Raw genre byte (index into the genre table; `0xFF` = unset).
+    pub genre: u8,
+}
+
+impl Default for Id3v1Tag {
+    fn default() -> Self {
+        Id3v1Tag {
+            title: String::new(),
+            artist: String::new(),
+            album: String::new(),
+            year: String::new(),
+            comment: String::new(),
+            track: None,
+            // 0xFF is the "no genre" sentinel; byte 0 is a real table
+            // entry (Blues) and would mislabel an empty tag.
+            genre: 0xFF,
+        }
+    }
+}
+
+impl Id3v1Tag {
+    /// Parse the 128-byte ID3v1 / ID3v1.1 trailer at the *start* of
+    /// `trailer`. Returns `None` when the buffer is shorter than 128
+    /// bytes or doesn't begin with `"TAG"` (callers pass the last 128
+    /// bytes of the file).
+    ///
+    /// The ID3v1.1 detection rule: the tag carries a track number iff
+    /// byte 125 is `$00` and byte 126 is non-zero; otherwise the full
+    /// 30 bytes are a v1.0 free-form comment.
+    pub fn parse(trailer: &[u8]) -> Option<Id3v1Tag> {
+        if trailer.len() < ID3V1_TAG_SIZE || &trailer[0..3] != b"TAG" {
+            return None;
+        }
+        let (comment, track) = if trailer[125] == 0 && trailer[126] != 0 {
+            (v1_string(&trailer[97..125]), Some(trailer[126]))
+        } else {
+            (v1_string(&trailer[97..127]), None)
+        };
+        Some(Id3v1Tag {
+            title: v1_string(&trailer[3..33]),
+            artist: v1_string(&trailer[33..63]),
+            album: v1_string(&trailer[63..93]),
+            year: v1_string(&trailer[93..97]),
+            comment,
+            track,
+            genre: trailer[127],
+        })
+    }
+
+    /// Serialise as the fixed 128-byte trailer. Strings are truncated
+    /// to their field widths, non-ISO-8859-1 characters are dropped,
+    /// and short fields are NUL-padded. A non-zero `track` selects the
+    /// ID3v1.1 layout (28-byte comment + `$00` + track byte); `None`
+    /// or `Some(0)` selects the v1.0 30-byte comment.
+    pub fn to_bytes(&self) -> [u8; ID3V1_TAG_SIZE] {
+        let mut out = [0u8; ID3V1_TAG_SIZE];
+        out[0..3].copy_from_slice(b"TAG");
+        write_v1_field(&mut out[3..33], &self.title);
+        write_v1_field(&mut out[33..63], &self.artist);
+        write_v1_field(&mut out[63..93], &self.album);
+        write_v1_field(&mut out[93..97], &self.year);
+        match self.track {
+            Some(t) if t != 0 => {
+                write_v1_field(&mut out[97..125], &self.comment);
+                out[125] = 0;
+                out[126] = t;
+            }
+            _ => write_v1_field(&mut out[97..127], &self.comment),
+        }
+        out[127] = self.genre;
+        out
+    }
+
+    /// Resolve the raw genre byte against the fixed genre table.
+    /// `None` for out-of-table bytes (including the `0xFF` sentinel).
+    pub fn genre_name(&self) -> Option<&'static str> {
+        id3v1_genre(self.genre)
+    }
+
+    /// Project into the frame-structured [`Id3Tag`] view (version
+    /// [`Id3Version::V1`]): title → `TIT2`, artist → `TPE1`, album →
+    /// `TALB`, year → `TYER`, comment → `COMM` (language `XXX`),
+    /// track → `TRCK`, resolvable genre → `TCON` (as its table name).
+    /// Empty fields produce no frame; an out-of-table genre byte is
+    /// dropped (it has no name to carry).
+    pub fn to_tag(&self) -> Id3Tag {
+        let mut frames = Vec::new();
+        let mut push_text = |id: &str, value: &str| {
+            if !value.is_empty() {
+                frames.push(Id3Frame::Text {
+                    id: id.to_string(),
+                    values: vec![value.to_string()],
+                });
+            }
+        };
+        push_text("TIT2", &self.title);
+        push_text("TPE1", &self.artist);
+        push_text("TALB", &self.album);
+        push_text("TYER", &self.year);
+        if !self.comment.is_empty() {
+            frames.push(Id3Frame::Comment {
+                lang: *b"XXX",
+                description: String::new(),
+                text: self.comment.clone(),
+            });
+        }
+        if let Some(t) = self.track {
+            frames.push(Id3Frame::Text {
+                id: "TRCK".into(),
+                values: vec![t.to_string()],
+            });
+        }
+        if let Some(g) = self.genre_name() {
+            frames.push(Id3Frame::Text {
+                id: "TCON".into(),
+                values: vec![g.to_string()],
+            });
+        }
+        Id3Tag {
+            version: Id3Version::V1,
+            frames,
+        }
+    }
+
+    /// Extract the ID3v1-expressible fields from any [`Id3Tag`] via
+    /// the flat [`to_key_value_pairs`] view: `title` / `artist` /
+    /// `album` / `comment` map directly, the year is the first four
+    /// characters of `date`, the track is the leading integer of
+    /// `track` (a `3/12` disc-style value keeps only the `3`) when it
+    /// fits `1..=255`, and the genre byte is the table index of the
+    /// `genre` name (`0xFF` when absent or out of table). Everything
+    /// else is dropped — ID3v1 has no room for it.
+    pub fn from_tag(tag: &Id3Tag) -> Id3v1Tag {
+        let kv = to_key_value_pairs(tag);
+        let get = |key: &str| -> String {
+            kv.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        let track = get("track")
+            .split('/')
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| (1..=255).contains(&n))
+            .map(|n| n as u8);
+        Id3v1Tag {
+            title: get("title"),
+            artist: get("artist"),
+            album: get("album"),
+            year: get("date").chars().take(4).collect(),
+            comment: get("comment"),
+            track,
+            genre: id3v1_genre_index(&get("genre")).unwrap_or(0xFF),
+        }
+    }
+}
+
+/// Look up an ID3v1 genre byte in the fixed genre table (the original
+/// 80-entry list, `0..=79`, plus the Winamp extension through 147).
+/// `None` for out-of-table indices and the `0xFF` "no genre" sentinel.
+pub fn id3v1_genre_name(index: u8) -> Option<&'static str> {
+    id3v1_genre(index)
+}
+
 /// Parse an ID3v1 trailer. Returns `None` when the buffer doesn't
 /// start with `TAG` or is shorter than 128 bytes.
+///
+/// This is the frame-view convenience wrapper over
+/// [`Id3v1Tag::parse`] + [`Id3v1Tag::to_tag`]; use [`Id3v1Tag`]
+/// directly for the raw fixed-field form (including the raw genre
+/// byte and the v1.0-vs-v1.1 track distinction on empty comments).
 pub fn parse_id3v1(trailer_128: &[u8]) -> Option<Id3Tag> {
-    if trailer_128.len() < 128 || &trailer_128[0..3] != b"TAG" {
-        return None;
-    }
-    let title = v1_string(&trailer_128[3..33]);
-    let artist = v1_string(&trailer_128[33..63]);
-    let album = v1_string(&trailer_128[63..93]);
-    let year = v1_string(&trailer_128[93..97]);
-    // ID3v1.1: if byte 125 is NUL and byte 126 is non-zero, the last
-    // 2 bytes are a track number; otherwise the full 30 bytes are a
-    // free-form comment.
-    let (comment, track) = if trailer_128[125] == 0 && trailer_128[126] != 0 {
-        (v1_string(&trailer_128[97..125]), Some(trailer_128[126]))
-    } else {
-        (v1_string(&trailer_128[97..127]), None)
-    };
-    let genre_byte = trailer_128[127];
-    let genre = id3v1_genre(genre_byte).map(|s| s.to_string());
-
-    let mut frames = Vec::new();
-    if !title.is_empty() {
-        frames.push(Id3Frame::Text {
-            id: "TIT2".into(),
-            values: vec![title],
-        });
-    }
-    if !artist.is_empty() {
-        frames.push(Id3Frame::Text {
-            id: "TPE1".into(),
-            values: vec![artist],
-        });
-    }
-    if !album.is_empty() {
-        frames.push(Id3Frame::Text {
-            id: "TALB".into(),
-            values: vec![album],
-        });
-    }
-    if !year.is_empty() {
-        frames.push(Id3Frame::Text {
-            id: "TYER".into(),
-            values: vec![year],
-        });
-    }
-    if !comment.is_empty() {
-        frames.push(Id3Frame::Comment {
-            lang: *b"XXX",
-            description: String::new(),
-            text: comment,
-        });
-    }
-    if let Some(t) = track {
-        frames.push(Id3Frame::Text {
-            id: "TRCK".into(),
-            values: vec![t.to_string()],
-        });
-    }
-    if let Some(g) = genre {
-        frames.push(Id3Frame::Text {
-            id: "TCON".into(),
-            values: vec![g],
-        });
-    }
-
-    Some(Id3Tag {
-        version: Id3Version::V1,
-        frames,
-    })
+    Some(Id3v1Tag::parse(trailer_128)?.to_tag())
 }
 
 /// Normalise an [`Id3Tag`] into flat `(key, value)` pairs using the
@@ -7538,40 +7684,7 @@ pub fn write_tag_with_options(
 /// trailer is written in ID3v1.1 form (28-byte comment + NUL + track
 /// byte). Unknown genre names fall back to byte `255` ("no genre").
 pub fn write_id3v1(tag: &Id3Tag) -> Vec<u8> {
-    let kv = to_key_value_pairs(tag);
-    let get = |key: &str| -> String {
-        kv.iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default()
-    };
-
-    let mut out = vec![0u8; 128];
-    out[0..3].copy_from_slice(b"TAG");
-    write_v1_field(&mut out[3..33], &get("title"));
-    write_v1_field(&mut out[33..63], &get("artist"));
-    write_v1_field(&mut out[63..93], &get("album"));
-    // Year is 4 chars; take the first 4 digits of whatever `date` holds.
-    let year: String = get("date").chars().take(4).collect();
-    write_v1_field(&mut out[93..97], &year);
-
-    let comment = get("comment");
-    let track_byte: Option<u8> = get("track")
-        .split('/')
-        .next()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|&n| (1..=255).contains(&n))
-        .map(|n| n as u8);
-
-    if let Some(t) = track_byte {
-        write_v1_field(&mut out[97..125], &comment);
-        out[125] = 0;
-        out[126] = t;
-    } else {
-        write_v1_field(&mut out[97..127], &comment);
-    }
-    out[127] = id3v1_genre_index(&get("genre")).unwrap_or(0xFF);
-    out
+    Id3v1Tag::from_tag(tag).to_bytes().to_vec()
 }
 
 fn write_v1_field(dst: &mut [u8], s: &str) {
@@ -9010,7 +9123,11 @@ fn encode_utf16_be(out: &mut Vec<u8>, s: &str) {
     }
 }
 
-fn id3v1_genre_index(name: &str) -> Option<u8> {
+/// Reverse lookup into the ID3v1 genre table: map a genre *name*
+/// (ASCII case-insensitive) to its table byte. `None` for names not in
+/// the table (writers conventionally fall back to the `0xFF` "no
+/// genre" sentinel). The inverse of [`id3v1_genre_name`].
+pub fn id3v1_genre_index(name: &str) -> Option<u8> {
     if name.is_empty() {
         return None;
     }
@@ -10196,6 +10313,164 @@ mod tests {
         assert!(kv.contains(&("artist".to_string(), "TinyArtist".to_string())));
         assert!(kv.contains(&("track".to_string(), "7".to_string())));
         assert!(kv.contains(&("genre".to_string(), "Rock".to_string())));
+    }
+
+    #[test]
+    fn id3v1_typed_parse_v10_and_v11_rule() {
+        // v1.0 layout: byte 125 non-zero → the whole 30 bytes are
+        // comment, even with a non-zero byte 126.
+        let mut t = vec![0u8; 128];
+        t[0..3].copy_from_slice(b"TAG");
+        t[3..8].copy_from_slice(b"Title");
+        let comment = b"comment that runs to twenty-ni"; // 30 chars
+        t[97..127].copy_from_slice(comment);
+        t[127] = 17;
+        let v1 = Id3v1Tag::parse(&t).expect("parses");
+        assert_eq!(v1.title, "Title");
+        assert_eq!(v1.track, None, "byte 125 != 0 means v1.0");
+        assert_eq!(v1.comment, "comment that runs to twenty-ni");
+        assert_eq!(v1.genre, 17);
+        assert_eq!(v1.genre_name(), Some("Rock"));
+
+        // v1.1 layout: byte 125 == 0 and byte 126 != 0 → 28-char
+        // comment + track byte.
+        let mut t = vec![0u8; 128];
+        t[0..3].copy_from_slice(b"TAG");
+        t[97..101].copy_from_slice(b"note");
+        t[125] = 0;
+        t[126] = 9;
+        t[127] = 0xFF;
+        let v1 = Id3v1Tag::parse(&t).expect("parses");
+        assert_eq!(v1.track, Some(9));
+        assert_eq!(v1.comment, "note");
+        assert_eq!(v1.genre_name(), None, "0xFF is the no-genre sentinel");
+
+        // byte 125 == 0 and byte 126 == 0 → still v1.0 (no track).
+        let mut t = vec![0u8; 128];
+        t[0..3].copy_from_slice(b"TAG");
+        let v1 = Id3v1Tag::parse(&t).expect("parses");
+        assert_eq!(v1.track, None);
+
+        // Too short / wrong magic → None.
+        assert!(Id3v1Tag::parse(&t[..127]).is_none());
+        let mut bad = t.clone();
+        bad[2] = b'X';
+        assert!(Id3v1Tag::parse(&bad).is_none());
+    }
+
+    #[test]
+    fn id3v1_typed_to_bytes_round_trip() {
+        let src = Id3v1Tag {
+            title: "A Title".into(),
+            artist: "An Artist".into(),
+            album: "An Album".into(),
+            year: "1997".into(),
+            comment: "space padded".into(),
+            track: Some(12),
+            genre: 80, // first Winamp-extension entry
+        };
+        let bytes = src.to_bytes();
+        assert_eq!(&bytes[0..3], b"TAG");
+        assert_eq!(bytes[125], 0);
+        assert_eq!(bytes[126], 12);
+        assert_eq!(bytes[127], 80);
+        let back = Id3v1Tag::parse(&bytes).expect("parses");
+        assert_eq!(back, src);
+
+        // Raw out-of-table genre bytes survive the typed round-trip.
+        for genre in [79u8, 147, 148, 200, 255] {
+            let tag = Id3v1Tag {
+                genre,
+                ..Id3v1Tag::default()
+            };
+            let back = Id3v1Tag::parse(&tag.to_bytes()).expect("parses");
+            assert_eq!(back.genre, genre);
+        }
+    }
+
+    #[test]
+    fn id3v1_typed_to_bytes_clamps_fields() {
+        // 35-char title truncates to 30; non-Latin-1 chars drop.
+        let long = "0123456789012345678901234567890123456789";
+        let src = Id3v1Tag {
+            title: long.into(),
+            artist: "snow\u{2603}man".into(), // U+2603 is not Latin-1
+            track: Some(0),                   // not representable in v1.1
+            comment: "c".repeat(40),
+            ..Id3v1Tag::default()
+        };
+        let bytes = src.to_bytes();
+        let back = Id3v1Tag::parse(&bytes).expect("parses");
+        assert_eq!(back.title, &long[..30]);
+        assert_eq!(back.artist, "snowman");
+        // Some(0) selects the v1.0 layout: 30-char comment, no track.
+        assert_eq!(back.track, None);
+        assert_eq!(back.comment, "c".repeat(30));
+    }
+
+    #[test]
+    fn id3v1_typed_tag_projections() {
+        // to_tag: frame view mirrors parse_id3v1's output.
+        let v1 = Id3v1Tag {
+            title: "T".into(),
+            artist: "A".into(),
+            album: "L".into(),
+            year: "2001".into(),
+            comment: "c".into(),
+            track: Some(3),
+            genre: 17,
+        };
+        let tag = v1.to_tag();
+        assert_eq!(tag.version, Id3Version::V1);
+        let kv = to_key_value_pairs(&tag);
+        assert!(kv.contains(&("title".into(), "T".into())));
+        assert!(kv.contains(&("date".into(), "2001".into())));
+        assert!(kv.contains(&("track".into(), "3".into())));
+        assert!(kv.contains(&("genre".into(), "Rock".into())));
+
+        // from_tag: v2 tag folds down; disc-style track keeps the
+        // leading integer, genre name resolves to its byte.
+        let v2 = Id3Tag {
+            version: Id3Version::V2_4,
+            frames: vec![
+                Id3Frame::Text {
+                    id: "TIT2".into(),
+                    values: vec!["Song".into()],
+                },
+                Id3Frame::Text {
+                    id: "TRCK".into(),
+                    values: vec!["4/12".into()],
+                },
+                Id3Frame::Text {
+                    id: "TCON".into(),
+                    values: vec!["Rock".into()],
+                },
+                Id3Frame::Text {
+                    id: "TDRC".into(),
+                    values: vec!["1999-05-03".into()],
+                },
+            ],
+        };
+        let folded = Id3v1Tag::from_tag(&v2);
+        assert_eq!(folded.title, "Song");
+        assert_eq!(folded.track, Some(4));
+        assert_eq!(folded.genre, 17);
+        assert_eq!(folded.year, "1999");
+
+        // write_id3v1 delegates to the same fold.
+        assert_eq!(write_id3v1(&v2), folded.to_bytes().to_vec());
+    }
+
+    #[test]
+    fn id3v1_public_genre_lookups_are_inverses() {
+        for i in 0..=147u8 {
+            let name = id3v1_genre_name(i).expect("table covers 0..=147");
+            assert_eq!(id3v1_genre_index(name), Some(i), "index {i} ({name})");
+        }
+        assert_eq!(id3v1_genre_name(148), None);
+        assert_eq!(id3v1_genre_name(255), None);
+        assert_eq!(id3v1_genre_index(""), None);
+        assert_eq!(id3v1_genre_index("Not A Genre"), None);
     }
 
     #[test]
