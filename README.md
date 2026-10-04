@@ -56,6 +56,7 @@ ID3v1 trailers (128 bytes at the end of a file) are handled by a
 separate entry point:
 
 ```rust
+# let file_bytes = vec![0u8; 128];
 let last_128 = &file_bytes[file_bytes.len() - 128..];
 if let Some(tag) = oxideav_id3::parse_id3v1(last_128) {
     // tag.version == Id3Version::V1
