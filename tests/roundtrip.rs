@@ -5,15 +5,14 @@
 
 use oxideav_core::{AttachedPicture, PictureType};
 use oxideav_id3::{
-    attached_pictures, parse_id3v1, parse_id3v1_enhanced, parse_tag,
-    parse_tag_with_extended_header, to_key_value_pairs, write_id3v1, write_id3v1_enhanced,
-    write_tag, write_tag_with_options, CommercialDelivery, ContentType, EnhancedTag,
-    EnhancedTagSpeed, EnhancedTagTime, Equ2Interpolation, EquaBand, EtcoEventType, FileType,
-    Id3Frame, Id3Tag, Id3Version, Id3v1Tag, ImageEncodingRestriction, ImageSizeRestriction,
-    KeyAccidental, MediaType, MusicalKey, PopmRating, Restrictions, Rva2Channel, Rva2ChannelType,
-    RvadBackChannels, RvadChannel, RvadFrontChannels, SyltContentType, SytcTempo,
-    TagSizeRestriction, TextEncodingRestriction, TextFieldsRestriction, TimestampUnit, UnsyncMode,
-    WriteOptions,
+    CommercialDelivery, ContentType, EnhancedTag, EnhancedTagSpeed, EnhancedTagTime,
+    Equ2Interpolation, EquaBand, EtcoEventType, FileType, Id3Frame, Id3Tag, Id3Version, Id3v1Tag,
+    ImageEncodingRestriction, ImageSizeRestriction, KeyAccidental, MediaType, MusicalKey,
+    PopmRating, Restrictions, Rva2Channel, Rva2ChannelType, RvadBackChannels, RvadChannel,
+    RvadFrontChannels, SyltContentType, SytcTempo, TagSizeRestriction, TextEncodingRestriction,
+    TextFieldsRestriction, TimestampUnit, UnsyncMode, WriteOptions, attached_pictures, parse_id3v1,
+    parse_id3v1_enhanced, parse_tag, parse_tag_with_extended_header, to_key_value_pairs,
+    write_id3v1, write_id3v1_enhanced, write_tag, write_tag_with_options,
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
@@ -442,12 +441,14 @@ fn roundtrip_itunes_sort_text_frames() {
         }
         // Flat projection exposes them under the lowercased id fallback.
         let kv = to_key_value_pairs(&parsed);
-        assert!(kv
-            .iter()
-            .any(|(k, v)| k == "tso2" && v == "Beethoven, Ludwig van"));
-        assert!(kv
-            .iter()
-            .any(|(k, v)| k == "tsoc" && v == "Beethoven, Ludwig van"));
+        assert!(
+            kv.iter()
+                .any(|(k, v)| k == "tso2" && v == "Beethoven, Ludwig van")
+        );
+        assert!(
+            kv.iter()
+                .any(|(k, v)| k == "tsoc" && v == "Beethoven, Ludwig van")
+        );
     }
 }
 
@@ -4988,10 +4989,12 @@ fn rva2_rejected_under_v23_and_v22() {
     // v2.2 home) rather than erroring, producing a valid empty tag.
     let v22 = write_tag(&tag, Id3Version::V2_2).expect("v2.2 write drops RVA2");
     let (parsed, _) = parse_tag(&v22).expect("parse");
-    assert!(parsed
-        .frames
-        .iter()
-        .all(|f| !matches!(f, Id3Frame::Rva2 { .. })));
+    assert!(
+        parsed
+            .frames
+            .iter()
+            .all(|f| !matches!(f, Id3Frame::Rva2 { .. }))
+    );
 }
 
 /// EQU2 / SEEK / SIGN / ASPI are likewise v2.4-only and rejected under
@@ -5140,10 +5143,11 @@ fn convert_v23_to_v24_drops_rvad_equa() {
         ],
     };
     let v24 = oxideav_id3::convert_tag(&tag, Id3Version::V2_4).expect("convert");
-    assert!(v24
-        .frames
-        .iter()
-        .all(|f| !matches!(f, Id3Frame::Equa { .. } | Id3Frame::Rvad { .. })));
+    assert!(
+        v24.frames
+            .iter()
+            .all(|f| !matches!(f, Id3Frame::Equa { .. } | Id3Frame::Rvad { .. }))
+    );
     // TIT2 survives; the result is writable as v2.4.
     let bytes = write_tag(&v24, Id3Version::V2_4).expect("write converted v2.4");
     parse_tag(&bytes).expect("parse");

@@ -161,6 +161,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- edition 2024, MSRV 1.95
 - `to_key_value_pairs` now surfaces a multi-value text frame as one
   `(key, value)` pair per value under the shared key, instead of
   collapsing the value list into a single slash-joined string. This

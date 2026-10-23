@@ -1762,11 +1762,11 @@ fn parse_tkey_value(value: &str) -> MusicalKey {
             pending = iter.next();
         }
     }
-    if let Some(c) = pending {
-        if c == 'm' {
-            minor = true;
-            pending = iter.next();
-        }
+    if let Some(c) = pending
+        && c == 'm'
+    {
+        minor = true;
+        pending = iter.next();
     }
     // Any leftover character means the value does not match the grammar.
     if pending.is_some() {
@@ -8553,7 +8553,7 @@ fn write_v22_frame(frame: &Id3Frame, out: &mut Vec<u8>) -> Result<()> {
         // propagated error from a frame we were going to drop anyway.
         Id3Frame::Chapter { .. } | Id3Frame::TableOfContents { .. } => return Ok(()),
         Id3Frame::Text { id, .. } if !text_id_valid_in_version(id, Id3Version::V2_3) => {
-            return Ok(())
+            return Ok(());
         }
         _ => {
             // Reuse the v2.3 encoder for the shared §4 bodies, then
@@ -9297,7 +9297,7 @@ fn encode_frame(version: Id3Version, frame: &Id3Frame) -> Result<(String, Vec<u8
                 ));
             }
             let total_bits = *bits_for_bytes_deviation as usize + *bits_for_ms_deviation as usize;
-            if total_bits % 4 != 0 {
+            if !total_bits.is_multiple_of(4) {
                 return Err(Error::invalid(
                     "MLLT bits_for_bytes_deviation + bits_for_ms_deviation must be a multiple of 4",
                 ));
@@ -9748,11 +9748,7 @@ fn write_fixed_ascii8(out: &mut Vec<u8>, s: &str) {
         .chars()
         .map(|c| {
             let v = c as u32;
-            if v < 256 {
-                v as u8
-            } else {
-                b'?'
-            }
+            if v < 256 { v as u8 } else { b'?' }
         })
         .collect();
     if bytes.len() >= 8 {
@@ -9789,10 +9785,10 @@ pub fn id3v1_genre_index(name: &str) -> Option<u8> {
         return None;
     }
     for i in 0..=191u8 {
-        if let Some(g) = id3v1_genre(i) {
-            if g.eq_ignore_ascii_case(name) {
-                return Some(i);
-            }
+        if let Some(g) = id3v1_genre(i)
+            && g.eq_ignore_ascii_case(name)
+        {
+            return Some(i);
         }
     }
     None
@@ -10501,7 +10497,7 @@ mod tests {
         tag.push(3); // major
         tag.push(0); // revision
         tag.push(0); // flags
-                     // synchsafe size
+        // synchsafe size
         let s = size as u32;
         tag.push(((s >> 21) & 0x7F) as u8);
         tag.push(((s >> 14) & 0x7F) as u8);
@@ -11685,9 +11681,11 @@ mod tests {
         assert_eq!(ch.description(), Some("A description"));
         assert_eq!(ch.sub_frames.len(), 2);
         // Chapters are structural: the flat key/value view skips them.
-        assert!(to_key_value_pairs(&tag)
-            .iter()
-            .all(|(k, _)| !k.contains("chap")));
+        assert!(
+            to_key_value_pairs(&tag)
+                .iter()
+                .all(|(k, _)| !k.contains("chap"))
+        );
     }
 
     #[test]
@@ -12015,14 +12013,16 @@ mod tests {
         let v24 = src.to_version(Id3Version::V2_4).expect("convert");
         let ch = v24.chapter_by_element_id("c").expect("chapter survives");
         assert_eq!(first_sub_text(ch.sub_frames, "TDRC"), Some("1999-05-03"));
-        assert!(ch
-            .sub_frames
-            .iter()
-            .any(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TIPL")));
-        assert!(!ch
-            .sub_frames
-            .iter()
-            .any(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TYER" || id == "TDAT")));
+        assert!(
+            ch.sub_frames
+                .iter()
+                .any(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TIPL"))
+        );
+        assert!(
+            !ch.sub_frames
+                .iter()
+                .any(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TYER" || id == "TDAT"))
+        );
         let bytes = write_tag(&v24, Id3Version::V2_4).expect("writes cleanly");
         let (reparsed, _) = parse_tag(&bytes).expect("re-parses");
         let ch = reparsed.chapter_by_element_id("c").expect("still there");
@@ -12612,15 +12612,16 @@ mod tests {
             // appended 0x00) — the *first* byte of any trailing 0xFF
             // is at position out.len() - 2 (the 0x00 sentinel sits at
             // out.len() - 1).
-            if let Some(&last) = out.last() {
-                if !input.is_empty() && input[input.len() - 1] == 0xFF {
-                    assert_eq!(
-                        last,
-                        0x00,
-                        "trailing 0xFF was not escaped: {:02X?}",
-                        &out[out.len().saturating_sub(4)..]
-                    );
-                }
+            if let Some(&last) = out.last()
+                && !input.is_empty()
+                && input[input.len() - 1] == 0xFF
+            {
+                assert_eq!(
+                    last,
+                    0x00,
+                    "trailing 0xFF was not escaped: {:02X?}",
+                    &out[out.len().saturating_sub(4)..]
+                );
             }
         }
     }
@@ -13272,7 +13273,9 @@ mod tests {
         assert_eq!(id, "RVRB");
         assert_eq!(
             payload,
-            vec![0x12, 0x34, 0x56, 0x78, 0x10, 0xFF, 0x7F, 0x01, 0x80, 0x02, 0xAA, 0x55]
+            vec![
+                0x12, 0x34, 0x56, 0x78, 0x10, 0xFF, 0x7F, 0x01, 0x80, 0x02, 0xAA, 0x55
+            ]
         );
     }
 
@@ -14349,12 +14352,14 @@ mod tests {
             ],
         };
         let kv = to_key_value_pairs(&tag);
-        assert!(kv
-            .iter()
-            .any(|(k, v)| k == "encodingtime" && v == "2026-06-03T10:15:00"));
-        assert!(kv
-            .iter()
-            .any(|(k, v)| k == "taggingtime" && v == "2026-06-03T11:00:00"));
+        assert!(
+            kv.iter()
+                .any(|(k, v)| k == "encodingtime" && v == "2026-06-03T10:15:00")
+        );
+        assert!(
+            kv.iter()
+                .any(|(k, v)| k == "taggingtime" && v == "2026-06-03T11:00:00")
+        );
     }
 
     /// §4.2.3 informational frames new (TMOO) and previously unmapped
@@ -14412,15 +14417,18 @@ mod tests {
         };
         let kv = to_key_value_pairs(&tag);
         assert!(kv.iter().any(|(k, v)| k == "owner" && v == "Some Licensee"));
-        assert!(kv
-            .iter()
-            .any(|(k, v)| k == "producednotice" && v == "2026 Producer Inc."));
-        assert!(kv
-            .iter()
-            .any(|(k, v)| k == "radiostation" && v == "Echelle Radio"));
-        assert!(kv
-            .iter()
-            .any(|(k, v)| k == "radiostationowner" && v == "Echelle Inc."));
+        assert!(
+            kv.iter()
+                .any(|(k, v)| k == "producednotice" && v == "2026 Producer Inc.")
+        );
+        assert!(
+            kv.iter()
+                .any(|(k, v)| k == "radiostation" && v == "Echelle Radio")
+        );
+        assert!(
+            kv.iter()
+                .any(|(k, v)| k == "radiostationowner" && v == "Echelle Inc.")
+        );
     }
 
     /// §4.2.5 sort-order frames (TSOA / TSOP / TSOT) and §4.2.1 set
@@ -14458,22 +14466,27 @@ mod tests {
             ],
         };
         let kv = to_key_value_pairs(&tag);
-        assert!(kv
-            .iter()
-            .any(|(k, v)| k == "albumsort" && v == "Album Sort"));
-        assert!(kv
-            .iter()
-            .any(|(k, v)| k == "artistsort" && v == "Artist Sort"));
-        assert!(kv
-            .iter()
-            .any(|(k, v)| k == "titlesort" && v == "Title Sort"));
-        assert!(kv
-            .iter()
-            .any(|(k, v)| k == "setsubtitle" && v == "Disc One"));
+        assert!(
+            kv.iter()
+                .any(|(k, v)| k == "albumsort" && v == "Album Sort")
+        );
+        assert!(
+            kv.iter()
+                .any(|(k, v)| k == "artistsort" && v == "Artist Sort")
+        );
+        assert!(
+            kv.iter()
+                .any(|(k, v)| k == "titlesort" && v == "Title Sort")
+        );
+        assert!(
+            kv.iter()
+                .any(|(k, v)| k == "setsubtitle" && v == "Disc One")
+        );
         assert!(kv.iter().any(|(k, v)| k == "playlistdelay" && v == "500"));
-        assert!(kv
-            .iter()
-            .any(|(k, v)| k == "originalfilename" && v == "song.mp3"));
+        assert!(
+            kv.iter()
+                .any(|(k, v)| k == "originalfilename" && v == "song.mp3")
+        );
     }
 
     /// v2.3-only date / time / recording-dates / size text frames that
@@ -14513,9 +14526,10 @@ mod tests {
         assert!(kv.iter().any(|(k, v)| k == "date" && v == "1999"));
         assert!(kv.iter().any(|(k, v)| k == "date_ddmm" && v == "3112"));
         assert!(kv.iter().any(|(k, v)| k == "time_hhmm" && v == "2359"));
-        assert!(kv
-            .iter()
-            .any(|(k, v)| k == "recordingdates" && v == "4th-7th June"));
+        assert!(
+            kv.iter()
+                .any(|(k, v)| k == "recordingdates" && v == "4th-7th June")
+        );
         assert!(kv.iter().any(|(k, v)| k == "size" && v == "123456"));
     }
 
@@ -16542,10 +16556,11 @@ mod tests {
             }],
         };
         let out = convert_tag(&tag, Id3Version::V2_4).unwrap();
-        assert!(!out
-            .frames
-            .iter()
-            .any(|f| matches!(f, Id3Frame::Ipls { .. })));
+        assert!(
+            !out.frames
+                .iter()
+                .any(|f| matches!(f, Id3Frame::Ipls { .. }))
+        );
         let tipl = out
             .frames
             .iter()
@@ -16793,10 +16808,11 @@ mod tests {
         assert_eq!(out.frames.len(), 2);
         assert_eq!(find_text(&out, "TIT2"), Some(&vec!["Song".to_string()]));
         assert_eq!(find_text(&out, "TPE1"), Some(&vec!["Artist".to_string()]));
-        assert!(!out
-            .frames
-            .iter()
-            .any(|f| matches!(f, Id3Frame::Rva2 { .. } | Id3Frame::Seek { .. })));
+        assert!(
+            !out.frames
+                .iter()
+                .any(|f| matches!(f, Id3Frame::Rva2 { .. } | Id3Frame::Seek { .. }))
+        );
         assert!(find_text(&out, "TMCL").is_none());
     }
 
@@ -16843,10 +16859,11 @@ mod tests {
         let out = convert_tag(&tag, Id3Version::V2_2).unwrap();
         assert_eq!(out.frames.len(), 2);
         assert!(out.frames.iter().any(|f| matches!(f, Id3Frame::Picture(_))));
-        assert!(out
-            .frames
-            .iter()
-            .any(|f| matches!(f, Id3Frame::EncryptedMeta { .. })));
+        assert!(
+            out.frames
+                .iter()
+                .any(|f| matches!(f, Id3Frame::EncryptedMeta { .. }))
+        );
     }
 
     #[test]
@@ -16908,14 +16925,18 @@ mod tests {
         let v24 = convert_tag(&tag, Id3Version::V2_4).unwrap();
         let bytes = write_tag(&v24, Id3Version::V2_4).unwrap();
         let (parsed, _) = parse_tag(&bytes).unwrap();
-        assert!(parsed
-            .frames
-            .iter()
-            .any(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TDRC")));
-        assert!(!parsed
-            .frames
-            .iter()
-            .any(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TYER")));
+        assert!(
+            parsed
+                .frames
+                .iter()
+                .any(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TDRC"))
+        );
+        assert!(
+            !parsed
+                .frames
+                .iter()
+                .any(|f| matches!(f, Id3Frame::Text { id, .. } if id == "TYER"))
+        );
     }
 
     // ---- multi-value text-frame splitting (v2.4 §4.2) ----

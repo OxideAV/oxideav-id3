@@ -14,8 +14,8 @@
 //! the very next push instead of at the next scheduled fuzz run.
 
 use oxideav_id3::{
-    parse_id3v1, parse_id3v1_enhanced, parse_tag, tag_size_at_head, to_key_value_pairs,
-    write_id3v1_enhanced, write_tag, EnhancedTag, Id3Frame, Id3Tag, Id3Version, Id3v1Tag,
+    EnhancedTag, Id3Frame, Id3Tag, Id3Version, Id3v1Tag, parse_id3v1, parse_id3v1_enhanced,
+    parse_tag, tag_size_at_head, to_key_value_pairs, write_id3v1_enhanced, write_tag,
 };
 
 /// Small deterministic PRNG (xorshift64*) so failures reproduce.
@@ -151,7 +151,7 @@ fn mutated_chapter_and_enhanced_fixtures_never_panic() {
                 data[idx] = rng.next() as u8;
             }
             // A third of the time, also truncate.
-            if rng.next() % 3 == 0 {
+            if rng.next().is_multiple_of(3) {
                 let keep = (rng.next() as usize) % (data.len() + 1);
                 data.truncate(keep);
             }

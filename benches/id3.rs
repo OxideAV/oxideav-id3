@@ -39,11 +39,11 @@
 //! Run with:
 //!     cargo bench -p oxideav-id3 --bench id3
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_id3::{
-    parse_id3v1, parse_tag, tag_size_at_head, to_key_value_pairs, write_tag, Id3Tag, Id3Version,
-    WriteOptions,
+    Id3Tag, Id3Version, WriteOptions, parse_id3v1, parse_tag, tag_size_at_head, to_key_value_pairs,
+    write_tag,
 };
 
 // ---------- deterministic byte source ----------
