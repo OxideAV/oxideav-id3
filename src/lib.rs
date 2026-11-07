@@ -111,6 +111,7 @@ use oxideav_core::{AttachedPicture, Error, PictureType, Result};
 pub const ID3V2_HEADER_SIZE: usize = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Id3Version {
     V2_2,
     V2_3,
@@ -119,12 +120,21 @@ pub enum Id3Version {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Id3Tag {
     pub version: Id3Version,
     pub frames: Vec<Id3Frame>,
 }
 
+impl Id3Tag {
+    /// Build a [`Id3Tag`] from its fields.
+    pub fn new(version: Id3Version, frames: Vec<Id3Frame>) -> Self {
+        Self { version, frames }
+    }
+}
+
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Id3Frame {
     /// Text-information frame (`T***` except `TXXX`), already decoded
     /// from whatever encoding was declared. Multi-value frames (v2.4
@@ -3913,6 +3923,7 @@ impl Restrictions {
 ///   sub-fields (`%ppqrrstt`). v2.3 has no equivalent; always `None`
 ///   for a v2.3 tag.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExtendedHeader {
     /// `true` when the v2.4 extended-header `b` flag bit is set:
     /// "Tag is an update. If this flag is set, the present tag is an
@@ -3930,6 +3941,26 @@ pub struct ExtendedHeader {
     /// bit is set, `None` otherwise (always `None` for v2.3 — the
     /// restrictions sub-field is v2.4-only).
     pub restrictions: Option<Restrictions>,
+}
+
+impl ExtendedHeader {
+    /// Set `is_update`.
+    pub fn with_is_update(mut self, v: bool) -> Self {
+        self.is_update = v;
+        self
+    }
+
+    /// Set `crc`.
+    pub fn with_crc(mut self, v: Option<u32>) -> Self {
+        self.crc = v;
+        self
+    }
+
+    /// Set `restrictions`.
+    pub fn with_restrictions(mut self, v: Option<Restrictions>) -> Self {
+        self.restrictions = v;
+        self
+    }
 }
 
 /// Parse an ID3v2 tag from a buffer that starts with the 10-byte
@@ -7840,6 +7871,7 @@ pub fn write_tag(tag: &Id3Tag, target_version: Id3Version) -> Result<Vec<u8>> {
 /// runs) from naive MPEG decoders that might otherwise mistake an ID3
 /// tag for the start of an audio frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UnsyncMode {
     /// No unsynchronisation. The tag header flag bit 0x80 is clear,
     /// no per-frame unsync format-flag bit is set, and the body is
@@ -7878,6 +7910,7 @@ pub enum UnsyncMode {
 /// [`WriteOptions::default`] or [`WriteOptions::new`] and tweaked
 /// with the builder-style setters.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct WriteOptions {
     pub unsync: UnsyncMode,
     /// Emit an extended header carrying a CRC-32 over the tag's frame
@@ -10259,6 +10292,7 @@ impl Id3Tag {
 /// Borrowed typed view of one `CHAP` frame
 /// ([`Id3Frame::Chapter`]) with sub-frame convenience accessors.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct ChapterRef<'a> {
     pub element_id: &'a str,
     pub start_time_ms: u32,
@@ -10311,6 +10345,7 @@ impl<'a> ChapterRef<'a> {
 /// Borrowed typed view of one `CTOC` frame
 /// ([`Id3Frame::TableOfContents`]).
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct TocRef<'a> {
     pub element_id: &'a str,
     pub top_level: bool,

@@ -16,9 +16,9 @@ use oxideav_id3::{
 };
 
 fn make_tag(version: Id3Version) -> Id3Tag {
-    Id3Tag {
+    Id3Tag::new(
         version,
-        frames: vec![
+        vec![
             Id3Frame::Text {
                 id: "TIT2".into(),
                 values: vec!["Round Trip".into()],
@@ -64,7 +64,7 @@ fn make_tag(version: Id3Version) -> Id3Tag {
                 text: "La la la".into(),
             },
         ],
-    }
+    )
 }
 
 fn find_text<'a>(tag: &'a Id3Tag, id: &str) -> Option<&'a [String]> {
@@ -193,13 +193,13 @@ fn roundtrip_v24_common_frames() {
 fn roundtrip_v24_multivalue_text() {
     // v2.4 splits multi-value text frames on NUL. Writer must emit NUL
     // separators so the parser recovers both values.
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Text {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Text {
             id: "TPE1".into(),
             values: vec!["Alice".into(), "Bob".into()],
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     assert_eq!(
@@ -216,13 +216,13 @@ fn v23_multivalue_text_joins_and_does_not_resplit() {
     // frame degrades to a single joined value under v2.3. This pins the
     // documented lossy behavior — the previous README wording wrongly
     // claimed the parser splits v2.3 on `/`.
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![Id3Frame::Text {
+    let tag = Id3Tag::new(
+        Id3Version::V2_3,
+        vec![Id3Frame::Text {
             id: "TPE1".into(),
             values: vec!["Alice".into(), "Bob".into()],
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     assert_eq!(
@@ -238,13 +238,13 @@ fn v23_slash_bearing_single_value_survives_verbatim() {
     // survive a v2.3 round-trip as exactly one value — never split into
     // ["3","10"]. Guards the parser's deliberate no-`/`-split rule.
     for version in [Id3Version::V2_3, Id3Version::V2_4] {
-        let tag = Id3Tag {
+        let tag = Id3Tag::new(
             version,
-            frames: vec![Id3Frame::Text {
+            vec![Id3Frame::Text {
                 id: "TRCK".into(),
                 values: vec!["3/10".into()],
             }],
-        };
+        );
         let bytes = write_tag(&tag, version).unwrap();
         let (parsed, _) = parse_tag(&bytes).unwrap();
         assert_eq!(
@@ -258,13 +258,13 @@ fn v23_slash_bearing_single_value_survives_verbatim() {
 #[test]
 fn roundtrip_v23_unicode_via_utf16() {
     // v2.3 writer uses UTF-16 with BOM. Ensure non-ASCII titles survive.
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![Id3Frame::Text {
+    let tag = Id3Tag::new(
+        Id3Version::V2_3,
+        vec![Id3Frame::Text {
             id: "TIT2".into(),
             values: vec!["\u{65E5}\u{672C}\u{8A9E} title".into()],
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     assert_eq!(
@@ -275,9 +275,9 @@ fn roundtrip_v23_unicode_via_utf16() {
 
 #[test]
 fn roundtrip_id3v1_trailer() {
-    let tag = Id3Tag {
-        version: Id3Version::V1,
-        frames: vec![
+    let tag = Id3Tag::new(
+        Id3Version::V1,
+        vec![
             Id3Frame::Text {
                 id: "TIT2".into(),
                 values: vec!["Short Title".into()],
@@ -308,7 +308,7 @@ fn roundtrip_id3v1_trailer() {
                 text: "hi".into(),
             },
         ],
-    };
+    );
     let bytes = write_id3v1(&tag);
     assert_eq!(bytes.len(), 128);
     assert_eq!(&bytes[0..3], b"TAG");
@@ -329,9 +329,9 @@ fn roundtrip_preserves_unknown_frames() {
     // payload verbatim so future code (or other tools) can still read
     // them. Use a synthetic 4-char id that the parser does NOT
     // recognise structurally (so it stays an `Unknown`).
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![
             Id3Frame::Text {
                 id: "TIT2".into(),
                 values: vec!["x".into()],
@@ -341,7 +341,7 @@ fn roundtrip_preserves_unknown_frames() {
                 raw: b"arbitrary bytes".to_vec(),
             },
         ],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let raw = parsed.frames.iter().find_map(|f| match f {
@@ -378,7 +378,7 @@ fn roundtrip_preserves_itunes_binary_frames_verbatim() {
                 raw: raw.to_vec(),
             });
         }
-        let tag = Id3Tag { version, frames };
+        let tag = Id3Tag::new(version, frames);
         let bytes = write_tag(&tag, version).unwrap();
         let (parsed, _) = parse_tag(&bytes).unwrap();
         for (id, raw) in bodies {
@@ -409,9 +409,9 @@ fn roundtrip_preserves_itunes_binary_frames_verbatim() {
 #[test]
 fn roundtrip_itunes_sort_text_frames() {
     for version in [Id3Version::V2_3, Id3Version::V2_4] {
-        let tag = Id3Tag {
+        let tag = Id3Tag::new(
             version,
-            frames: vec![
+            vec![
                 Id3Frame::Text {
                     id: "TIT2".into(),
                     values: vec!["x".into()],
@@ -425,7 +425,7 @@ fn roundtrip_itunes_sort_text_frames() {
                     values: vec!["Beethoven, Ludwig van".into()],
                 },
             ],
-        };
+        );
         let bytes = write_tag(&tag, version).unwrap();
         let (parsed, _) = parse_tag(&bytes).unwrap();
         for id in ["TSO2", "TSOC"] {
@@ -465,14 +465,14 @@ fn tag_size_matches_written_bytes() {
 /// `rating_count` keys in the Vorbis-style k/v projection.
 #[test]
 fn roundtrip_popm_v24() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Popularimeter {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Popularimeter {
             email: "rater@example.com".into(),
             rating: 196,
             counter: 42,
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let pop = parsed.frames.iter().find_map(|f| match f {
@@ -496,14 +496,14 @@ fn roundtrip_popm_v24() {
 #[test]
 fn roundtrip_popm_wide_counter() {
     let big = (u32::MAX as u64) + 7;
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Popularimeter {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Popularimeter {
             email: String::new(),
             rating: 255,
             counter: big,
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let pop = parsed.frames.iter().find_map(|f| match f {
@@ -519,10 +519,10 @@ fn roundtrip_popm_wide_counter() {
 /// k/v projection surfaces `play_count`.
 #[test]
 fn roundtrip_pcnt_v23() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![Id3Frame::PlayCounter { count: 1234 }],
-    };
+    let tag = Id3Tag::new(
+        Id3Version::V2_3,
+        vec![Id3Frame::PlayCounter { count: 1234 }],
+    );
     let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let pc = parsed.frames.iter().find_map(|f| match f {
@@ -537,13 +537,13 @@ fn roundtrip_pcnt_v23() {
 /// `PRIV` round-trip: owner identifier + opaque binary payload.
 #[test]
 fn roundtrip_priv() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Private {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Private {
             owner: "WM/MediaClassPrimaryID".into(),
             data: vec![0xBC, 0x7D, 0x60, 0xD1, 0x23, 0xE3, 0xE2, 0x4B],
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let pv = parsed.frames.iter().find_map(|f| match f {
@@ -563,13 +563,13 @@ fn roundtrip_priv() {
 #[test]
 fn roundtrip_ufid() {
     let id_bytes: Vec<u8> = (0..16).collect();
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Ufid {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Ufid {
             owner: "http://musicbrainz.org".into(),
             identifier: id_bytes.clone(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let ufid = parsed.frames.iter().find_map(|f| match f {
@@ -586,15 +586,15 @@ fn roundtrip_ufid() {
 #[test]
 fn roundtrip_geob_v24() {
     let payload = b"binary attachment payload\x00\x01\x02".to_vec();
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Geob {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Geob {
             mime_type: "application/octet-stream".into(),
             filename: "notes.bin".into(),
             description: "session notes".into(),
             data: payload.clone(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let g = parsed.frames.iter().find_map(|f| match f {
@@ -625,9 +625,9 @@ fn roundtrip_geob_v24() {
 #[test]
 fn roundtrip_geob_v23_utf16() {
     let payload = vec![0xDE, 0xAD, 0xBE, 0xEF];
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![Id3Frame::Geob {
+    let tag = Id3Tag::new(
+        Id3Version::V2_3,
+        vec![Id3Frame::Geob {
             mime_type: "image/png".into(),
             // Non-ASCII filename forces the v2.3 UTF-16-with-BOM path
             // through both the filename and description fields.
@@ -635,7 +635,7 @@ fn roundtrip_geob_v23_utf16() {
             description: "cover art".into(),
             data: payload.clone(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let g = parsed.frames.iter().find_map(|f| match f {
@@ -668,9 +668,9 @@ fn roundtrip_geob_v23_utf16() {
 /// triplet is always plain ASCII.
 #[test]
 fn roundtrip_user_v23_and_v24() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![
             Id3Frame::TermsOfUse {
                 lang: *b"eng",
                 text: "All rights reserved.".into(),
@@ -680,7 +680,7 @@ fn roundtrip_user_v23_and_v24() {
                 text: "\u{3059}\u{3079}\u{3066}\u{306E}\u{6A29}\u{5229}".into(),
             },
         ],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let mut got: Vec<([u8; 3], String)> = parsed
@@ -707,14 +707,14 @@ fn roundtrip_user_v23_and_v24() {
 /// always parseable.
 #[test]
 fn roundtrip_owne_v24() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Ownership {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Ownership {
             price: "USD9.99".into(),
             date: "20260114".into(),
             seller: "Example Records Inc.".into(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let own = parsed.frames.iter().find_map(|f| match f {
@@ -746,14 +746,14 @@ fn roundtrip_owne_v24() {
 /// out-of-shape.
 #[test]
 fn owne_short_date_pads_to_eight() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Ownership {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Ownership {
             price: "EUR1".into(),
             date: "2026".into(),
             seller: "S".into(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let date = parsed.frames.iter().find_map(|f| match f {
@@ -768,9 +768,9 @@ fn owne_short_date_pads_to_eight() {
 /// + encoded-string seller/description + MIME + binary logo path.
 #[test]
 fn roundtrip_comr_with_logo() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Commercial {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Commercial {
             price: "USD9.99/EUR8.99".into(),
             valid_until: "20271231".into(),
             contact_url: "https://example.com/buy".into(),
@@ -780,7 +780,7 @@ fn roundtrip_comr_with_logo() {
             logo_mime: "image/png".into(),
             logo_data: vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let cm = parsed.frames.iter().find_map(|f| match f {
@@ -826,9 +826,9 @@ fn roundtrip_comr_with_logo() {
 /// reads back the same.
 #[test]
 fn roundtrip_comr_without_logo() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![Id3Frame::Commercial {
+    let tag = Id3Tag::new(
+        Id3Version::V2_3,
+        vec![Id3Frame::Commercial {
             price: "JPY1000".into(),
             valid_until: "20261231".into(),
             contact_url: "mailto:sales@example.com".into(),
@@ -838,7 +838,7 @@ fn roundtrip_comr_without_logo() {
             logo_mime: String::new(),
             logo_data: Vec::new(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let cm = parsed.frames.iter().find_map(|f| match f {
@@ -873,13 +873,13 @@ fn roundtrip_sytc() {
         (300, 5_500),      // 300 BPM ($FF $2D)
         (510, 12_000_000), // upper end of $FF extension
     ];
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::SyncedTempo {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::SyncedTempo {
             time_format: 0x02, // milliseconds
             codes: codes.clone(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -897,9 +897,9 @@ fn roundtrip_sytc() {
 fn roundtrip_rva2_multi_channel() {
     // +2 dB = 2 * 512 = 1024 = $04 00
     // -3 dB = -3 * 512 = -1536 = $FA 00 (two's complement)
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Rva2 {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Rva2 {
             identification: "track".into(),
             channels: vec![
                 Rva2Channel {
@@ -916,7 +916,7 @@ fn roundtrip_rva2_multi_channel() {
                 },
             ],
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -945,9 +945,9 @@ fn roundtrip_rva2_multi_channel() {
 /// reads the padded form back verbatim.
 #[test]
 fn roundtrip_rva2_padded_peak() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Rva2 {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Rva2 {
             identification: "album".into(),
             channels: vec![Rva2Channel {
                 channel_type: 0x01,
@@ -956,7 +956,7 @@ fn roundtrip_rva2_padded_peak() {
                 peak: vec![0x0F, 0xFF],
             }],
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let ch = parsed
@@ -982,14 +982,14 @@ fn roundtrip_equ2_linear() {
         (8_000, 0),       // 4000 Hz, flat
         (24_000, 1_024),  // 12000 Hz, +2 dB
     ];
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Equ2 {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Equ2 {
             interpolation: 1, // Linear
             identification: "headphones".into(),
             points: pts.clone(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1045,10 +1045,10 @@ fn popm_truncated_no_rating() {
 #[test]
 fn roundtrip_mcdi() {
     let toc: Vec<u8> = (0..200u8).collect();
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::MusicCdId { toc: toc.clone() }],
-    };
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::MusicCdId { toc: toc.clone() }],
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1063,13 +1063,13 @@ fn roundtrip_mcdi() {
 #[test]
 fn roundtrip_etco() {
     let events = vec![(0x01u8, 0u32), (0x02, 1_500), (0x05, 180_000)];
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::EventTimingCodes {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::EventTimingCodes {
             time_format: 0x02, // milliseconds
             events: events.clone(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1094,16 +1094,16 @@ fn roundtrip_sylt() {
             ("in the ".to_string(), 2_000),
             ("night".to_string(), 3_000),
         ];
-        let tag = Id3Tag {
-            version: v,
-            frames: vec![Id3Frame::SyncedLyrics {
+        let tag = Id3Tag::new(
+            v,
+            vec![Id3Frame::SyncedLyrics {
                 lang: *b"eng",
                 time_format: 0x02,
                 content_type: 0x01, // lyrics
                 description: "Sinatra".into(),
                 syncs: syncs.clone(),
             }],
-        };
+        );
         let bytes = write_tag(&tag, v).unwrap();
         let (parsed, _) = parse_tag(&bytes).unwrap();
         let got = parsed.frames.iter().find_map(|f| match f {
@@ -1144,16 +1144,16 @@ fn sylt_timestamp_unit_roundtrips_across_v23_and_v24() {
             (Id3Version::V2_3, Id3Version::V2_4),
             (Id3Version::V2_4, Id3Version::V2_3),
         ] {
-            let tag = Id3Tag {
-                version: src,
-                frames: vec![Id3Frame::SyncedLyrics {
+            let tag = Id3Tag::new(
+                src,
+                vec![Id3Frame::SyncedLyrics {
                     lang: *b"eng",
                     time_format: wire_format,
                     content_type: 0x01,
                     description: "x".into(),
                     syncs: vec![("hi".into(), 12_345)],
                 }],
-            };
+            );
             // Write under the source version then re-parse under the
             // destination version envelope (parse_tag reads the version
             // from the wire header, not a caller-supplied hint).
@@ -1188,16 +1188,16 @@ fn sylt_timestamp_unit_roundtrips_across_v23_and_v24() {
 /// unit.
 #[test]
 fn sylt_timestamp_unit_none_for_reserved_byte() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::SyncedLyrics {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::SyncedLyrics {
             lang: *b"eng",
             time_format: 0x05, // reserved
             content_type: 0x01,
             description: String::new(),
             syncs: vec![],
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let frame = parsed
@@ -1218,13 +1218,13 @@ fn sylt_timestamp_unit_none_for_reserved_byte() {
 /// resume point in milliseconds.
 #[test]
 fn roundtrip_poss() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::PositionSync {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::PositionSync {
             time_format: 0x02,
             position: 45_000,
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1241,14 +1241,14 @@ fn roundtrip_poss() {
 /// flag set and a non-zero offset-to-next.
 #[test]
 fn roundtrip_rbuf() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::RecommendedBuffer {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::RecommendedBuffer {
             buffer_size: 0x12_3456,
             embedded_info: true,
             offset_to_next: 0xCAFE_BABE,
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1266,14 +1266,14 @@ fn roundtrip_rbuf() {
 /// to 0xFF_FFFF on write (per spec the field is 3 bytes wide).
 #[test]
 fn rbuf_clamps_oversize_buffer_size() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::RecommendedBuffer {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::RecommendedBuffer {
             buffer_size: 0xFFFF_FFFF,
             embedded_info: false,
             offset_to_next: 0,
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1286,12 +1286,12 @@ fn rbuf_clamps_oversize_buffer_size() {
 /// `SEEK` round-trip — a single 32-bit offset.
 #[test]
 fn roundtrip_seek() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Seek {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Seek {
             min_offset_to_next_tag: 0x0010_0000,
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1307,13 +1307,13 @@ fn roundtrip_seek() {
 #[test]
 fn roundtrip_sign() {
     let sig = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Signature {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Signature {
             group_symbol: 0x80,
             signature: sig.clone(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1331,15 +1331,15 @@ fn roundtrip_sign() {
 #[test]
 fn roundtrip_aenc() {
     let info = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::AudioEncryption {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::AudioEncryption {
             owner: "https://example.com/crypto".into(),
             preview_start: 100,
             preview_length: 50,
             encryption_info: info.clone(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1374,14 +1374,14 @@ fn roundtrip_aenc() {
 fn roundtrip_grid() {
     let extra = vec![0xAB, 0xCD, 0xEF, 0x12, 0x34];
     for version in [Id3Version::V2_3, Id3Version::V2_4] {
-        let tag = Id3Tag {
+        let tag = Id3Tag::new(
             version,
-            frames: vec![Id3Frame::GroupId {
+            vec![Id3Frame::GroupId {
                 owner: "https://example.com/group".into(),
                 group_symbol: 0x90,
                 data: extra.clone(),
             }],
-        };
+        );
         let bytes = write_tag(&tag, version).unwrap();
         let (parsed, _) = parse_tag(&bytes).unwrap();
         let got = parsed.frames.iter().find_map(|f| match f {
@@ -1407,14 +1407,14 @@ fn roundtrip_grid() {
 /// minimum legal frame. The empty-data branch must round-trip cleanly.
 #[test]
 fn roundtrip_grid_empty_data() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::GroupId {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::GroupId {
             owner: "tag@example.org".into(),
             group_symbol: 0x80,
             data: Vec::new(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1482,14 +1482,14 @@ fn grid_parse_raw_bytes() {
 /// frame from another file.
 #[test]
 fn roundtrip_link_v24() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::LinkedInfo {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::LinkedInfo {
             frame_id: *b"TPE1",
             url: "https://example.com/canonical.mp3".into(),
             additional: Vec::new(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1515,14 +1515,14 @@ fn roundtrip_link_v24() {
 /// 4-byte `[frame_id]` slot with the trailing byte zero-padded.
 #[test]
 fn roundtrip_link_v23() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![Id3Frame::LinkedInfo {
+    let tag = Id3Tag::new(
+        Id3Version::V2_3,
+        vec![Id3Frame::LinkedInfo {
             frame_id: [b'T', b'P', b'1', 0],
             url: "https://example.com/legacy.mp3".into(),
             additional: Vec::new(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1552,14 +1552,14 @@ fn roundtrip_link_v23() {
 fn roundtrip_link_v23_url_starts_with_id_char() {
     // `WWW.example.com` — the 4th payload byte is 'W' (a valid id char),
     // which the old heuristic would have stolen into the frame id.
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![Id3Frame::LinkedInfo {
+    let tag = Id3Tag::new(
+        Id3Version::V2_3,
+        vec![Id3Frame::LinkedInfo {
             frame_id: [b'W', b'O', b'A', 0],
             url: "WWW.EXAMPLE.COM/legacy.mp3".into(),
             additional: vec![1, 2, 3],
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1590,15 +1590,15 @@ fn roundtrip_aspi_v24_16bit() {
     let fractions: Vec<u16> = (0..100u32)
         .map(|i| ((i * (u16::MAX as u32)) / 99) as u16)
         .collect();
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::AudioSeekPointIndex {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::AudioSeekPointIndex {
             indexed_data_start: 4096,
             indexed_data_length: 12_345_678,
             bits_per_index_point: 16,
             fractions: fractions.clone(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1623,15 +1623,15 @@ fn roundtrip_aspi_v24_16bit() {
 #[test]
 fn roundtrip_aspi_v24_8bit() {
     let fractions: Vec<u16> = (0..10u16).map(|i| i * 25).collect();
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::AudioSeekPointIndex {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::AudioSeekPointIndex {
             indexed_data_start: 0,
             indexed_data_length: 30_000,
             bits_per_index_point: 8,
             fractions: fractions.clone(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1702,9 +1702,9 @@ fn roundtrip_mllt_v24_8plus8_bits() {
     let references: Vec<(u32, u32)> = (0..100u32)
         .map(|i| ((i * 251) % 256, (i * 17) % 256))
         .collect();
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::MpegLocationLookup {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::MpegLocationLookup {
             mpeg_frames_between_reference: 2,
             bytes_between_reference: 65_536,
             ms_between_reference: 1_500,
@@ -1712,7 +1712,7 @@ fn roundtrip_mllt_v24_8plus8_bits() {
             bits_for_ms_deviation: 8,
             references: references.clone(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1762,9 +1762,9 @@ fn roundtrip_mllt_v23_12plus4_bits_subbyte_packing() {
         (0x400, 0x8),
         (0x500, 0xA),
     ];
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![Id3Frame::MpegLocationLookup {
+    let tag = Id3Tag::new(
+        Id3Version::V2_3,
+        vec![Id3Frame::MpegLocationLookup {
             mpeg_frames_between_reference: 1,
             bytes_between_reference: 0x00FF_FFFF,
             ms_between_reference: 0x00FF_FFFF,
@@ -1772,7 +1772,7 @@ fn roundtrip_mllt_v23_12plus4_bits_subbyte_packing() {
             bits_for_ms_deviation: 4,
             references: references.clone(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let got = parsed.frames.iter().find_map(|f| match f {
@@ -1804,9 +1804,9 @@ fn roundtrip_mllt_v23_12plus4_bits_subbyte_packing() {
 /// a non-conforming stream.
 #[test]
 fn mllt_writer_rejects_non_multiple_of_four_total_bits() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::MpegLocationLookup {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::MpegLocationLookup {
             mpeg_frames_between_reference: 2,
             bytes_between_reference: 1000,
             ms_between_reference: 1000,
@@ -1815,7 +1815,7 @@ fn mllt_writer_rejects_non_multiple_of_four_total_bits() {
             bits_for_ms_deviation: 8,
             references: vec![(1, 1)],
         }],
-    };
+    );
     let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -1827,9 +1827,9 @@ fn mllt_writer_rejects_non_multiple_of_four_total_bits() {
 /// `MLLT` writer must refuse a 24-bit-field value that doesn't fit.
 #[test]
 fn mllt_writer_rejects_24bit_overflow() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::MpegLocationLookup {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::MpegLocationLookup {
             mpeg_frames_between_reference: 1,
             bytes_between_reference: 0x0100_0000, // 1 over the 24-bit cap
             ms_between_reference: 0,
@@ -1837,7 +1837,7 @@ fn mllt_writer_rejects_24bit_overflow() {
             bits_for_ms_deviation: 8,
             references: vec![],
         }],
-    };
+    );
     let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -1850,9 +1850,9 @@ fn mllt_writer_rejects_24bit_overflow() {
 /// wider than the declared per-reference width.
 #[test]
 fn mllt_writer_rejects_reference_over_width() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::MpegLocationLookup {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::MpegLocationLookup {
             mpeg_frames_between_reference: 1,
             bytes_between_reference: 0,
             ms_between_reference: 0,
@@ -1861,7 +1861,7 @@ fn mllt_writer_rejects_reference_over_width() {
             // Declared as 4 bits (max 0xF) but value is 0x10.
             references: vec![(0x10, 0)],
         }],
-    };
+    );
     let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -1969,9 +1969,9 @@ fn mllt_parser_rejects_excessive_bit_width() {
 // ---------------------------------------------------------------------------
 
 fn small_text_tag(version: Id3Version) -> Id3Tag {
-    Id3Tag {
+    Id3Tag::new(
         version,
-        frames: vec![
+        vec![
             Id3Frame::Text {
                 id: "TIT2".into(),
                 values: vec!["CRC Test".into()],
@@ -1981,7 +1981,7 @@ fn small_text_tag(version: Id3Version) -> Id3Tag {
                 values: vec!["The CRC".into()],
             },
         ],
-    }
+    )
 }
 
 /// v2.3 extended-header CRC: emitting `WriteOptions::with_crc(true)`
@@ -2060,13 +2060,13 @@ fn roundtrip_extended_header_crc_v24() {
 fn roundtrip_extended_header_crc_with_unsync_v23() {
     // Use a frame value that contains an $FF byte so unsync actually
     // mutates the body.
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![Id3Frame::Private {
+    let tag = Id3Tag::new(
+        Id3Version::V2_3,
+        vec![Id3Frame::Private {
             owner: "test@oxideav.io".into(),
             data: vec![0xFF, 0xE0, 0xFF, 0x00, 0xFF],
         }],
-    };
+    );
     let opts = WriteOptions::new()
         .with_crc(true)
         .with_unsync(UnsyncMode::WholeTag);
@@ -2087,13 +2087,13 @@ fn roundtrip_extended_header_crc_with_unsync_v23() {
 
 #[test]
 fn roundtrip_extended_header_crc_with_unsync_v24() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Private {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Private {
             owner: "v24@oxideav.io".into(),
             data: vec![0xFF, 0xFA, 0xFF, 0x00, 0x10],
         }],
-    };
+    );
     let opts = WriteOptions::new()
         .with_crc(true)
         .with_unsync(UnsyncMode::WholeTag);
@@ -2145,13 +2145,13 @@ fn parse_rejects_bad_crc_v24() {
 /// frame payloads, not the ext header itself.
 #[test]
 fn roundtrip_extended_header_crc_with_perframe_unsync_v24() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Private {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Private {
             owner: "perframe".into(),
             data: vec![0xFF, 0xE0, 0x00, 0xFF, 0xF8],
         }],
-    };
+    );
     let opts = WriteOptions::new()
         .with_crc(true)
         .with_unsync(UnsyncMode::PerFrame);
@@ -2212,13 +2212,13 @@ fn roundtrip_footer_v24_text() {
 #[test]
 fn roundtrip_footer_v24_with_unsync() {
     let payload = vec![0xFF, 0xE0, 0xAB, 0xFF, 0x00, 0xCD];
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Private {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Private {
             owner: "owner@example.com".into(),
             data: payload.clone(),
         }],
-    };
+    );
     let opts = WriteOptions::new()
         .with_unsync(UnsyncMode::WholeTag)
         .with_footer(true);
@@ -2282,10 +2282,7 @@ fn roundtrip_rvrb_v23_and_v24() {
         premix_rl: 0x20,
     };
     for version in [Id3Version::V2_3, Id3Version::V2_4] {
-        let tag = Id3Tag {
-            version,
-            frames: vec![original.clone()],
-        };
+        let tag = Id3Tag::new(version, vec![original.clone()]);
         let bytes = write_tag(&tag, version).unwrap();
         let (parsed, _) = parse_tag(&bytes).unwrap();
         assert_eq!(parsed.frames.len(), 1);
@@ -2336,10 +2333,7 @@ fn roundtrip_rvrb_extreme_values() {
         premix_lr: 0xFF,
         premix_rl: 0xFF,
     };
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![original.clone()],
-    };
+    let tag = Id3Tag::new(Id3Version::V2_4, vec![original.clone()]);
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     assert_eq!(parsed.frames.len(), 1);
@@ -2400,10 +2394,7 @@ fn roundtrip_rvad_v23_all_channels_12bit() {
             peak: vec![0x00, 0x02],
         }),
     };
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![original],
-    };
+    let tag = Id3Tag::new(Id3Version::V2_3, vec![original]);
     let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     assert_eq!(parsed.frames.len(), 1);
@@ -2443,9 +2434,9 @@ fn roundtrip_rvad_v23_all_channels_12bit() {
 /// fail rather than producing a frame v2.4 readers would not parse.
 #[test]
 fn roundtrip_rvad_writer_rejects_v24() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Rvad {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Rvad {
             increment_decrement: 0b0000_0011,
             bits_used: 16,
             front: Some(RvadFrontChannels {
@@ -2462,7 +2453,7 @@ fn roundtrip_rvad_writer_rejects_v24() {
             center: None,
             bass: None,
         }],
-    };
+    );
     let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();
     assert!(format!("{err}").to_lowercase().contains("v2.3"));
 }
@@ -2503,10 +2494,7 @@ fn roundtrip_equa_v23_multi_band_16bit() {
             },
         ],
     };
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![original.clone()],
-    };
+    let tag = Id3Tag::new(Id3Version::V2_3, vec![original.clone()]);
     let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     assert_eq!(parsed.frames.len(), 1);
@@ -2535,9 +2523,9 @@ fn roundtrip_equa_v23_multi_band_16bit() {
 /// (v2.4 dropped `EQUA` in favour of `EQU2`).
 #[test]
 fn roundtrip_equa_writer_rejects_v24() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Equa {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Equa {
             adjustment_bits: 16,
             bands: vec![EquaBand {
                 increment: true,
@@ -2545,7 +2533,7 @@ fn roundtrip_equa_writer_rejects_v24() {
                 adjustment: vec![0x00, 0x80],
             }],
         }],
-    };
+    );
     let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();
     assert!(format!("{err}").to_lowercase().contains("v2.3"));
 }
@@ -2566,10 +2554,7 @@ fn roundtrip_ipls_v23_multi_pair_unicode() {
             ("mastering".to_string(), "David Müller".to_string()),
         ],
     };
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![original.clone()],
-    };
+    let tag = Id3Tag::new(Id3Version::V2_3, vec![original.clone()]);
     let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     assert_eq!(parsed.frames.len(), 1);
@@ -2597,12 +2582,12 @@ fn roundtrip_ipls_v23_multi_pair_unicode() {
 /// emitting an unrecognised id).
 #[test]
 fn roundtrip_ipls_writer_rejects_v24() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Ipls {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Ipls {
             pairs: vec![("producer".to_string(), "Alice".to_string())],
         }],
-    };
+    );
     let err = write_tag(&tag, Id3Version::V2_4).unwrap_err();
     assert!(format!("{err}").to_lowercase().contains("v2.3"));
 }
@@ -2616,13 +2601,13 @@ fn roundtrip_ipls_writer_rejects_v24() {
 /// clear). All sub-fields are `false` / `None`.
 #[test]
 fn ext_header_default_when_no_ext_header() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Text {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Text {
             id: "TIT2".into(),
             values: vec!["Plain".into()],
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (_parsed, ext, _) = parse_tag_with_extended_header(&bytes).unwrap();
     assert!(!ext.is_update);
@@ -2635,13 +2620,13 @@ fn ext_header_default_when_no_ext_header() {
 /// frames they recover from the same bytes.
 #[test]
 fn ext_header_parse_tag_still_agrees() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Text {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Text {
             id: "TIT2".into(),
             values: vec!["Agree".into()],
         }],
-    };
+    );
     let bytes = write_tag_with_options(
         &tag,
         Id3Version::V2_4,
@@ -2661,13 +2646,13 @@ fn ext_header_parse_tag_still_agrees() {
 /// [`parse_tag_with_extended_header`].
 #[test]
 fn ext_header_is_update_v24_roundtrip() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Text {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Text {
             id: "TPE1".into(),
             values: vec!["Updater".into()],
         }],
-    };
+    );
     let bytes = write_tag_with_options(
         &tag,
         Id3Version::V2_4,
@@ -2688,13 +2673,13 @@ fn ext_header_is_update_v24_roundtrip() {
 /// rather than silently dropping the flag.
 #[test]
 fn ext_header_is_update_v23_rejected() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![Id3Frame::Text {
+    let tag = Id3Tag::new(
+        Id3Version::V2_3,
+        vec![Id3Frame::Text {
             id: "TIT2".into(),
             values: vec!["Nope".into()],
         }],
-    };
+    );
     let err = write_tag_with_options(
         &tag,
         Id3Version::V2_3,
@@ -2718,13 +2703,13 @@ fn ext_header_restrictions_saturated_v24_roundtrip() {
         image_size: ImageSizeRestriction::Exactly64x64,
     };
     assert_eq!(restrictions.to_wire(), 0xFF);
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Text {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Text {
             id: "TIT2".into(),
             values: vec!["Restricted".into()],
         }],
-    };
+    );
     let bytes = write_tag_with_options(
         &tag,
         Id3Version::V2_4,
@@ -2744,13 +2729,13 @@ fn ext_header_restrictions_zero_byte_roundtrips() {
     assert_eq!(restrictions.to_wire(), 0x00);
     let recovered = Restrictions::from_wire(0x00);
     assert_eq!(recovered, restrictions);
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Text {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Text {
             id: "TIT2".into(),
             values: vec!["Zero".into()],
         }],
-    };
+    );
     let bytes = write_tag_with_options(
         &tag,
         Id3Version::V2_4,
@@ -2810,13 +2795,13 @@ fn ext_header_restrictions_byte_bijection() {
 /// `with_footer` rejection pattern.
 #[test]
 fn ext_header_restrictions_v23_rejected() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![Id3Frame::Text {
+    let tag = Id3Tag::new(
+        Id3Version::V2_3,
+        vec![Id3Frame::Text {
             id: "TIT2".into(),
             values: vec!["Nope".into()],
         }],
-    };
+    );
     let err = write_tag_with_options(
         &tag,
         Id3Version::V2_3,
@@ -2839,9 +2824,9 @@ fn ext_header_all_subfields_compose_v24() {
         image_encoding: ImageEncodingRestriction::PngOrJpeg,
         image_size: ImageSizeRestriction::Max256x256,
     };
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![
             Id3Frame::Text {
                 id: "TIT2".into(),
                 values: vec!["Composed".into()],
@@ -2851,7 +2836,7 @@ fn ext_header_all_subfields_compose_v24() {
                 values: vec!["All Flags".into()],
             },
         ],
-    };
+    );
     let bytes = write_tag_with_options(
         &tag,
         Id3Version::V2_4,
@@ -2880,10 +2865,7 @@ fn ext_header_all_subfields_compose_v24() {
 /// accidentally bloat the crc-only emission.
 #[test]
 fn ext_header_crc_only_v24_size_unchanged() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![],
-    };
+    let tag = Id3Tag::new(Id3Version::V2_4, vec![]);
     let bytes = write_tag_with_options(&tag, Id3Version::V2_4, &WriteOptions::new().with_crc(true))
         .unwrap();
     // tag header (10) + ext header (12) = 22 bytes total when
@@ -2910,13 +2892,13 @@ fn ext_header_crc_top_bit_survives_synchsafe_encoding() {
     let mut found = false;
     for n in 0u32..256 {
         let title = format!("ext-header-crc-top-bit-{n:08x}");
-        let tag = Id3Tag {
-            version: Id3Version::V2_4,
-            frames: vec![Id3Frame::Text {
+        let tag = Id3Tag::new(
+            Id3Version::V2_4,
+            vec![Id3Frame::Text {
                 id: "TIT2".into(),
                 values: vec![title.clone()],
             }],
-        };
+        );
         let bytes =
             write_tag_with_options(&tag, Id3Version::V2_4, &WriteOptions::new().with_crc(true))
                 .unwrap();
@@ -2944,9 +2926,9 @@ fn ext_header_crc_top_bit_survives_synchsafe_encoding() {
 /// so callers don't have to repeat the `chunks_exact(2)` boilerplate.
 #[test]
 fn tipl_involved_people_pairs_v24() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Text {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Text {
             id: "TIPL".into(),
             values: vec![
                 "producer".into(),
@@ -2955,7 +2937,7 @@ fn tipl_involved_people_pairs_v24() {
                 "Bob".into(),
             ],
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let frame = parsed
@@ -2988,9 +2970,9 @@ fn tipl_involved_people_pairs_v24() {
 /// artist or a comma delimited list of artists."
 #[test]
 fn tmcl_musician_credits_pairs_v24() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Text {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Text {
             id: "TMCL".into(),
             values: vec![
                 "guitar".into(),
@@ -2999,7 +2981,7 @@ fn tmcl_musician_credits_pairs_v24() {
                 "Carol".into(),
             ],
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let frame = parsed
@@ -3034,15 +3016,15 @@ fn tmcl_musician_credits_pairs_v24() {
 /// either source version without matching on the underlying variant.
 #[test]
 fn ipls_involved_people_pairs_v23() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![Id3Frame::Ipls {
+    let tag = Id3Tag::new(
+        Id3Version::V2_3,
+        vec![Id3Frame::Ipls {
             pairs: vec![
                 ("producer".to_string(), "Alice".to_string()),
                 ("mixing engineer".to_string(), "Bob".to_string()),
             ],
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_3).unwrap();
     let (parsed, _) = parse_tag(&bytes).unwrap();
     let frame = parsed
@@ -3178,16 +3160,16 @@ fn sylt_content_type_accessor_decodes_lyrics() {
 #[test]
 fn sylt_content_type_roundtrips_v23_and_v24() {
     for version in [Id3Version::V2_3, Id3Version::V2_4] {
-        let tag = Id3Tag {
+        let tag = Id3Tag::new(
             version,
-            frames: vec![Id3Frame::SyncedLyrics {
+            vec![Id3Frame::SyncedLyrics {
                 lang: *b"eng",
                 time_format: 2,
                 content_type: SyltContentType::MovementPartName.to_wire(),
                 description: "movement".into(),
                 syncs: vec![("Adagio".into(), 0), ("Allegro".into(), 4_000)],
             }],
-        };
+        );
         let bytes = write_tag(&tag, version).expect("write");
         let (parsed, _) = parse_tag(&bytes).expect("parse");
         let kind = parsed
@@ -3268,10 +3250,7 @@ fn commercial_delivery_accessor_and_roundtrip() {
     assert_eq!(other.commercial_delivery(), None);
 
     for version in [Id3Version::V2_3, Id3Version::V2_4] {
-        let tag = Id3Tag {
-            version,
-            frames: vec![comr.clone()],
-        };
+        let tag = Id3Tag::new(version, vec![comr.clone()]);
         let bytes = write_tag(&tag, version).expect("write");
         let (parsed, _) = parse_tag(&bytes).expect("parse");
         let mode = parsed
@@ -3389,13 +3368,13 @@ fn rva2_channel_type_roundtrips_v23_and_v24() {
     // RVA2 is a v2.4-only frame (§4.11; it supersedes v2.3's RVAD).
     // It round-trips under V2_4 only — see `rva2_rejected_under_v23`
     // for the version-guard half.
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Rva2 {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Rva2 {
             identification: "mix".into(),
             channels: channels.clone(),
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).expect("write");
     let (parsed, _) = parse_tag(&bytes).expect("parse");
     let parsed_channels = parsed
@@ -3493,14 +3472,14 @@ fn equ2_interpolation_accessor_decodes_band_and_linear() {
 #[test]
 fn equ2_interpolation_roundtrips_v24() {
     for typed in [Equ2Interpolation::Band, Equ2Interpolation::Linear] {
-        let tag = Id3Tag {
-            version: Id3Version::V2_4,
-            frames: vec![Id3Frame::Equ2 {
+        let tag = Id3Tag::new(
+            Id3Version::V2_4,
+            vec![Id3Frame::Equ2 {
                 interpolation: typed.to_wire(),
                 identification: "spec-§4.12-roundtrip".into(),
                 points: vec![(880, 256), (4_400, -256), (12_000, 0)],
             }],
-        };
+        );
         let bytes = write_tag(&tag, Id3Version::V2_4).expect("write");
         let (parsed, _) = parse_tag(&bytes).expect("parse");
         let kind = parsed
@@ -3518,14 +3497,14 @@ fn equ2_interpolation_roundtrips_v24() {
 /// payloads — mirrors the contract pinned for `Rva2Channel::channel_type`.
 #[test]
 fn equ2_interpolation_preserves_reserved_byte_through_roundtrip() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Equ2 {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Equ2 {
             interpolation: 0x77,
             identification: "reserved".into(),
             points: vec![(2_000, 100)],
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_4).expect("write");
     let (parsed, _) = parse_tag(&bytes).expect("parse");
     let raw = parsed
@@ -3605,14 +3584,14 @@ fn popm_rating_accessor_decodes_unknown_and_rated() {
 fn popm_rating_roundtrips_v23_and_v24() {
     for raw in [0u8, 1, 128, 196, 255] {
         for version in [Id3Version::V2_3, Id3Version::V2_4] {
-            let tag = Id3Tag {
+            let tag = Id3Tag::new(
                 version,
-                frames: vec![Id3Frame::Popularimeter {
+                vec![Id3Frame::Popularimeter {
                     email: "rater@example.com".into(),
                     rating: raw,
                     counter: 7,
                 }],
-            };
+            );
             let bytes = write_tag(&tag, version).expect("write");
             let (parsed, _) = parse_tag(&bytes).expect("parse");
             let typed = parsed
@@ -3766,13 +3745,13 @@ fn etco_event_types_roundtrip_v23_and_v24() {
         (0xFF, 178_500), // continuation marker
     ];
     for version in [Id3Version::V2_3, Id3Version::V2_4] {
-        let tag = Id3Tag {
+        let tag = Id3Tag::new(
             version,
-            frames: vec![Id3Frame::EventTimingCodes {
+            vec![Id3Frame::EventTimingCodes {
                 time_format: 2,
                 events: events.clone(),
             }],
-        };
+        );
         let bytes = write_tag(&tag, version).expect("write");
         let (parsed, _) = parse_tag(&bytes).expect("parse");
         let decoded = parsed
@@ -3904,13 +3883,13 @@ fn sytc_tempo_codes_roundtrip_v23_and_v24() {
         (510, 6_000_000), // last $FF-extension BPM
     ];
     for version in [Id3Version::V2_3, Id3Version::V2_4] {
-        let tag = Id3Tag {
+        let tag = Id3Tag::new(
             version,
-            frames: vec![Id3Frame::SyncedTempo {
+            vec![Id3Frame::SyncedTempo {
                 time_format: 2,
                 codes: codes.clone(),
             }],
-        };
+        );
         let bytes = write_tag(&tag, version).expect("write");
         let (parsed, _) = parse_tag(&bytes).expect("parse");
         let decoded = parsed
@@ -4097,13 +4076,13 @@ fn content_types_roundtrip_v23_and_v24() {
         // A single parenthesised v2.3-style value round-trips under
         // either envelope (no embedded NUL, so the writer keeps it as a
         // single value).
-        let tag = Id3Tag {
+        let tag = Id3Tag::new(
             version,
-            frames: vec![Id3Frame::Text {
+            vec![Id3Frame::Text {
                 id: "TCON".into(),
                 values: vec!["(21)".into()],
             }],
-        };
+        );
         let bytes = write_tag(&tag, version).expect("write");
         let (parsed, _) = parse_tag(&bytes).expect("parse");
         let decoded = parsed
@@ -4263,10 +4242,7 @@ fn media_type_roundtrips_v23_and_v24() {
     for version in [Id3Version::V2_3, Id3Version::V2_4] {
         // A single value with no embedded NUL round-trips as one value
         // under either envelope, so the typed view is preserved.
-        let tag = Id3Tag {
-            version,
-            frames: vec![tmed(vec!["(VID/PAL/VHS)"])],
-        };
+        let tag = Id3Tag::new(version, vec![tmed(vec!["(VID/PAL/VHS)"])]);
         let bytes = write_tag(&tag, version).expect("write");
         let (parsed, _) = parse_tag(&bytes).expect("parse");
         let decoded = parsed
@@ -4399,10 +4375,7 @@ fn file_type_accessor_v24_mime_and_unknown_codes() {
 #[test]
 fn file_type_roundtrips_v23_and_v24() {
     for version in [Id3Version::V2_3, Id3Version::V2_4] {
-        let tag = Id3Tag {
-            version,
-            frames: vec![tflt(vec!["MPG/3"])],
-        };
+        let tag = Id3Tag::new(version, vec![tflt(vec!["MPG/3"])]);
         let bytes = write_tag(&tag, version).expect("write");
         let (parsed, _) = parse_tag(&bytes).expect("parse");
         let decoded = parsed
@@ -4499,15 +4472,15 @@ fn roundtrip_v22_common_frames() {
 fn v22_pic_emits_three_char_image_format() {
     // A PNG picture must serialise to the v2.2 PIC "PNG" image-format
     // code (not a NUL-terminated MIME string as v2.3 APIC would).
-    let tag = Id3Tag {
-        version: Id3Version::V2_2,
-        frames: vec![Id3Frame::Picture(AttachedPicture {
+    let tag = Id3Tag::new(
+        Id3Version::V2_2,
+        vec![Id3Frame::Picture(AttachedPicture {
             mime_type: "image/png".into(),
             picture_type: PictureType::BackCover,
             description: String::new(),
             data: vec![0x89, 0x50, 0x4E, 0x47],
         })],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_2).expect("write v2.2");
     // Frame header at offset 10: "PIC" + 3-byte size, then payload:
     // encoding byte (1) + "PNG" image format + picture-type byte.
@@ -4529,15 +4502,15 @@ fn v22_pic_emits_three_char_image_format() {
 fn v22_whole_tag_unsync_roundtrips() {
     // A data payload carrying a false sync (0xFF 0xF0) must survive
     // whole-tag unsync under the v2.2 envelope.
-    let tag = Id3Tag {
-        version: Id3Version::V2_2,
-        frames: vec![Id3Frame::Picture(AttachedPicture {
+    let tag = Id3Tag::new(
+        Id3Version::V2_2,
+        vec![Id3Frame::Picture(AttachedPicture {
             mime_type: "image/jpeg".into(),
             picture_type: PictureType::Other,
             description: String::new(),
             data: vec![0xFF, 0xF0, 0x00, 0xFF, 0xFB, 0x90],
         })],
-    };
+    );
     let opts = WriteOptions::new().with_unsync(UnsyncMode::WholeTag);
     let bytes = write_tag_with_options(&tag, Id3Version::V2_2, &opts).expect("write");
     // Header unsync flag (bit 7) set.
@@ -4554,9 +4527,9 @@ fn v22_skips_frames_without_v22_equivalent() {
     // SEEK is a v2.4-only frame with no v2.2 demotion; it must be
     // dropped rather than emitted under a truncated id, while the
     // text frame beside it survives.
-    let tag = Id3Tag {
-        version: Id3Version::V2_2,
-        frames: vec![
+    let tag = Id3Tag::new(
+        Id3Version::V2_2,
+        vec![
             Id3Frame::Text {
                 id: "TIT2".into(),
                 values: vec!["Keep me".into()],
@@ -4566,7 +4539,7 @@ fn v22_skips_frames_without_v22_equivalent() {
                 raw: vec![0, 0, 0, 0],
             },
         ],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_2).expect("write");
     // Only the demoted "TT2" frame should appear; "SEE"/"SEEK" must not.
     assert_eq!(&bytes[10..13], b"TT2");
@@ -4588,9 +4561,9 @@ fn v22_drops_structural_aspi_lossily() {
     // v2.2 writer drops it (matching the doc contract) rather than
     // erroring or emitting a truncated id, while a co-resident text
     // frame survives.
-    let tag = Id3Tag {
-        version: Id3Version::V2_2,
-        frames: vec![
+    let tag = Id3Tag::new(
+        Id3Version::V2_2,
+        vec![
             Id3Frame::AudioSeekPointIndex {
                 indexed_data_start: 0,
                 indexed_data_length: 1000,
@@ -4602,7 +4575,7 @@ fn v22_drops_structural_aspi_lossily() {
                 values: vec!["Survivor".into()],
             },
         ],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_2).expect("v2.2 write must not error");
     assert!(
         !bytes.windows(3).any(|w| w == b"ASP"),
@@ -4618,10 +4591,7 @@ fn v22_drops_structural_aspi_lossily() {
 
 #[test]
 fn v22_rejects_v23plus_only_options() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_2,
-        frames: vec![],
-    };
+    let tag = Id3Tag::new(Id3Version::V2_2, vec![]);
     // CRC / footer / compression / update / restrictions are all
     // post-v2.2 features and must be rejected loudly.
     for opts in [
@@ -4648,14 +4618,14 @@ fn v22_rejects_v23plus_only_options() {
 fn v22_structural_frame_roundtrips() {
     // A structured non-text frame (POPM) whose §4 body is shared with
     // v2.3 demotes to "POP" and round-trips through the v2.2 envelope.
-    let tag = Id3Tag {
-        version: Id3Version::V2_2,
-        frames: vec![Id3Frame::Popularimeter {
+    let tag = Id3Tag::new(
+        Id3Version::V2_2,
+        vec![Id3Frame::Popularimeter {
             email: "rater@example.com".into(),
             rating: 196,
             counter: 4242,
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_2).expect("write");
     assert_eq!(&bytes[10..13], b"POP");
     let (parsed, _) = parse_tag(&bytes).expect("re-parse");
@@ -4684,9 +4654,9 @@ fn v22_structural_frame_roundtrips() {
 /// encoding byte (the frame predates one).
 #[test]
 fn roundtrip_v22_crm_encrypted_meta() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_2,
-        frames: vec![Id3Frame::EncryptedMeta {
+    let tag = Id3Tag::new(
+        Id3Version::V2_2,
+        vec![Id3Frame::EncryptedMeta {
             owner: "owner@example.com".into(),
             content: "explanation text".into(),
             // A block whose bytes include a $00 — the parser splits on
@@ -4694,7 +4664,7 @@ fn roundtrip_v22_crm_encrypted_meta() {
             // encrypted block must not be treated as a field boundary.
             encrypted: vec![0xDE, 0xAD, 0x00, 0xBE, 0xEF],
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_2).expect("write v2.2");
     // Frame header: three-char "CRM" id (no encoding byte in the body).
     assert_eq!(&bytes[10..13], b"CRM");
@@ -4735,9 +4705,9 @@ fn roundtrip_v22_crm_encrypted_meta() {
 /// for every inc/dec combination including all-decrement.
 #[test]
 fn roundtrip_v22_rva_both_decrement() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_2,
-        frames: vec![Id3Frame::Rvad {
+    let tag = Id3Tag::new(
+        Id3Version::V2_2,
+        vec![Id3Frame::Rvad {
             increment_decrement: 0x00, // both channels decrement
             bits_used: 16,
             front: Some(RvadFrontChannels {
@@ -4754,7 +4724,7 @@ fn roundtrip_v22_rva_both_decrement() {
             center: None,
             bass: None,
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_2).expect("write v2.2 RVA");
     // Three-char "RVA" id, not "RVAD".
     assert_eq!(&bytes[10..13], b"RVA");
@@ -4791,9 +4761,9 @@ fn roundtrip_v22_rva_both_decrement() {
 /// lossy-but-valid rather than an error.
 #[test]
 fn roundtrip_v23_rvad_back_channels_to_v22_keeps_front() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![Id3Frame::Rvad {
+    let tag = Id3Tag::new(
+        Id3Version::V2_3,
+        vec![Id3Frame::Rvad {
             increment_decrement: 0b0000_1111, // front + back, all increment
             bits_used: 16,
             front: Some(RvadFrontChannels {
@@ -4819,7 +4789,7 @@ fn roundtrip_v23_rvad_back_channels_to_v22_keeps_front() {
             center: None,
             bass: None,
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_2).expect("write v2.2");
     assert_eq!(&bytes[10..13], b"RVA");
     let (parsed, _) = parse_tag(&bytes).expect("re-parse");
@@ -4847,9 +4817,9 @@ fn roundtrip_v23_rvad_back_channels_to_v22_keeps_front() {
 /// 8-bit field width too (one byte per field).
 #[test]
 fn roundtrip_v22_rva_omitted_peaks_8bit() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_2,
-        frames: vec![Id3Frame::Rvad {
+    let tag = Id3Tag::new(
+        Id3Version::V2_2,
+        vec![Id3Frame::Rvad {
             increment_decrement: 0x03, // both increment
             bits_used: 8,
             front: Some(RvadFrontChannels {
@@ -4866,7 +4836,7 @@ fn roundtrip_v22_rva_omitted_peaks_8bit() {
             center: None,
             bass: None,
         }],
-    };
+    );
     let bytes = write_tag(&tag, Id3Version::V2_2).expect("write");
     // body = inc/dec + bits + right-delta + left-delta = 4 bytes; no peaks.
     let frame_size = u32::from_be_bytes([0, bytes[13], bytes[14], bytes[15]]);
@@ -4922,13 +4892,13 @@ fn roundtrip_tkey_initial_key_typed_view() {
 
     for version in [Id3Version::V2_3, Id3Version::V2_4] {
         for (wire, expected) in cases {
-            let tag = Id3Tag {
+            let tag = Id3Tag::new(
                 version,
-                frames: vec![Id3Frame::Text {
+                vec![Id3Frame::Text {
                     id: "TKEY".into(),
                     values: vec![(*wire).to_string()],
                 }],
-            };
+            );
             let bytes = write_tag(&tag, version).expect("write");
             let (parsed, _) = parse_tag(&bytes).expect("re-parse");
             let tkey = parsed
@@ -4972,9 +4942,9 @@ fn roundtrip_tkey_initial_key_typed_view() {
 /// conformant reader of that version recognises.
 #[test]
 fn rva2_rejected_under_v23_and_v22() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Rva2 {
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Rva2 {
             identification: "norm".into(),
             channels: vec![Rva2Channel {
                 channel_type: Rva2ChannelType::MasterVolume.to_wire(),
@@ -4983,7 +4953,7 @@ fn rva2_rejected_under_v23_and_v22() {
                 peak: Vec::new(),
             }],
         }],
-    };
+    );
     assert!(write_tag(&tag, Id3Version::V2_3).is_err());
     // A v2.2 target *drops* the frame (its writer skips frames without a
     // v2.2 home) rather than erroring, producing a valid empty tag.
@@ -5022,10 +4992,7 @@ fn v24_only_structural_frames_rejected_under_v23() {
         },
     ];
     for frame in frames {
-        let tag = Id3Tag {
-            version: Id3Version::V2_4,
-            frames: vec![frame.clone()],
-        };
+        let tag = Id3Tag::new(Id3Version::V2_4, vec![frame.clone()]);
         // Sanity: each writes fine under v2.4.
         assert!(write_tag(&tag, Id3Version::V2_4).is_ok(), "v2.4 write");
         // ...and is rejected under v2.3.
@@ -5043,13 +5010,13 @@ fn v24_only_text_frames_rejected_under_v23() {
     for id in [
         "TDRC", "TMOO", "TSOA", "TSOP", "TSOT", "TSST", "TPRO", "TDEN",
     ] {
-        let tag = Id3Tag {
-            version: Id3Version::V2_4,
-            frames: vec![Id3Frame::Text {
+        let tag = Id3Tag::new(
+            Id3Version::V2_4,
+            vec![Id3Frame::Text {
                 id: id.into(),
                 values: vec!["x".into()],
             }],
-        };
+        );
         assert!(write_tag(&tag, Id3Version::V2_4).is_ok(), "{id} under v2.4");
         assert!(
             write_tag(&tag, Id3Version::V2_3).is_err(),
@@ -5062,13 +5029,13 @@ fn v24_only_text_frames_rejected_under_v23() {
 #[test]
 fn v23_only_text_frames_rejected_under_v24() {
     for id in ["TYER", "TDAT", "TIME", "TORY", "TRDA", "TSIZ"] {
-        let tag = Id3Tag {
-            version: Id3Version::V2_3,
-            frames: vec![Id3Frame::Text {
+        let tag = Id3Tag::new(
+            Id3Version::V2_3,
+            vec![Id3Frame::Text {
                 id: id.into(),
                 values: vec!["2024".into()],
             }],
-        };
+        );
         assert!(write_tag(&tag, Id3Version::V2_3).is_ok(), "{id} under v2.3");
         assert!(
             write_tag(&tag, Id3Version::V2_4).is_err(),
@@ -5081,9 +5048,9 @@ fn v23_only_text_frames_rejected_under_v24() {
 /// to v2.3, so the converted tag is writable as v2.3 and round-trips.
 #[test]
 fn convert_v24_to_v23_drops_v24_only_frames() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![
             Id3Frame::Text {
                 id: "TIT2".into(),
                 values: vec!["Title".into()],
@@ -5109,7 +5076,7 @@ fn convert_v24_to_v23_drops_v24_only_frames() {
                 values: vec!["Title".into()],
             },
         ],
-    };
+    );
     let v23 = oxideav_id3::convert_tag(&tag, Id3Version::V2_3).expect("convert");
     // Only the universally-valid TIT2 survives.
     assert_eq!(v23.frames.len(), 1);
@@ -5125,9 +5092,9 @@ fn convert_v24_to_v23_drops_v24_only_frames() {
 /// cleanly under v2.4.
 #[test]
 fn convert_v23_to_v24_drops_rvad_equa() {
-    let tag = Id3Tag {
-        version: Id3Version::V2_3,
-        frames: vec![
+    let tag = Id3Tag::new(
+        Id3Version::V2_3,
+        vec![
             Id3Frame::Text {
                 id: "TIT2".into(),
                 values: vec!["Title".into()],
@@ -5141,7 +5108,7 @@ fn convert_v23_to_v24_drops_rvad_equa() {
                 }],
             },
         ],
-    };
+    );
     let v24 = oxideav_id3::convert_tag(&tag, Id3Version::V2_4).expect("convert");
     assert!(
         v24.frames
@@ -5165,9 +5132,9 @@ fn convert_matrix_every_pair_writes_clean() {
     use Id3Version::{V2_2, V2_3, V2_4};
 
     // A v2.3-vocabulary source (TYER/TDAT) plus universal frames.
-    let v23_src = Id3Tag {
-        version: V2_3,
-        frames: vec![
+    let v23_src = Id3Tag::new(
+        V2_3,
+        vec![
             Id3Frame::Text {
                 id: "TIT2".into(),
                 values: vec!["Title".into()],
@@ -5186,11 +5153,11 @@ fn convert_matrix_every_pair_writes_clean() {
                 text: "hi".into(),
             },
         ],
-    };
+    );
     // A v2.4-vocabulary source (TDRC) plus a v2.4-only mood frame.
-    let v24_src = Id3Tag {
-        version: V2_4,
-        frames: vec![
+    let v24_src = Id3Tag::new(
+        V2_4,
+        vec![
             Id3Frame::Text {
                 id: "TIT2".into(),
                 values: vec!["Title".into()],
@@ -5204,7 +5171,7 @@ fn convert_matrix_every_pair_writes_clean() {
                 values: vec!["Calm".into()],
             },
         ],
-    };
+    );
 
     for src in [&v23_src, &v24_src] {
         for target in [V2_2, V2_3, V2_4] {
@@ -5240,9 +5207,9 @@ fn roundtrip_chapters_full_stack() {
     // carries an APIC slide and a WXXX link. Everything must survive
     // write -> parse under both v2.3 and v2.4 and stay reachable
     // through the typed walkers.
-    let src = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![
+    let src = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![
             Id3Frame::Text {
                 id: "TIT2".into(),
                 values: vec!["The Whale".into()],
@@ -5292,7 +5259,7 @@ fn roundtrip_chapters_full_stack() {
                 ],
             },
         ],
-    };
+    );
     for version in [Id3Version::V2_3, Id3Version::V2_4] {
         let bytes = write_tag(&src, version).expect("write");
         let (parsed, consumed) = parse_tag(&bytes).expect("parse");
@@ -5330,9 +5297,9 @@ fn roundtrip_chapters_survive_whole_tag_unsync_and_compression() {
     // so drive them through whole-tag unsync and frame compression to
     // prove the embedded sub-frame layer composes with the envelope
     // transforms.
-    let src = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![Id3Frame::Chapter {
+    let src = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![Id3Frame::Chapter {
             element_id: "c".into(),
             start_time_ms: 0xFF00FF,
             end_time_ms: 0xFFFFFF,
@@ -5343,7 +5310,7 @@ fn roundtrip_chapters_survive_whole_tag_unsync_and_compression() {
                 values: vec!["unsync me".into()],
             }],
         }],
-    };
+    );
     for version in [Id3Version::V2_3, Id3Version::V2_4] {
         for (unsync, compress) in [
             (UnsyncMode::WholeTag, false),

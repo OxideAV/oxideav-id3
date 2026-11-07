@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Id3Tag::new(version, frames)`, and `ExtendedHeader::with_is_update`
+  / `with_crc` / `with_restrictions`.
+
+### Changed
+
+- API hygiene: `#[non_exhaustive]` on `Id3Version`, `Id3Frame`,
+  `UnsyncMode`, `Id3Tag`, `ExtendedHeader`, `WriteOptions`, `ChapterRef`
+  and `TocRef`. Build a tag with `Id3Tag::new`. Enums whose value set
+  the ID3 specification fixes (the restriction fields, timestamp unit,
+  content / delivery / channel / event-type tables, interpolation,
+  key and the parsed-or-malformed value shapes) and the fixed-layout
+  frame records (`EquaBand`, `Rva2Channel`, `Rvad*`, `Restrictions`,
+  `Id3v1Tag`, `EnhancedTag*`) stay exhaustive. No behaviour change.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-id3/compare/v0.0.6...v0.0.7) - 2026-10-23
 
 ### Other

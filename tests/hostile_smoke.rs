@@ -34,9 +34,9 @@ impl XorShift {
 
 /// Build a chapter-heavy tag and serialise it under `version`.
 fn chapter_fixture(version: Id3Version) -> Vec<u8> {
-    let tag = Id3Tag {
+    let tag = Id3Tag::new(
         version,
-        frames: vec![
+        vec![
             Id3Frame::TableOfContents {
                 element_id: "root".into(),
                 top_level: true,
@@ -77,15 +77,15 @@ fn chapter_fixture(version: Id3Version) -> Vec<u8> {
                 }],
             },
         ],
-    };
+    );
     write_tag(&tag, version).expect("fixture writes")
 }
 
 /// Build a 355-byte enhanced trailer fixture.
 fn enhanced_fixture() -> Vec<u8> {
-    let tag = Id3Tag {
-        version: Id3Version::V2_4,
-        frames: vec![
+    let tag = Id3Tag::new(
+        Id3Version::V2_4,
+        vec![
             Id3Frame::Text {
                 id: "TIT2".into(),
                 values: vec!["T".repeat(80)],
@@ -99,7 +99,7 @@ fn enhanced_fixture() -> Vec<u8> {
                 values: vec!["9".into()],
             },
         ],
-    };
+    );
     write_id3v1_enhanced(&tag)
 }
 

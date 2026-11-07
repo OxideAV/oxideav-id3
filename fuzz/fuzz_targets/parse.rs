@@ -134,6 +134,7 @@ fuzz_target!(|data: &[u8]| {
     let writeable = match tag.version {
         Id3Version::V2_2 | Id3Version::V2_3 | Id3Version::V2_4 => tag.clone(),
         Id3Version::V1 => return,
+        _ => return,
     };
     // Both writer targets must finish without panicking. The output is
     // discarded; we are not asserting any round-trip property because
