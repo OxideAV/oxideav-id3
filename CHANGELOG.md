@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-id3/compare/v0.0.7...v0.0.8) - 2026-11-07
+
+### Other
+
+- API hygiene: #[non_exhaustive] on growable enums and records
+
 ### Added
 
 - `Id3Tag::new(version, frames)`, and `ExtendedHeader::with_is_update`
